@@ -1,0 +1,18 @@
+.{
+    .name = .lenore_gpu,
+    .fingerprint = 0x40a4ac0532dc2059,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .lenore_platform = .{ .path = "../lenore-platform" },
+        .vulkan_zig = .{
+            .url = "git+https://github.com/Snektron/vulkan-zig#b496a6a561ffbbeb530b0f9ed4e059f88c0723a5",
+            .hash = "vulkan-0.0.0-r7Ytx7N9AwD7IZt5_XNHtkJ4G9qY0pCH-cpcOsbL8wzD",
+        },
+        .zmath = .{
+            .url = "git+https://github.com/zig-gamedev/zmath.git#9e42b04a24c970a297b365f3d3022f92dbf3219d",
+            .hash = "zmath-0.11.0-dev-wjwivTwtAwDOjG2_KGP-HLtHrONfsFfHttalmxFAGVAK",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "tests", "examples", "vk", "LICENSE", "AUTHORS" },
+}

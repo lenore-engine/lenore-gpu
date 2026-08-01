@@ -1,0 +1,533 @@
+const std = @import("std");
+const build_options = @import("build_options");
+const platform = @import("lenore-platform");
+const vk = @import("vulkan");
+
+const Allocator = std.mem.Allocator;
+const BaseWrapper = vk.BaseWrapper;
+const InstanceWrapper = vk.InstanceWrapper;
+const DeviceWrapper = vk.DeviceWrapper;
+const Instance = vk.InstanceProxy;
+const Device = vk.DeviceProxy;
+const log = std.log.scoped(.vulkan);
+
+const validation_layer: [*:0]const u8 = "VK_LAYER_KHRONOS_validation";
+const required_device_extensions = [_][*:0]const u8{
+    vk.extensions.khr_swapchain.name,
+};
+
+const SurfaceError = InstanceWrapper.CreateWaylandSurfaceKHRError;
+const LayerQueryError = BaseWrapper.EnumerateInstanceLayerPropertiesAllocError;
+const DeviceQueryError = Allocator.Error ||
+    InstanceWrapper.EnumeratePhysicalDevicesAllocError ||
+    InstanceWrapper.EnumerateDeviceExtensionPropertiesAllocError ||
+    InstanceWrapper.GetPhysicalDeviceSurfaceSupportKHRError ||
+    InstanceWrapper.GetPhysicalDeviceSurfaceFormatsKHRError ||
+    InstanceWrapper.GetPhysicalDeviceSurfacePresentModesKHRError;
+const DevicePickError = DeviceQueryError || error{NoSuitableDevice};
+
+pub const InitError = error{
+    MissingLoaderSymbol,
+    MissingValidationLayer,
+    NoSuitableDevice,
+} || std.DynLib.Error || Allocator.Error || BaseWrapper.CreateInstanceError ||
+    LayerQueryError || SurfaceError || DeviceQueryError ||
+    InstanceWrapper.CreateDebugUtilsMessengerEXTError || InstanceWrapper.CreateDeviceError;
+
+pub const MemoryTypeError = error{NoSuitableMemoryType};
+
+pub const Queue = struct {
+    handle: vk.Queue,
+    family: u32,
+
+    fn init(device: Device, family: u32) Queue {
+        return .{
+            .handle = device.getDeviceQueue(family, 0),
+            .family = family,
+        };
+    }
+};
+
+const QueueAllocation = struct {
+    graphics_family: u32,
+    present_family: u32,
+};
+
+const DeviceExtensions = struct {
+    memory_budget: bool,
+};
+
+const DeviceCandidate = struct {
+    physical_device: vk.PhysicalDevice,
+    properties: vk.PhysicalDeviceProperties,
+    extensions: DeviceExtensions,
+    queues: QueueAllocation,
+    pipeline_statistics: bool,
+    max_buffer_size: vk.DeviceSize,
+};
+
+pub const Context = struct {
+    pub const CommandBuffer = vk.CommandBufferProxy;
+
+    allocator: Allocator,
+    loader: std.DynLib,
+    base_wrapper: BaseWrapper,
+    instance: Instance,
+    debug_messenger: ?vk.DebugUtilsMessengerEXT,
+    surface: vk.SurfaceKHR,
+    physical_device: vk.PhysicalDevice,
+    properties: vk.PhysicalDeviceProperties,
+    memory_properties: vk.PhysicalDeviceMemoryProperties,
+    max_sampler_anisotropy: f32,
+    max_buffer_size: vk.DeviceSize,
+    device: Device,
+    graphics_queue: Queue,
+    present_queue: Queue,
+    pipeline_statistics_enabled: bool,
+    memory_budget_enabled: bool,
+
+    // Initialization may return the Context by value: every proxy references a
+    // separately allocated wrapper, and no callback retains the Context address.
+    pub fn init(
+        allocator: Allocator,
+        application_name: [:0]const u8,
+        native_handles: platform.NativeHandles,
+    ) InitError!Context {
+        var loader = try std.DynLib.open("libvulkan.so.1");
+        errdefer loader.close();
+        const get_instance_proc_addr = loader.lookup(
+            vk.PfnGetInstanceProcAddr,
+            "vkGetInstanceProcAddr",
+        ) orelse return error.MissingLoaderSymbol;
+        const base_wrapper = BaseWrapper.load(get_instance_proc_addr);
+
+        var extension_names: std.ArrayList([*:0]const u8) = .empty;
+        defer extension_names.deinit(allocator);
+        try appendSurfaceExtensions(&extension_names, allocator, native_handles);
+        if (build_options.enable_validation)
+            try extension_names.append(allocator, vk.extensions.ext_debug_utils.name);
+
+        var enabled_layers: []const [*:0]const u8 = &.{};
+        if (build_options.enable_validation) {
+            if (!try hasInstanceLayer(&base_wrapper, allocator, std.mem.span(validation_layer))) {
+                log.err("Debug builds require {s}", .{validation_layer});
+                return error.MissingValidationLayer;
+            }
+            enabled_layers = &.{validation_layer};
+        }
+
+        const raw_instance = try base_wrapper.createInstance(&.{
+            .p_application_info = &.{
+                .p_application_name = application_name,
+                .application_version = @bitCast(vk.makeApiVersion(0, 0, 0, 0)),
+                .p_engine_name = "Lenore",
+                .engine_version = @bitCast(vk.makeApiVersion(0, 0, 0, 0)),
+                .api_version = @bitCast(vk.API_VERSION_1_3),
+            },
+            .enabled_layer_count = @intCast(enabled_layers.len),
+            .pp_enabled_layer_names = enabled_layers.ptr,
+            .enabled_extension_count = @intCast(extension_names.items.len),
+            .pp_enabled_extension_names = extension_names.items.ptr,
+        }, null);
+
+        const loaded_instance_wrapper = InstanceWrapper.load(
+            raw_instance,
+            base_wrapper.dispatch.vkGetInstanceProcAddr.?,
+        );
+        const instance_wrapper = allocator.create(InstanceWrapper) catch |err| {
+            loaded_instance_wrapper.destroyInstance(raw_instance, null);
+            return err;
+        };
+        instance_wrapper.* = loaded_instance_wrapper;
+        const instance = Instance.init(raw_instance, instance_wrapper);
+        errdefer {
+            instance.destroyInstance(null);
+            allocator.destroy(instance_wrapper);
+        }
+
+        const debug_messenger: ?vk.DebugUtilsMessengerEXT = if (build_options.enable_validation)
+            try instance.createDebugUtilsMessengerEXT(&.{
+                .message_severity = .{
+                    .warning_bit_ext = true,
+                    .error_bit_ext = true,
+                },
+                .message_type = .{
+                    .general_bit_ext = true,
+                    .validation_bit_ext = true,
+                    .performance_bit_ext = true,
+                },
+                .pfn_user_callback = &debugCallback,
+            }, null)
+        else
+            null;
+        errdefer if (debug_messenger) |messenger|
+            instance.destroyDebugUtilsMessengerEXT(messenger, null);
+
+        const surface = try createSurface(instance, native_handles);
+        errdefer instance.destroySurfaceKHR(surface, null);
+
+        const candidate = try pickIntegratedDevice(instance, allocator, surface);
+        const raw_device = try createDevice(instance, candidate);
+        const loaded_device_wrapper = DeviceWrapper.load(
+            raw_device,
+            instance.wrapper.dispatch.vkGetDeviceProcAddr.?,
+        );
+        const device_wrapper = allocator.create(DeviceWrapper) catch |err| {
+            loaded_device_wrapper.destroyDevice(raw_device, null);
+            return err;
+        };
+        device_wrapper.* = loaded_device_wrapper;
+        const device = Device.init(raw_device, device_wrapper);
+        errdefer {
+            device.destroyDevice(null);
+            allocator.destroy(device_wrapper);
+        }
+
+        return .{
+            .allocator = allocator,
+            .loader = loader,
+            .base_wrapper = base_wrapper,
+            .instance = instance,
+            .debug_messenger = debug_messenger,
+            .surface = surface,
+            .physical_device = candidate.physical_device,
+            .properties = candidate.properties,
+            .memory_properties = instance.getPhysicalDeviceMemoryProperties(candidate.physical_device),
+            .max_sampler_anisotropy = candidate.properties.limits.max_sampler_anisotropy,
+            .max_buffer_size = candidate.max_buffer_size,
+            .device = device,
+            .graphics_queue = .init(device, candidate.queues.graphics_family),
+            .present_queue = .init(device, candidate.queues.present_family),
+            .pipeline_statistics_enabled = candidate.pipeline_statistics,
+            .memory_budget_enabled = candidate.extensions.memory_budget,
+        };
+    }
+
+    pub fn deinit(self: *Context) void {
+        self.device.destroyDevice(null);
+        self.allocator.destroy(self.device.wrapper);
+        self.instance.destroySurfaceKHR(self.surface, null);
+        if (self.debug_messenger) |messenger|
+            self.instance.destroyDebugUtilsMessengerEXT(messenger, null);
+        self.instance.destroyInstance(null);
+        self.allocator.destroy(self.instance.wrapper);
+        self.loader.close();
+        self.* = undefined;
+    }
+
+    // Waits for every queue to drain.
+    //
+    // A fence proves a submission finished; it says nothing about the
+    // presentation that was queued after it, which still holds the swapchain
+    // image and the semaphore it waited on. Destroying either therefore needs
+    // this, not a fence. Vulkan specification, vkDestroySwapchainKHR and
+    // vkDestroySemaphore both require every use to have completed.
+    //
+    // It is a cold path by nature: recreation and teardown. Anything per-frame
+    // that reaches for it is synchronizing the wrong way.
+    pub fn waitIdle(self: *const Context) vk.DeviceWrapper.DeviceWaitIdleError!void {
+        try self.device.deviceWaitIdle();
+    }
+
+    pub fn deviceName(self: *const Context) []const u8 {
+        return std.mem.sliceTo(&self.properties.device_name, 0);
+    }
+
+    pub fn findMemoryTypeIndex(
+        self: *const Context,
+        memory_type_bits: u32,
+        required: vk.MemoryPropertyFlags,
+    ) MemoryTypeError!u32 {
+        for (self.memory_properties.memory_types[0..self.memory_properties.memory_type_count], 0..) |memory_type, index| {
+            const supported = memory_type_bits & (@as(u32, 1) << @intCast(index)) != 0;
+            if (supported and memory_type.property_flags.contains(required))
+                return @intCast(index);
+        }
+        return error.NoSuitableMemoryType;
+    }
+};
+
+fn appendSurfaceExtensions(
+    names: *std.ArrayList([*:0]const u8),
+    allocator: Allocator,
+    handles: platform.NativeHandles,
+) Allocator.Error!void {
+    try names.append(allocator, vk.extensions.khr_surface.name);
+    switch (handles) {
+        .wayland => try names.append(allocator, vk.extensions.khr_wayland_surface.name),
+    }
+}
+
+fn createSurface(instance: Instance, handles: platform.NativeHandles) SurfaceError!vk.SurfaceKHR {
+    return switch (handles) {
+        .wayland => |wayland| instance.createWaylandSurfaceKHR(&.{
+            .display = @ptrCast(wayland.display),
+            .surface = @ptrCast(wayland.surface),
+        }, null),
+    };
+}
+
+fn hasInstanceLayer(
+    base_wrapper: *const BaseWrapper,
+    allocator: Allocator,
+    name: []const u8,
+) LayerQueryError!bool {
+    const layers = try base_wrapper.enumerateInstanceLayerPropertiesAlloc(allocator);
+    defer allocator.free(layers);
+    for (layers) |layer|
+        if (std.mem.eql(u8, std.mem.sliceTo(&layer.layer_name, 0), name)) return true;
+    return false;
+}
+
+fn pickIntegratedDevice(
+    instance: Instance,
+    allocator: Allocator,
+    surface: vk.SurfaceKHR,
+) DevicePickError!DeviceCandidate {
+    const physical_devices = try instance.enumeratePhysicalDevicesAlloc(allocator);
+    defer allocator.free(physical_devices);
+
+    for (physical_devices) |physical_device| {
+        const properties = instance.getPhysicalDeviceProperties(physical_device);
+        if (properties.device_type != .integrated_gpu) continue;
+        if (try inspectDevice(instance, physical_device, properties, allocator, surface)) |candidate|
+            return candidate;
+    }
+    return error.NoSuitableDevice;
+}
+
+fn inspectDevice(
+    instance: Instance,
+    physical_device: vk.PhysicalDevice,
+    properties: vk.PhysicalDeviceProperties,
+    allocator: Allocator,
+    surface: vk.SurfaceKHR,
+) DeviceQueryError!?DeviceCandidate {
+    const extensions = try inspectDeviceExtensions(
+        instance,
+        physical_device,
+        allocator,
+    ) orelse return null;
+    if (!try supportsSurface(instance, physical_device, surface)) return null;
+    const pipeline_statistics = supportsRequiredFeatures(instance, physical_device) orelse return null;
+    const queues = try allocateQueues(instance, physical_device, allocator, surface) orelse return null;
+    if (!supportsVertexFormats(instance, physical_device)) return null;
+
+    return .{
+        .physical_device = physical_device,
+        .properties = properties,
+        .queues = queues,
+        .extensions = extensions,
+        .pipeline_statistics = pipeline_statistics,
+        .max_buffer_size = queryMaxBufferSize(instance, physical_device),
+    };
+}
+
+fn allocateQueues(
+    instance: Instance,
+    physical_device: vk.PhysicalDevice,
+    allocator: Allocator,
+    surface: vk.SurfaceKHR,
+) (Allocator.Error || InstanceWrapper.GetPhysicalDeviceSurfaceSupportKHRError)!?QueueAllocation {
+    const families = try instance.getPhysicalDeviceQueueFamilyPropertiesAlloc(physical_device, allocator);
+    defer allocator.free(families);
+
+    var graphics_family: ?u32 = null;
+    var present_family: ?u32 = null;
+    for (families, 0..) |properties, index| {
+        const family: u32 = @intCast(index);
+        const supports_graphics = properties.queue_flags.graphics_bit;
+        const supports_present = try instance.getPhysicalDeviceSurfaceSupportKHR(
+            physical_device,
+            family,
+            surface,
+        ) == .true;
+        if (supports_graphics and supports_present)
+            return .{ .graphics_family = family, .present_family = family };
+        if (graphics_family == null and supports_graphics) graphics_family = family;
+        if (present_family == null and supports_present) present_family = family;
+    }
+
+    if (graphics_family != null and present_family != null) return .{
+        .graphics_family = graphics_family.?,
+        .present_family = present_family.?,
+    };
+    return null;
+}
+
+fn supportsSurface(
+    instance: Instance,
+    physical_device: vk.PhysicalDevice,
+    surface: vk.SurfaceKHR,
+) (InstanceWrapper.GetPhysicalDeviceSurfaceFormatsKHRError ||
+    InstanceWrapper.GetPhysicalDeviceSurfacePresentModesKHRError)!bool {
+    var format_count: u32 = 0;
+    _ = try instance.getPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &format_count, null);
+    var present_mode_count: u32 = 0;
+    _ = try instance.getPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &present_mode_count, null);
+    return format_count > 0 and present_mode_count > 0;
+}
+
+fn inspectDeviceExtensions(
+    instance: Instance,
+    physical_device: vk.PhysicalDevice,
+    allocator: Allocator,
+) InstanceWrapper.EnumerateDeviceExtensionPropertiesAllocError!?DeviceExtensions {
+    const available = try instance.enumerateDeviceExtensionPropertiesAlloc(
+        physical_device,
+        null,
+        allocator,
+    );
+    defer allocator.free(available);
+
+    for (required_device_extensions) |required|
+        if (!hasDeviceExtension(available, required)) return null;
+
+    return .{
+        .memory_budget = hasDeviceExtension(
+            available,
+            vk.extensions.ext_memory_budget.name,
+        ),
+    };
+}
+
+fn hasDeviceExtension(
+    available: []const vk.ExtensionProperties,
+    name: [*:0]const u8,
+) bool {
+    for (available) |extension|
+        if (std.mem.eql(
+            u8,
+            std.mem.span(name),
+            std.mem.sliceTo(&extension.extension_name, 0),
+        )) return true;
+    return false;
+}
+
+fn supportsRequiredFeatures(instance: Instance, physical_device: vk.PhysicalDevice) ?bool {
+    const properties = instance.getPhysicalDeviceProperties(physical_device);
+    if (properties.api_version < @as(u32, @bitCast(vk.API_VERSION_1_3))) return null;
+
+    var vulkan_13 = vk.PhysicalDeviceVulkan13Features{};
+    var features = vk.PhysicalDeviceFeatures2{
+        .p_next = @ptrCast(&vulkan_13),
+        .features = .{},
+    };
+    instance.getPhysicalDeviceFeatures2(physical_device, &features);
+
+    const core = features.features;
+    if (core.sampler_anisotropy != .true or
+        core.sample_rate_shading != .true or
+        core.texture_compression_bc != .true or
+        core.shader_storage_image_extended_formats != .true or
+        vulkan_13.dynamic_rendering != .true or
+        vulkan_13.synchronization_2 != .true or
+        vulkan_13.shader_demote_to_helper_invocation != .true)
+    {
+        return null;
+    }
+    return core.pipeline_statistics_query == .true;
+}
+
+fn queryMaxBufferSize(
+    instance: Instance,
+    physical_device: vk.PhysicalDevice,
+) vk.DeviceSize {
+    var maintenance_4 = vk.PhysicalDeviceMaintenance4Properties{
+        .max_buffer_size = undefined,
+    };
+    var properties = vk.PhysicalDeviceProperties2{
+        .p_next = @ptrCast(&maintenance_4),
+        .properties = undefined,
+    };
+    instance.getPhysicalDeviceProperties2(physical_device, &properties);
+    return maintenance_4.max_buffer_size;
+}
+
+fn supportsVertexFormats(instance: Instance, physical_device: vk.PhysicalDevice) bool {
+    const required = [_]vk.Format{
+        .a2b10g10r10_snorm_pack32,
+        .r16g16_sfloat,
+        .r16g16b16a16_unorm,
+        .r16g16b16a16_uint,
+    };
+    for (required) |format| {
+        const properties = instance.getPhysicalDeviceFormatProperties(physical_device, format);
+        if (!properties.buffer_features.vertex_buffer_bit) return false;
+    }
+    return true;
+}
+
+fn createDevice(instance: Instance, candidate: DeviceCandidate) InstanceWrapper.CreateDeviceError!vk.Device {
+    const priority = [_]f32{1};
+    const queue_infos = [_]vk.DeviceQueueCreateInfo{
+        .{
+            .queue_family_index = candidate.queues.graphics_family,
+            .queue_count = 1,
+            .p_queue_priorities = &priority,
+        },
+        .{
+            .queue_family_index = candidate.queues.present_family,
+            .queue_count = 1,
+            .p_queue_priorities = &priority,
+        },
+    };
+    const queue_count: u32 = if (candidate.queues.graphics_family == candidate.queues.present_family) 1 else 2;
+
+    var vulkan_13 = vk.PhysicalDeviceVulkan13Features{
+        .dynamic_rendering = .true,
+        .synchronization_2 = .true,
+        .shader_demote_to_helper_invocation = .true,
+    };
+    const features = vk.PhysicalDeviceFeatures2{
+        .p_next = @ptrCast(&vulkan_13),
+        .features = .{
+            .sampler_anisotropy = .true,
+            .sample_rate_shading = .true,
+            .texture_compression_bc = .true,
+            .shader_storage_image_extended_formats = .true,
+            .pipeline_statistics_query = if (candidate.pipeline_statistics) .true else .false,
+        },
+    };
+    var extension_names = [_][*:0]const u8{
+        vk.extensions.khr_swapchain.name,
+        undefined,
+    };
+    var extension_count: u32 = required_device_extensions.len;
+    if (candidate.extensions.memory_budget) {
+        extension_names[extension_count] = vk.extensions.ext_memory_budget.name;
+        extension_count += 1;
+    }
+
+    return instance.createDevice(candidate.physical_device, &.{
+        .p_next = @ptrCast(&features),
+        .queue_create_info_count = queue_count,
+        .p_queue_create_infos = &queue_infos,
+        .enabled_extension_count = extension_count,
+        .pp_enabled_extension_names = &extension_names,
+    }, null);
+}
+
+fn debugCallback(
+    severity: vk.DebugUtilsMessageSeverityFlagsEXT,
+    message_type: vk.DebugUtilsMessageTypeFlagsEXT,
+    callback_data: ?*const vk.DebugUtilsMessengerCallbackDataEXT,
+    _: ?*anyopaque,
+) callconv(.c) vk.Bool32 {
+    const kind = if (message_type.validation_bit_ext)
+        "validation"
+    else if (message_type.performance_bit_ext)
+        "performance"
+    else
+        "general";
+    const message = if (callback_data) |data|
+        data.p_message orelse "missing callback message"
+    else
+        "missing callback data";
+
+    if (severity.error_bit_ext)
+        log.err("[{s}] {s}", .{ kind, message })
+    else
+        log.warn("[{s}] {s}", .{ kind, message });
+    return .false;
+}
