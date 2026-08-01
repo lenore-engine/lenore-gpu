@@ -1,8 +1,9 @@
 const std = @import("std");
 const gpu = @import("lenore-gpu");
+const res = @import("lenore-resources");
 
 const testing = std.testing;
-const Vertex3D = gpu.Vertex3D;
+const Vertex3D = res.Vertex3D;
 const GpuVertex = gpu.GpuVertex;
 
 // Snorm quantisation of a full-scale component. Vulkan converts a signed
@@ -48,17 +49,6 @@ test "the GPU layouts are what a pipeline binds" {
 
     try testing.expectEqual(@as(u32, 24), GpuVertex.binding_description.stride);
     try testing.expectEqual(@as(u32, 1), gpu.GpuSkinVertex.binding_description.binding);
-}
-
-test "a stream set packs to its bit index" {
-    try testing.expectEqual(@as(u3, 0), (gpu.VertexStreams{}).index());
-    try testing.expectEqual(@as(u3, 1), (gpu.VertexStreams{ .skinned = true }).index());
-    try testing.expectEqual(@as(u3, 2), (gpu.VertexStreams{ .colour = true }).index());
-    try testing.expectEqual(@as(u3, 4), (gpu.VertexStreams{ .uv1 = true }).index());
-    try testing.expectEqual(
-        @as(u3, 7),
-        (gpu.VertexStreams{ .skinned = true, .colour = true, .uv1 = true }).index(),
-    );
 }
 
 test "a direction packs into the ten-bit lanes at full scale" {
@@ -174,9 +164,4 @@ test "the optional streams are straight copies" {
     const uv1 = gpu.packUv1Vertex(&vertex(.{ .uv1 = .{ 0.5, 0.125 } }));
     try testing.expectEqual(@as(f16, 0.5), uv1.uv1[0]);
     try testing.expectEqual(@as(f16, 0.125), uv1.uv1[1]);
-
-    // A vertex that declared neither carries the identity tint and set zero.
-    const default = vertex(.{});
-    try testing.expectEqual([4]u8{ 255, 255, 255, 255 }, default.colour);
-    try testing.expectEqual([2]f32{ 0, 0 }, [2]f32{ default.uv1[0], default.uv1[1] });
 }

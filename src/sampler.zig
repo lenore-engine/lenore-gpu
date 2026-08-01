@@ -1,34 +1,14 @@
 const std = @import("std");
 const vk = @import("vulkan");
+const res = @import("lenore-resources");
 const Context = @import("context.zig").Context;
 
 const Allocator = std.mem.Allocator;
 
-pub const Filter = enum(u8) { nearest, linear };
-pub const MipmapMode = enum(u8) { nearest, linear };
-pub const AddressMode = enum(u8) { repeat, mirrored_repeat, clamp_to_edge };
-
-// A Vulkan-free sampler identity, shared by asset import and rendering. It is a
-// plain value of enums and a flag, so it hashes and compares field by field:
-// that value identity is what makes it usable as a cache key.
-//
-// Sampler state is deliberately not part of an image's identity. glTF 2.0
-// specification, 3.8.2: a texture pairs a source image with a sampler, and
-// nothing stops two textures naming the same source with different samplers. An
-// image deduplicated by content must therefore be able to carry a different wrap
-// mode per material.
-pub const SamplerConfig = struct {
-    mag_filter: Filter = .linear,
-    min_filter: Filter = .linear,
-    mipmap_mode: MipmapMode = .linear,
-    address_mode_u: AddressMode = .repeat,
-    address_mode_v: AddressMode = .repeat,
-    address_mode_w: AddressMode = .repeat,
-    // Anisotropy is a per-sampler choice rather than a global default nobody can
-    // decline. Its cost on this target is unmeasured, so the default is the one
-    // that changes nothing about how textures look.
-    anisotropic: bool = true,
-};
+const Filter = res.Filter;
+const MipmapMode = res.MipmapMode;
+const AddressMode = res.AddressMode;
+const SamplerConfig = res.SamplerConfig;
 
 pub const GetError = Allocator.Error || vk.DeviceWrapper.CreateSamplerError;
 

@@ -1,51 +1,9 @@
 const std = @import("std");
 const vk = @import("vulkan");
+const res = @import("lenore-resources");
 
-pub const Vec2 = @Vector(2, f32);
-pub const Vec3 = @Vector(3, f32);
-pub const Vec4 = @Vector(4, f32);
-
-// The vertex as an asset produces it and as load-time maths operates on it:
-// full precision, so merging, transform baking and bounds lose nothing. It is
-// packed into the GPU layouts once, at upload, and never uploaded as it stands.
-pub const Vertex3D = struct {
-    position: Vec3,
-    normal: Vec3,
-    uv: Vec2,
-    // xyz is the tangent, w the handedness that reconstructs the bitangent.
-    tangent: Vec4,
-
-    // COLOR_0, already normalised to unorm8 rgba. glTF 2.0 specification, 3.7.2,
-    // mesh attribute table: the attribute is VEC3 or VEC4 in float, normalised
-    // unsigned byte or normalised unsigned short, and every component is clamped
-    // to zero through one, so all of them fold to this at parse time. White is
-    // the identity tint, so a mesh without the attribute carries a stream that
-    // changes nothing.
-    colour: [4]u8 = .{ 255, 255, 255, 255 },
-
-    // TEXCOORD_1. A material selects UV set 0 or 1 per texture slot, so a mesh
-    // without this attribute is only wrong if an asset selects set 1 for it.
-    uv1: Vec2 = .{ 0.0, 0.0 },
-
-    // glTF 2.0 specification, 3.7.2: JOINTS_n and WEIGHTS_n are VEC4, so one
-    // attribute set holds four joints per vertex.
-    joints: @Vector(4, u16) = @splat(0),
-    weights: Vec4 = @splat(0.0),
-};
-
-// The optional streams a mesh carries beyond the mandatory binding 0. Each flag
-// is one optional binding, described once by the corresponding GPU struct below.
-// Adding a stream is a field here and a struct there, rather than a branch in
-// every place that touches vertices.
-pub const VertexStreams = packed struct(u3) {
-    skinned: bool = false,
-    colour: bool = false,
-    uv1: bool = false,
-
-    pub fn index(self: VertexStreams) u3 {
-        return @bitCast(self);
-    }
-};
+const Vec3 = res.Vec3;
+const Vertex3D = res.Vertex3D;
 
 // Binding 0, present on every mesh. Positions stay f32 because geometry
 // precision is visible; UVs are f16, and normal and tangent are 10-10-10-2

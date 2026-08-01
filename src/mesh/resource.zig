@@ -1,7 +1,7 @@
 const std = @import("std");
 const vk = @import("vulkan");
 
-const bounds = @import("bounds.zig");
+const res = @import("lenore-resources");
 const buffer_module = @import("../buffer.zig");
 const Context = @import("../context.zig").Context;
 const memory = @import("../memory/allocator.zig");
@@ -10,8 +10,8 @@ const vertex_module = @import("vertex.zig");
 
 const Buffer = buffer_module.Buffer;
 const StagingArena = staging.StagingArena;
-const Vertex3D = vertex_module.Vertex3D;
-const VertexStreams = vertex_module.VertexStreams;
+const Vertex3D = res.Vertex3D;
+const VertexStreams = res.VertexStreams;
 
 // Every stream is laid out at this alignment inside one staging reservation.
 // vkCmdCopyBuffer constrains no offset, so this exists to keep each stream's
@@ -76,7 +76,7 @@ pub const Mesh = struct {
     index_type: vk.IndexType,
     streams: VertexStreams,
     morph_target_count: u32,
-    bounds: bounds.Bounds,
+    bounds: res.Bounds,
 
     // Packs the interchange vertices straight into the staging arena and records
     // one copy per stream into the caller's command buffer. Nothing is submitted
@@ -241,7 +241,7 @@ pub const Mesh = struct {
             .index_type = comptime if (IndexType == u16) .uint16 else .uint32,
             .streams = upload.streams,
             .morph_target_count = morph_target_count,
-            .bounds = bounds.Bounds.compute(vertices),
+            .bounds = res.Bounds.compute(vertices),
         };
     }
 

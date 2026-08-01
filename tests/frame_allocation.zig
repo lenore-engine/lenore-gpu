@@ -12,10 +12,6 @@ const testing = std.testing;
 // freedom rests on review of those methods; this only catches the cheapest way
 // to lose it.
 const frame_types = [_]type{
-    gpu.SkeletonPose,
-    gpu.NodeAnimator,
-    gpu.Animation,
-    gpu.AnimationChannel,
     gpu.StagingArena,
     gpu.MaterialStorage,
     gpu.Mesh,
@@ -37,12 +33,10 @@ test "no per-frame type has a direct allocator field" {
     }
 }
 
-// The templates and caches a frame reads from are built once and may hold
-// whatever they need, so they are deliberately not in the list above. Naming
-// them here says the omission is a decision.
+// The caches a frame reads from are built once and may hold whatever they need,
+// so they are deliberately not in the list above. Naming one here says the
+// omission is a decision.
 test "the load-time types are outside that rule" {
-    try testing.expect(!holdsHostAllocator(gpu.SkeletonTemplate));
-    try testing.expect(!holdsHostAllocator(gpu.NodeTemplate));
     // The texture cache does store one, because acquiring a texture is load-time
     // work that allocates a key and a map entry.
     try testing.expect(holdsHostAllocator(gpu.TextureCache));

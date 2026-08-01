@@ -1,9 +1,10 @@
 const std = @import("std");
 const gpu = @import("lenore-gpu");
+const res = @import("lenore-resources");
 
 const testing = std.testing;
 const MaterialData = gpu.MaterialData;
-const MaterialInfo = gpu.MaterialInfo;
+const MaterialInfo = res.MaterialInfo;
 const TextureSlot = gpu.MaterialTextureSlot;
 
 // Resolving the type is what makes its comptime layout asserts run. Without a

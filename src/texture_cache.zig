@@ -12,7 +12,7 @@ const staging = @import("staging/arena.zig");
 const Allocator = std.mem.Allocator;
 const Image = image_module.Image;
 const SamplerCache = sampler_module.SamplerCache;
-const SamplerConfig = sampler_module.SamplerConfig;
+const SamplerConfig = @import("lenore-resources").SamplerConfig;
 const StagingArena = staging.StagingArena;
 
 // Vulkan specification, vkCmdCopyBufferToImage: bufferOffset is a multiple of 4

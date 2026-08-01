@@ -1,6 +1,7 @@
 const std = @import("std");
 const platform = @import("lenore-platform");
 const gpu = @import("lenore-gpu");
+const res = @import("lenore-resources");
 
 const checking = std.debug.runtime_safety;
 var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
@@ -172,7 +173,7 @@ pub fn main(process: std.process.Init.Minimal) !void {
 
     // A quad carrying every optional stream, so one batch exercises the
     // skinning, colour, second-UV and morph paths as well as the mandatory one.
-    const quad = [_]gpu.Vertex3D{
+    const quad = [_]res.Vertex3D{
         .{ .position = .{ -1, -1, 0 }, .normal = .{ 0, 0, 1 }, .uv = .{ 0, 0 }, .tangent = .{ 1, 0, 0, 1 } },
         .{ .position = .{ 1, -1, 0 }, .normal = .{ 0, 0, 1 }, .uv = .{ 1, 0 }, .tangent = .{ 1, 0, 0, 1 } },
         .{ .position = .{ 1, 1, 0 }, .normal = .{ 0, 0, 1 }, .uv = .{ 1, 1 }, .tangent = .{ 1, 0, 0, 1 } },
@@ -306,7 +307,7 @@ pub fn main(process: std.process.Init.Minimal) !void {
     var materials: gpu.MaterialStorage = try .init(&context, &allocator, 64);
     defer materials.deinit();
 
-    var info: gpu.MaterialInfo = .{
+    var info: res.MaterialInfo = .{
         .name = "example",
         .textures = .{},
         .factors = .{ .metallic = 0.0, .roughness = 0.4 },

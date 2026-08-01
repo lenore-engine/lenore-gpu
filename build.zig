@@ -7,6 +7,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_validation", optimize == .Debug);
 
     const platform = b.dependency("lenore_platform", .{ .target = target, .optimize = optimize });
+    const resource = b.dependency("lenore_resources", .{ .target = target, .optimize = optimize });
     const vulkan = b.dependency("vulkan_zig", .{
         .registry = b.path("vk/vk.xml"),
     }).module("vulkan-zig");
@@ -27,6 +28,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
             .{ .name = "lenore-platform", .module = platform.module("lenore-platform") },
+            .{ .name = "lenore-resources", .module = resource.module("lenore-resources") },
             .{ .name = "memory-suballocator", .module = suballocator },
             .{ .name = "staging-placement", .module = placement },
             .{ .name = "vulkan", .module = vulkan },
@@ -41,6 +43,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = testRoot(b, "tests"),
             .imports = &.{
                 .{ .name = "lenore-gpu", .module = mod },
+                .{ .name = "lenore-resources", .module = resource.module("lenore-resources") },
                 .{ .name = "memory-suballocator", .module = suballocator },
                 .{ .name = "staging-placement", .module = placement },
                 .{ .name = "vulkan", .module = vulkan },
@@ -67,6 +70,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "lenore-gpu", .module = mod },
                     .{ .name = "lenore-platform", .module = platform.module("lenore-platform") },
+                    .{ .name = "lenore-resources", .module = resource.module("lenore-resources") },
                     .{ .name = "zmath", .module = zmath },
                 },
                 .target = target,
