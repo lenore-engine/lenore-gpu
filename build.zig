@@ -38,6 +38,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    addShaders(b, mod);
+
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = testRoot(b, "tests"),
@@ -58,36 +60,67 @@ pub fn build(b: *std.Build) void {
 
     const module_tests = b.addTest(.{ .root_module = mod });
     test_step.dependOn(&b.addRunArtifact(module_tests).step);
+}
 
-    const examples_step = b.step("examples", "Build every example");
-    b.getInstallStep().dependOn(examples_step);
-    for (zigFilesIn(b, "examples")) |name| {
-        const stem = name[0 .. name.len - ".zig".len];
-        const exe = b.addExecutable(.{
-            .name = stem,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(b.fmt("examples/{s}", .{name})),
-                .imports = &.{
-                    .{ .name = "lenore-gpu", .module = mod },
-                    .{ .name = "lenore-platform", .module = platform.module("lenore-platform") },
-                    .{ .name = "lenore-resources", .module = resource.module("lenore-resources") },
-                    .{ .name = "zmath", .module = zmath },
-                },
-                .target = target,
-                .optimize = optimize,
-            }),
+// Vulkan 1.3 consumes SPIR-V 1.6, which is what the profile names.
+const spirv_profile = "spirv_1_6";
+
+// Every `assets/shaders/*.slang` becomes one SPIR-V module carrying all of that
+// file's entry points, imported under the file's stem. `shaders.zig` embeds
+// them; nothing else names a path.
+//
+// One module per file rather than per stage, because a Slang file marked up
+// with `[shader(...)]` attributes emits every entry point into one binary and
+// keeps their names, and the pipeline selects a stage by name.
+//
+// `-matrix-layout-row-major` is what makes a zmath `Mat` arrive as itself.
+//
+// The flag names the source language's convention, not the SPIR-V decoration:
+// measured, it produces `ColMajor`, and the default produces `RowMajor`. Which
+// one is right follows from the decoration together with the operation, and
+// only from both.
+//
+// Slang compiles `mul(vector, matrix)` to `OpMatrixTimesVector` either way, so
+// the result is the SPIR-V matrix times a column vector: component r is the sum
+// over c of column c's r-th component times v[c]. SPIR-V specification, 3.20
+// Decoration: `ColMajor` means components within a column are contiguous, so
+// SPIR-V's column c is the c-th four floats in memory, which is zmath's row c.
+// The sum is then over rows, which is what zmath's `mul(v, m)` computes.
+//
+// With the default the same sum runs over zmath's columns instead, and every
+// matrix reaches the shader transposed.
+fn addShaders(b: *std.Build, module: *std.Build.Module) void {
+    for (filesIn(b, "assets/shaders", ".slang")) |name| {
+        const stem = name[0 .. name.len - ".slang".len];
+        const command = b.addSystemCommand(&.{
+            "slangc",
+            "-target",
+            "spirv",
+            "-profile",
+            spirv_profile,
+            "-matrix-layout-row-major",
         });
-        exe.root_module.linkLibrary(platform.artifact("glfw"));
-        examples_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+        command.addFileArg(b.path(b.fmt("assets/shaders/{s}", .{name})));
+        command.addArg("-o");
+        const spirv = command.addOutputFileArg(b.fmt("{s}.spv", .{stem}));
 
-        const run = b.addRunArtifact(exe);
-        if (b.args) |args| run.addArgs(args);
-        b.step(b.fmt("run-{s}", .{stem}), b.fmt("Run the {s} example", .{stem}))
-            .dependOn(&run.step);
+        // The compiler's own account of the layout it produced. It is imported
+        // beside the words so a test can hold the hand-written mirror against
+        // it, which is the only thing that keeps the two from drifting. Nothing
+        // is generated from it: the Zig side stays authored.
+        command.addArg("-reflection-json");
+        const reflection = command.addOutputFileArg(b.fmt("{s}.json", .{stem}));
+
+        module.addAnonymousImport(stem, .{ .root_source_file = spirv });
+        module.addAnonymousImport(b.fmt("{s}_reflection", .{stem}), .{ .root_source_file = reflection });
     }
 }
 
 fn zigFilesIn(b: *std.Build, dir_path: []const u8) [][]const u8 {
+    return filesIn(b, dir_path, ".zig");
+}
+
+fn filesIn(b: *std.Build, dir_path: []const u8, extension: []const u8) [][]const u8 {
     var names: std.ArrayList([]const u8) = .empty;
     const io = b.graph.io;
     var dir = b.build_root.handle.openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
@@ -98,7 +131,7 @@ fn zigFilesIn(b: *std.Build, dir_path: []const u8) [][]const u8 {
 
     var iterator = dir.iterate();
     while (iterator.next(io) catch @panic("cannot list the directory")) |entry| {
-        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, extension)) continue;
         names.append(b.allocator, b.dupe(entry.name)) catch @panic("OOM");
     }
 

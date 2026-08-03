@@ -409,8 +409,9 @@ fn supportsRequiredFeatures(instance: Instance, physical_device: vk.PhysicalDevi
     if (properties.api_version < @as(u32, @bitCast(vk.API_VERSION_1_3))) return null;
 
     var vulkan_13 = vk.PhysicalDeviceVulkan13Features{};
+    var vulkan_11 = vk.PhysicalDeviceVulkan11Features{ .p_next = @ptrCast(&vulkan_13) };
     var features = vk.PhysicalDeviceFeatures2{
-        .p_next = @ptrCast(&vulkan_13),
+        .p_next = @ptrCast(&vulkan_11),
         .features = .{},
     };
     instance.getPhysicalDeviceFeatures2(physical_device, &features);
@@ -422,7 +423,11 @@ fn supportsRequiredFeatures(instance: Instance, physical_device: vk.PhysicalDevi
         core.shader_storage_image_extended_formats != .true or
         vulkan_13.dynamic_rendering != .true or
         vulkan_13.synchronization_2 != .true or
-        vulkan_13.shader_demote_to_helper_invocation != .true)
+        vulkan_13.shader_demote_to_helper_invocation != .true or
+        // An instanced draw reads SV_InstanceID, which Slang emits as the
+        // InstanceIndex builtin less the BaseInstance one, and BaseInstance is
+        // what this feature admits.
+        vulkan_11.shader_draw_parameters != .true)
     {
         return null;
     }
@@ -479,8 +484,12 @@ fn createDevice(instance: Instance, candidate: DeviceCandidate) InstanceWrapper.
         .synchronization_2 = .true,
         .shader_demote_to_helper_invocation = .true,
     };
-    const features = vk.PhysicalDeviceFeatures2{
+    var vulkan_11 = vk.PhysicalDeviceVulkan11Features{
         .p_next = @ptrCast(&vulkan_13),
+        .shader_draw_parameters = .true,
+    };
+    const features = vk.PhysicalDeviceFeatures2{
+        .p_next = @ptrCast(&vulkan_11),
         .features = .{
             .sampler_anisotropy = .true,
             .sample_rate_shading = .true,
@@ -525,9 +534,24 @@ fn debugCallback(
     else
         "missing callback data";
 
-    if (severity.error_bit_ext)
-        log.err("[{s}] {s}", .{ kind, message })
-    else
+    if (severity.error_bit_ext) {
+        _ = validation_errors.fetchAdd(1, .monotonic);
+        log.err("[{s}] {s}", .{ kind, message });
+    } else {
         log.warn("[{s}] {s}", .{ kind, message });
+    }
     return .false;
+}
+
+// Errors the validation layer has reported since the process started.
+//
+// A count rather than a log line, because a run that means to treat a
+// validation error as a failure cannot do that by reading its own output. The
+// callback is called from whichever thread made the offending call, so the
+// counter is atomic. Zero when validation is not enabled, which is every
+// release build.
+var validation_errors: std.atomic.Value(u32) = .init(0);
+
+pub fn validationErrorCount() u32 {
+    return validation_errors.load(.monotonic);
 }

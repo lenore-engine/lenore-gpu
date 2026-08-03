@@ -22,12 +22,21 @@ const TextureCache = texture_cache.TextureCache;
 const TextureSet = resource_storage.TextureSet;
 const TextureSetHandle = resource_storage.TextureSetHandle;
 
-// One texture a material asks for: the bytes, what the slot requires them to be,
-// and how it wants them sampled. The key is the content identity the cache
-// deduplicates by.
+// The two GPU-ready texture sources. A KTX2 carries its own format and mip
+// chain; decoded RGBA8 carries one tightly packed level and receives the format
+// required by the material slot.
+pub const TextureSource = union(enum) {
+    ktx2: []const u8,
+    rgba8: texture_cache.Rgba8,
+};
+
+// One texture a material asks for: the source image identity, its GPU-ready
+// bytes, and how it wants them sampled. The upload path includes the selected
+// Vulkan format in the cache key, because the same decoded image interpreted as
+// sRGB colour and linear data needs two immutable image formats.
 pub const TextureRequest = struct {
     key: []const u8,
-    ktx2_bytes: []const u8,
+    source: TextureSource,
     sampler: SamplerConfig = .{},
 };
 
@@ -51,13 +60,19 @@ const Slot = enum {
     emissive,
     occlusion,
 
-    fn format(self: Slot) vk.Format {
-        return switch (self) {
-            .base_colour, .emissive => .bc7_srgb_block,
-            .metallic_roughness, .occlusion => .bc7_unorm_block,
-            // Two channels are enough for a tangent-space normal: the third is
-            // reconstructed from them.
-            .normal => .bc5_unorm_block,
+    fn format(self: Slot, source: TextureSource) vk.Format {
+        return switch (source) {
+            .ktx2 => switch (self) {
+                .base_colour, .emissive => .bc7_srgb_block,
+                .metallic_roughness, .occlusion => .bc7_unorm_block,
+                // Two channels are enough for a tangent-space normal: the third
+                // is reconstructed from them.
+                .normal => .bc5_unorm_block,
+            },
+            .rgba8 => switch (self) {
+                .base_colour, .emissive => .r8g8b8a8_srgb,
+                .metallic_roughness, .normal, .occlusion => .r8g8b8a8_unorm,
+            },
         };
     }
 
@@ -84,10 +99,30 @@ comptime {
     }
 }
 
+// Cache identity is source identity plus immutable image format. A fixed-width
+// suffix makes the pairing injective without escaping arbitrary path bytes.
+fn interpretedKey(
+    allocator: Allocator,
+    source_key: []const u8,
+    format: vk.Format,
+) (Allocator.Error || error{TextureKeyTooLong})![]u8 {
+    const length = std.math.add(usize, source_key.len, @sizeOf(u32)) catch
+        return error.TextureKeyTooLong;
+    const key = try allocator.alloc(u8, length);
+    @memcpy(key[0..source_key.len], source_key);
+    std.mem.writeInt(
+        u32,
+        key[source_key.len..][0..@sizeOf(u32)],
+        @intCast(@intFromEnum(format)),
+        .little,
+    );
+    return key;
+}
+
 pub const BeginError = commands.BeginError || Allocator.Error;
 pub const AddMeshError = mesh_module.InitError || pool_module.AddError;
-pub const AddTextureSetError = texture_cache.AcquireError ||
-    sampler_module.GetError || pool_module.AddError;
+pub const AddTextureSetError = error{TextureKeyTooLong} ||
+    texture_cache.AcquireError || sampler_module.GetError || pool_module.AddError;
 pub const FinishError = commands.SubmitError;
 
 // What one completed batch put into the storage and the cache. It exists so a
@@ -340,19 +375,30 @@ pub const Batch = struct {
         const wanted = request orelse
             return self.cache.fallback(slot.fallback(), .{});
 
-        // The key is duplicated because the batch outlives the request, and
-        // releasing on rollback needs it.
-        const key = try self.allocator.dupe(u8, wanted.key);
+        const format = slot.format(wanted.source);
+        // The batch owns the interpreted key because it outlives the request,
+        // and releasing on rollback needs the exact identity the cache received.
+        const key = try interpretedKey(self.allocator, wanted.key, format);
         errdefer self.allocator.free(key);
 
-        const bound = try self.cache.acquireKtx2(
-            key,
-            wanted.ktx2_bytes,
-            slot.format(),
-            wanted.sampler,
-            self.arena,
-            self.command_buffer,
-        );
+        const bound = switch (wanted.source) {
+            .ktx2 => |bytes| try self.cache.acquireKtx2(
+                key,
+                bytes,
+                format,
+                wanted.sampler,
+                self.arena,
+                self.command_buffer,
+            ),
+            .rgba8 => |source| try self.cache.acquireRgba8(
+                key,
+                source,
+                format,
+                wanted.sampler,
+                self.arena,
+                self.command_buffer,
+            ),
+        };
         // Recorded before the reference is registered, so a failure between the
         // two would drop a reference nobody releases. Appending cannot fail: the
         // capacity for every slot was reserved before the first was resolved.

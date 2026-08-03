@@ -16,10 +16,27 @@ const SamplerConfig = @import("lenore-resources").SamplerConfig;
 const StagingArena = staging.StagingArena;
 
 // Vulkan specification, vkCmdCopyBufferToImage: bufferOffset is a multiple of 4
-// and of the texel block size. Every format this accepts has 16-byte blocks, and
-// KTX2 aligns its levels to the same value, so reserving the whole level block
-// at that alignment keeps each level's offset inside it aligned too.
+// and of the texel block size. Every KTX2 format this accepts has 16-byte blocks,
+// and the container aligns its levels to the same value, so reserving the whole
+// level block at that alignment keeps each level's offset inside it aligned too.
 const level_alignment: vk.DeviceSize = 16;
+const rgba8_alignment: vk.DeviceSize = @sizeOf(u32);
+
+// Decoded pixels, independent of the container or decoder that produced them.
+// Rows are tightly packed from the top of the source image, four bytes per
+// texel. The bytes need only outlive acquisition; they are copied into staging.
+pub const Rgba8 = struct {
+    width: u32,
+    height: u32,
+    bytes: []const u8,
+};
+
+pub const Rgba8Error = error{
+    InvalidExtent,
+    PixelLengthMismatch,
+    PixelLengthOverflow,
+    UnsupportedPixelFormat,
+};
 
 // The neutral image each material slot falls back to when it declares no
 // texture. They exist so a shader has no branch: sampling white and multiplying
@@ -92,8 +109,9 @@ pub const InitError = image_module.InitError || staging.ReserveError ||
 
 pub const AcquireError = error{
     FormatMismatch,
+    KeyConflict,
     NotKtx2,
-} || ktx2.ParseError || InitError || ref_cache.InsertError;
+} || Rgba8Error || ktx2.ParseError || InitError || ref_cache.InsertError;
 
 // Content-addressed store of texture images, with the fallbacks beside it.
 //
@@ -192,12 +210,17 @@ pub const TextureCache = struct {
         arena: *StagingArena,
         command_buffer: vk.CommandBuffer,
     ) AcquireError!Bound {
-        const resolved = try self.sampler(sampler_config);
-        if (self.images.acquire(key)) |existing| return .of(existing, resolved);
-
         if (!ktx2.isKtx2(bytes)) return error.NotKtx2;
         const file = try ktx2.parse(bytes);
         if (file.format != expected_format) return error.FormatMismatch;
+
+        const resolved = try self.sampler(sampler_config);
+        if (try self.acquireExisting(key, .{
+            .format = file.format,
+            .width = file.width,
+            .height = file.height,
+            .mip_levels = @intCast(file.level_count),
+        }, resolved)) |existing| return existing;
 
         const uploaded = try uploadKtx2(
             self.context,
@@ -210,6 +233,77 @@ pub const TextureCache = struct {
         // The cache owns the image from here, including if publishing fails.
         const stored = try self.images.insert(self.host_allocator, key, uploaded);
         return .of(stored, resolved);
+    }
+
+    // Uploads one decoded RGBA8 level. Decoding is deliberately outside the GPU
+    // module; this path consumes the same plain pixels whether they came from
+    // PNG, JPEG, an editor canvas or generated content.
+    //
+    // The image has one mip. Vulkan clamps sampling to the view's level count,
+    // so this is complete without pretending that mip generation and its colour
+    // filtering policy have been decided here.
+    pub fn acquireRgba8(
+        self: *TextureCache,
+        key: []const u8,
+        source: Rgba8,
+        format: vk.Format,
+        sampler_config: SamplerConfig,
+        arena: *StagingArena,
+        command_buffer: vk.CommandBuffer,
+    ) AcquireError!Bound {
+        try validateRgba8(source, format);
+
+        const resolved = try self.sampler(sampler_config);
+        if (try self.acquireExisting(key, .{
+            .format = format,
+            .width = source.width,
+            .height = source.height,
+            .mip_levels = 1,
+        }, resolved)) |existing| return existing;
+
+        const uploaded = try uploadRgba8(
+            self.context,
+            self.memory_allocator,
+            arena,
+            command_buffer,
+            source,
+            format,
+        );
+        const stored = try self.images.insert(self.host_allocator, key, uploaded);
+        return .of(stored, resolved);
+    }
+
+    // Host-side validation exposed on the type so container decoders can be
+    // tested without constructing a device or a cache.
+    pub fn validateRgba8(source: Rgba8, format: vk.Format) Rgba8Error!void {
+        return validateRgba8Source(source, format);
+    }
+
+    const ExpectedImage = struct {
+        format: vk.Format,
+        width: u32,
+        height: u32,
+        mip_levels: u32,
+    };
+
+    fn acquireExisting(
+        self: *TextureCache,
+        key: []const u8,
+        expected: ExpectedImage,
+        resolved_sampler: vk.Sampler,
+    ) AcquireError!?Bound {
+        const existing = self.images.acquire(key) orelse return null;
+        if (existing.format != expected.format or
+            existing.width != expected.width or
+            existing.height != expected.height or
+            existing.mip_levels != expected.mip_levels)
+        {
+            // `acquire` already took a reference. Undo it before reporting that
+            // the caller reused one identity for different image content.
+            self.images.release(self.host_allocator, key);
+            return error.KeyConflict;
+        }
+        return .of(existing, resolved_sampler);
     }
 
     pub fn release(self: *TextureCache, key: []const u8) void {
@@ -228,6 +322,18 @@ pub const TextureCache = struct {
         return self.images.references(key);
     }
 };
+
+fn validateRgba8Source(source: Rgba8, format: vk.Format) Rgba8Error!void {
+    if (source.width == 0 or source.height == 0) return error.InvalidExtent;
+    if (format != .r8g8b8a8_srgb and format != .r8g8b8a8_unorm)
+        return error.UnsupportedPixelFormat;
+
+    const width = std.math.cast(usize, source.width) orelse return error.PixelLengthOverflow;
+    const height = std.math.cast(usize, source.height) orelse return error.PixelLengthOverflow;
+    const pixels = std.math.mul(usize, width, height) catch return error.PixelLengthOverflow;
+    const expected = std.math.mul(usize, pixels, 4) catch return error.PixelLengthOverflow;
+    if (source.bytes.len != expected) return error.PixelLengthMismatch;
+}
 
 fn uploadSingleTexel(
     context: *const Context,
@@ -253,6 +359,34 @@ fn uploadSingleTexel(
         .mip_level = 0,
         .width = 1,
         .height = 1,
+    }});
+    return image;
+}
+
+fn uploadRgba8(
+    context: *const Context,
+    memory_allocator: *memory.MemoryAllocator,
+    arena: *StagingArena,
+    command_buffer: vk.CommandBuffer,
+    source: Rgba8,
+    format: vk.Format,
+) InitError!Image {
+    const reservation = try arena.reserve(source.bytes.len, rgba8_alignment);
+    @memcpy(reservation.bytes, source.bytes);
+
+    var image = try Image.init(context, memory_allocator, .{
+        .width = source.width,
+        .height = source.height,
+        .format = format,
+        .usage = .{ .transfer_dst_bit = true, .sampled_bit = true },
+    });
+    errdefer image.deinit();
+
+    try recordUpload(&image, arena, command_buffer, &.{.{
+        .buffer_offset = reservation.offset,
+        .mip_level = 0,
+        .width = source.width,
+        .height = source.height,
     }});
     return image;
 }

@@ -4,19 +4,35 @@ const Buffer = @import("buffer.zig").Buffer;
 const Context = @import("context.zig").Context;
 const memory = @import("memory/allocator.zig");
 
-// Every image here is a single-sampled, optimal-tiling, single-layer 2D colour
-// image. That is what the resource path uses, and it is what the allocator's
-// image pool is granularity-separated for. Attachments with other shapes belong
-// to the renderer.
+// Every image here is single-sampled, optimal-tiling, single-layer and 2D. That
+// is what the resource path uses and what the allocator's image pool is
+// granularity-separated for, and it is also the shape of a render target.
+// Multisampled and layered attachments are not this type.
 const array_layers: u32 = 1;
 const base_array_layer: u32 = 0;
 const base_mip_level: u32 = 0;
 const image_origin: vk.Offset3D = .{ .x = 0, .y = 0, .z = 0 };
 const single_depth: u32 = 1;
 
-// The colour aspect is the only one a sampled resource image has. Depth and
-// stencil aspects arrive with attachments.
-const colour_aspect: vk.ImageAspectFlags = .{ .color_bit = true };
+// What an image holds, which decides its view's aspect and which format feature
+// its usage is checked against. A named pair rather than a free `aspect` field:
+// a view carrying both the colour and the depth aspect is not a state worth
+// being able to express.
+pub const Kind = enum {
+    // Colour data, whether it is sampled, copied into, or rendered to.
+    colour,
+
+    // A depth attachment. Nothing here creates a combined depth-stencil view,
+    // so the aspect is depth alone.
+    depth,
+
+    pub fn aspect(self: Kind) vk.ImageAspectFlags {
+        return switch (self) {
+            .colour => .{ .color_bit = true },
+            .depth => .{ .depth_bit = true },
+        };
+    }
+};
 
 // A mip chain of 16 levels describes extents up to 32768 texels. Creation
 // rejects anything deeper, which is what lets the copy path build its Vulkan
@@ -29,6 +45,8 @@ const supported_usage = vk.ImageUsageFlags{
     .transfer_src_bit = true,
     .transfer_dst_bit = true,
     .sampled_bit = true,
+    .color_attachment_bit = true,
+    .depth_stencil_attachment_bit = true,
 };
 
 pub const InitError = error{
@@ -59,6 +77,7 @@ pub const Config = struct {
     format: vk.Format,
     mip_levels: u32 = 1,
     usage: vk.ImageUsageFlags,
+    kind: Kind = .colour,
 };
 
 // One mip level of a buffer-to-image copy. The fields a caller can get wrong are
@@ -126,6 +145,7 @@ pub const Image = struct {
     format: vk.Format,
     mip_levels: u32,
     usage: vk.ImageUsageFlags,
+    kind: Kind,
 
     pub fn init(
         context: *const Context,
@@ -136,7 +156,7 @@ pub const Image = struct {
         if (memory_allocator.context.device.handle != context.device.handle)
             return error.AllocatorDeviceMismatch;
         if (std.meta.eql(config.usage, vk.ImageUsageFlags{})) return error.EmptyUsage;
-        if (!supported_usage.contains(config.usage)) return error.UnsupportedUsage;
+        if (!usageSupported(config.usage)) return error.UnsupportedUsage;
 
         const limit = context.properties.limits.max_image_dimension_2d;
         if (config.width > limit or config.height > limit)
@@ -182,7 +202,7 @@ pub const Image = struct {
             .format = config.format,
             .components = .{ .r = .identity, .g = .identity, .b = .identity, .a = .identity },
             .subresource_range = .{
-                .aspect_mask = colour_aspect,
+                .aspect_mask = config.kind.aspect(),
                 .base_mip_level = base_mip_level,
                 .level_count = config.mip_levels,
                 .base_array_layer = base_array_layer,
@@ -201,6 +221,7 @@ pub const Image = struct {
             .format = config.format,
             .mip_levels = config.mip_levels,
             .usage = config.usage,
+            .kind = config.kind,
         };
     }
 
@@ -237,7 +258,7 @@ pub const Image = struct {
             .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
             .image = self.handle,
             .subresource_range = .{
-                .aspect_mask = colour_aspect,
+                .aspect_mask = self.kind.aspect(),
                 .base_mip_level = base_mip_level,
                 .level_count = self.mip_levels,
                 .base_array_layer = base_array_layer,
@@ -289,7 +310,7 @@ pub const Image = struct {
                 .buffer_row_length = 0,
                 .buffer_image_height = 0,
                 .image_subresource = .{
-                    .aspect_mask = colour_aspect,
+                    .aspect_mask = self.kind.aspect(),
                     .mip_level = region.mip_level,
                     .base_array_layer = base_array_layer,
                     .layer_count = array_layers,
@@ -319,6 +340,28 @@ pub fn mipExtent(base: u32, level: u32) u32 {
     return @max(1, base >> @intCast(level));
 }
 
+// One check per supported usage bit, rather than a table mapping usage to
+// features. Adding a usage to `supported_usage` without its feature check is
+// then a visible omission instead of a silent pass.
+//
+// Takes the features rather than a device, so which usage needs which feature
+// is decided where it can be exercised without one.
+// Whether this module creates an image with that usage at all, as distinct from
+// whether a given format can serve it. Feature-gated and multisample-only bits
+// are the ones that fail here.
+pub fn usageSupported(usage: vk.ImageUsageFlags) bool {
+    return supported_usage.contains(usage);
+}
+
+pub fn formatSupports(usage: vk.ImageUsageFlags, features: vk.FormatFeatureFlags) bool {
+    if (usage.transfer_src_bit and !features.transfer_src_bit) return false;
+    if (usage.transfer_dst_bit and !features.transfer_dst_bit) return false;
+    if (usage.sampled_bit and !features.sampled_image_bit) return false;
+    if (usage.color_attachment_bit and !features.color_attachment_bit) return false;
+    if (usage.depth_stencil_attachment_bit and !features.depth_stencil_attachment_bit) return false;
+    return true;
+}
+
 fn verifyFormatSupport(
     context: *const Context,
     format: vk.Format,
@@ -328,15 +371,6 @@ fn verifyFormatSupport(
         context.physical_device,
         format,
     );
-    const features = properties.optimal_tiling_features;
-
-    // One check per supported usage bit, rather than a table mapping usage to
-    // features. Adding a usage to supported_usage without its feature check is
-    // then a visible omission instead of a silent pass.
-    if (usage.transfer_src_bit and !features.transfer_src_bit)
-        return error.UnsupportedFormatUsage;
-    if (usage.transfer_dst_bit and !features.transfer_dst_bit)
-        return error.UnsupportedFormatUsage;
-    if (usage.sampled_bit and !features.sampled_image_bit)
+    if (!formatSupports(usage, properties.optimal_tiling_features))
         return error.UnsupportedFormatUsage;
 }
