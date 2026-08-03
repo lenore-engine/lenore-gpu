@@ -13,6 +13,62 @@ const Allocator = std.mem.Allocator;
 // the triangle, so loading the previous contents would be bandwidth spent on
 // values that are all about to be replaced.
 
+// Runtime look state is supplied by composition for each recording. The pass
+// does not retain it, so changing a look cannot mutate work already submitted.
+pub const Settings = struct {
+    exposure: f32 = 1,
+};
+
+pub const SettingsError = error{InvalidExposure};
+
+// Mirrors `PostPushConstants` in fullscreen.slang.
+pub const PushConstants = extern struct {
+    exposure: f32,
+};
+
+pub const push_constant_range: vk.PushConstantRange = .{
+    .stage_flags = .{ .fragment_bit = true },
+    .offset = 0,
+    .size = @sizeOf(PushConstants),
+};
+
+pub fn pushConstants(settings: Settings) SettingsError!PushConstants {
+    if (!std.math.isFinite(settings.exposure) or settings.exposure < 0)
+        return error.InvalidExposure;
+    return .{ .exposure = settings.exposure };
+}
+
+// The host account of the fragment arithmetic. KhronosGroup/ToneMapping,
+// PBR_Neutral defines the operator over non-negative linear Rec. 709 values.
+pub fn toneMap(colour: [3]f32, settings: Settings) SettingsError![3]f32 {
+    const constants = try pushConstants(settings);
+
+    var mapped: [3]f32 = undefined;
+    inline for (0..3) |channel|
+        mapped[channel] = @max(colour[channel] * constants.exposure, 0);
+
+    const darkest = @min(mapped[0], @min(mapped[1], mapped[2]));
+    const offset = if (darkest < 0.08)
+        darkest - 6.25 * darkest * darkest
+    else
+        0.04;
+    inline for (0..3) |channel| mapped[channel] -= offset;
+
+    const start_compression = 0.8 - 0.04;
+    const peak = @max(mapped[0], @max(mapped[1], mapped[2]));
+    if (peak < start_compression) return mapped;
+
+    const distance_to_white = 1 - start_compression;
+    const compressed_peak = 1 - distance_to_white * distance_to_white /
+        (peak + distance_to_white - start_compression);
+    inline for (0..3) |channel| mapped[channel] *= compressed_peak / peak;
+
+    const desaturation = 1 - 1 / (0.15 * (peak - compressed_peak) + 1);
+    inline for (0..3) |channel|
+        mapped[channel] = mapped[channel] * (1 - desaturation) + compressed_peak * desaturation;
+    return mapped;
+}
+
 // The swapchain image this frame acquired.
 pub const Target = struct {
     image: vk.Image,

@@ -101,9 +101,16 @@ pub const TextureRequest = upload.TextureRequest;
 pub const TextureSetRequest = upload.TextureSetRequest;
 
 pub const Renderer = renderer.Renderer;
+pub const RendererMaterialError = renderer.MaterialError;
+pub const RendererFrameError = renderer.FrameError;
+pub const RendererUpdateError = renderer.UpdateError;
+pub const RendererRecordError = renderer.RecordError;
+pub const validateRendererMaterialIndex = renderer.validateMaterialIndex;
+pub const validateRendererFrameIndex = renderer.validateFrameIndex;
+pub const validateRendererRecordBatch = renderer.validateRecordBatch;
 pub const SceneVariant = renderer.SceneVariant;
 pub const sceneVariantFor = renderer.sceneVariantFor;
-pub const RendererDraw = renderer.Draw;
+pub const RecordBatch = renderer.RecordBatch;
 pub const RendererMaterialBindings = renderer.material_bindings;
 
 pub const ResourceStorage = resource_storage.ResourceStorage;
@@ -155,6 +162,11 @@ pub const PostTarget = post.Target;
 pub const PostSets = post.Sets;
 pub const PostSource = post.Source;
 pub const PostBindings = post.bindings;
+pub const PostSettings = post.Settings;
+pub const PostSettingsError = post.SettingsError;
+pub const PostPushConstants = post.PushConstants;
+pub const postPushConstantRange = post.push_constant_range;
+pub const toneMap = post.toneMap;
 
 pub const ResourcePool = pool.ResourcePool;
 pub const PoolAddError = pool.AddError;

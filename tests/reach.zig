@@ -101,7 +101,7 @@ test "the device-facing surface is compiled" {
     _ = &gpu.Renderer.resize;
     _ = &gpu.Renderer.update;
     _ = &gpu.Renderer.record;
-    _ = &gpu.Renderer.bindMaterial;
+    _ = &gpu.Renderer.setMaterialTextures;
     _ = &gpu.Renderer.targetExtent;
     _ = &gpu.Renderer.mainPassTarget;
 

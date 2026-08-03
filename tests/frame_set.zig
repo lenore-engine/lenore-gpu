@@ -15,18 +15,22 @@ test "the frame set's own methods are reached by the compiler" {
     _ = &gpu.FrameSet.descriptorSetLayout;
 }
 
-test "an instance is the model matrix and the joint base, at the shader's stride" {
+test "an instance carries model, joint and material indices at the shader's stride" {
     // The element the shader steps through. A `float4x4` aligns the struct to
-    // sixteen bytes, so sixty-eight bytes of payload stride by eighty. Getting
+    // sixteen bytes, so seventy-two bytes of payload stride by eighty. Getting
     // this wrong reads the wrong instance from the second one on, and the first
     // still looks right, which is why it is pinned here rather than noticed.
     try testing.expectEqual(@as(usize, 80), @sizeOf(gpu.Instance));
     try testing.expectEqual(@as(usize, 16), @alignOf(gpu.Instance));
 
-    // The base sits after the matrix, not before it. Both orders compile and
-    // both are eighty bytes; only one agrees with the shader.
+    // The indices sit after the matrix in the order the shader names them. A
+    // different order has the same stride and still reads different values.
     try testing.expectEqual(@as(usize, 0), @offsetOf(gpu.Instance, "model"));
     try testing.expectEqual(@as(usize, 64), @offsetOf(gpu.Instance, "joint_base"));
+    try testing.expectEqual(@as(usize, 68), @offsetOf(gpu.Instance, "material_index"));
+
+    const default_material: gpu.Instance = .{ .model = zm.identity(), .joint_base = 0 };
+    try testing.expectEqual(@as(u32, 0), default_material.material_index);
 }
 
 test "a joint matrix is the matrix the shader reads and nothing more" {

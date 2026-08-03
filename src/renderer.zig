@@ -41,6 +41,46 @@ pub const InitError = error{
     descriptors.InitError ||
     pipeline.CreateError;
 
+pub const MaterialError = error{MaterialIndexOutOfRange};
+pub const FrameError = error{FrameIndexOutOfRange};
+pub const UpdateError = frame_set.UpdateError || FrameError;
+pub const RecordError = MaterialError || FrameError || post.SettingsError || error{
+    MaterialNotConfigured,
+    EmptyBatch,
+    InstanceRangeOutOfBounds,
+    UnsupportedCullMode,
+};
+
+pub fn validateMaterialIndex(material_count: usize, index: u32) MaterialError!void {
+    if (index >= material_count) return error.MaterialIndexOutOfRange;
+}
+
+pub fn validateFrameIndex(frame_count: usize, index: usize) FrameError!void {
+    if (index >= frame_count) return error.FrameIndexOutOfRange;
+}
+
+// Validates every value the recorder uses as an unchecked index or range. This
+// runs over the complete list before rendering begins, so a bad batch cannot
+// leave an open pass or a partially recorded frame.
+pub fn validateRecordBatch(
+    material_ready: []const bool,
+    live_instances: usize,
+    material_index: u32,
+    cull_mode: vk.CullModeFlags,
+    first_instance: u32,
+    instance_count: u32,
+) RecordError!void {
+    try validateMaterialIndex(material_ready.len, material_index);
+    if (!material_ready[material_index]) return error.MaterialNotConfigured;
+    if (instance_count == 0) return error.EmptyBatch;
+    if (cull_mode.front_bit and cull_mode.back_bit) return error.UnsupportedCullMode;
+
+    const first: usize = first_instance;
+    const count: usize = instance_count;
+    if (first > live_instances or count > live_instances - first)
+        return error.InstanceRangeOutOfBounds;
+}
+
 // Which of the scene pipelines a mesh draws through.
 pub const SceneVariant = enum { unskinned, skinned };
 
@@ -62,12 +102,16 @@ pub fn sceneVariantFor(streams: res.VertexStreams) SceneVariant {
     return if (streams.skinned) .skinned else .unskinned;
 }
 
-// One mesh drawn with one material, repeated for every instance. The instances
-// are model matrices, written into the frame ring in the order they are drawn.
-pub const Draw = struct {
+// The Vulkan-facing form the umbrella translates a scene batch into. Keeping
+// this distinct from the scene plan is deliberate: the GPU module owns resource
+// pointers and Vulkan cull state, while the scene module owns ordering policy.
+// Composition performs that translation into preallocated storage explicitly.
+pub const RecordBatch = struct {
     mesh: *const mesh_module.Mesh,
-    textures: *const resource_storage.TextureSet,
-    instances: []const frame_set.Instance,
+    material_index: u32,
+    cull_mode: vk.CullModeFlags,
+    first_instance: u32,
+    instance_count: u32,
 };
 
 pub const Renderer = struct {
@@ -91,6 +135,12 @@ pub const Renderer = struct {
 
     frame: frame_set.FrameSet,
     materials: MaterialSets,
+    // Descriptor sets and frame slots are indexed without checks after the
+    // recorder validates the whole batch list. Material readiness changes at
+    // cold setup; an instance count is published only after its frame update
+    // succeeds.
+    material_ready: []bool,
+    frame_instance_counts: []usize,
     post_sets: post.Sets,
     post_sampler: vk.Sampler,
 
@@ -99,11 +149,6 @@ pub const Renderer = struct {
     // so a caller that wants to tell them apart sets it to something else.
     clear_colour: [4]f32 = .{ 0, 0, 0, 1 },
 
-    // Which faces the scene pass drops. A material declares whether it is
-    // double sided, so this is dynamic state rather than a pipeline property.
-    // Dropping none is what a caller sets while the winding is not settled.
-    cull_mode: vk.CullModeFlags = .{ .back_bit = true },
-
     pub fn init(
         context: *const Context,
         memory_allocator: *memory.MemoryAllocator,
@@ -111,6 +156,7 @@ pub const Renderer = struct {
         extent: vk.Extent2D,
         frames: usize,
         capacity: frame_set.Capacity,
+        material_capacity: u32,
         present_format: vk.Format,
         post_sampler: vk.Sampler,
     ) InitError!Renderer {
@@ -133,8 +179,19 @@ pub const Renderer = struct {
         );
         errdefer frame.deinit(context, allocator);
 
-        var materials = try MaterialSets.init(context, allocator, 1);
+        // Set one has one long-lived descriptor set per material. It is not
+        // multiplied by frame or batch count: frame data lives in set zero, and
+        // every batch naming the same material reuses this set.
+        var materials = try MaterialSets.init(context, allocator, material_capacity);
         errdefer materials.deinit(context, allocator);
+
+        const material_ready = try allocator.alloc(bool, material_capacity);
+        errdefer allocator.free(material_ready);
+        @memset(material_ready, false);
+
+        const frame_instance_counts = try allocator.alloc(usize, frames);
+        errdefer allocator.free(frame_instance_counts);
+        @memset(frame_instance_counts, 0);
 
         var post_sets = try post.Sets.init(context, allocator, 1);
         errdefer post_sets.deinit(context, allocator);
@@ -143,12 +200,15 @@ pub const Renderer = struct {
         // Set 0 is the frame's and set 1 the material's, in that order: a
         // pipeline layout names its sets by index, and the shader's `space` is
         // that index.
-        const scene_layout = try pipeline.createLayout(context, &.{
+        const scene_layout = try pipeline.createLayout(context, .{ .descriptor_sets = &.{
             frame.descriptorSetLayout(),
             materials.layout,
-        });
+        } });
         errdefer context.device.destroyPipelineLayout(scene_layout, null);
-        const post_layout = try pipeline.createLayout(context, &.{post_sets.layout});
+        const post_layout = try pipeline.createLayout(context, .{
+            .descriptor_sets = &.{post_sets.layout},
+            .push_constants = &.{post.push_constant_range},
+        });
         errdefer context.device.destroyPipelineLayout(post_layout, null);
 
         const scene_pipeline = try pipeline.create(context, .{
@@ -214,6 +274,8 @@ pub const Renderer = struct {
             .post_pipeline = post_pipeline,
             .frame = frame,
             .materials = materials,
+            .material_ready = material_ready,
+            .frame_instance_counts = frame_instance_counts,
             .post_sets = post_sets,
             .post_sampler = post_sampler,
         };
@@ -229,6 +291,8 @@ pub const Renderer = struct {
         device.destroyPipelineLayout(self.post_layout, null);
         device.destroyPipelineLayout(self.scene_layout, null);
         self.post_sets.deinit(self.context, self.allocator);
+        self.allocator.free(self.frame_instance_counts);
+        self.allocator.free(self.material_ready);
         self.materials.deinit(self.context, self.allocator);
         self.frame.deinit(self.context, self.allocator);
         device.destroyShaderModule(self.post_module, null);
@@ -238,16 +302,23 @@ pub const Renderer = struct {
         self.* = undefined;
     }
 
-    // Point the material set at a texture set. Cold: once per material, not per
-    // frame.
-    pub fn bindMaterial(self: *Renderer, textures: *const resource_storage.TextureSet) void {
+    // Point one material set at its textures. Cold: once when that material's
+    // residency is established, not per frame or per batch. The caller ensures
+    // no submitted frame is reading the set when replacing an existing source.
+    pub fn setMaterialTextures(
+        self: *Renderer,
+        material_index: u32,
+        textures: *const resource_storage.TextureSet,
+    ) MaterialError!void {
+        try validateMaterialIndex(self.materials.sets.len, material_index);
+
         const info = vk.DescriptorImageInfo{
             .sampler = textures.base_colour.sampler,
             .image_view = textures.base_colour.view,
             .image_layout = pass.sampled_layout,
         };
         const writes = [_]vk.WriteDescriptorSet{.{
-            .dst_set = self.materials.set(0),
+            .dst_set = self.materials.set(@intCast(material_index)),
             .dst_binding = material_bindings[0].slot,
             .dst_array_element = 0,
             .descriptor_count = 1,
@@ -257,6 +328,7 @@ pub const Renderer = struct {
             .p_texel_buffer_view = &no_texel_buffers,
         }};
         self.context.device.updateDescriptorSets(&writes, null);
+        self.material_ready[material_index] = true;
     }
 
     // The attachments follow the swapchain, so a resize replaces them and the
@@ -308,10 +380,13 @@ pub const Renderer = struct {
         self: *Renderer,
         frame_index: usize,
         contents: frame_set.FrameSet.Frame,
-    ) frame_set.UpdateError!void {
+    ) UpdateError!void {
+        try validateFrameIndex(self.frame_instance_counts.len, frame_index);
+
         var flipped = contents;
         flipped.camera.view_projection = uniforms.vulkanClip(contents.camera.view_projection);
-        return self.frame.update(frame_index, flipped);
+        try self.frame.update(frame_index, flipped);
+        self.frame_instance_counts[frame_index] = contents.models.len;
     }
 
     fn scenePipelineFor(self: *const Renderer, streams: res.VertexStreams) vk.Pipeline {
@@ -326,26 +401,78 @@ pub const Renderer = struct {
         command_buffer: vk.CommandBuffer,
         frame_index: usize,
         target: post.Target,
-        draw: Draw,
-    ) void {
-        const device = self.context.device;
+        batches: []const RecordBatch,
+        post_settings: post.Settings,
+    ) RecordError!void {
+        const post_constants = try post.pushConstants(post_settings);
 
+        if (batches.len > 0) {
+            try validateFrameIndex(self.frame_instance_counts.len, frame_index);
+            const live_instances = self.frame_instance_counts[frame_index];
+            for (batches) |batch| {
+                try validateRecordBatch(
+                    self.material_ready,
+                    live_instances,
+                    batch.material_index,
+                    batch.cull_mode,
+                    batch.first_instance,
+                    batch.instance_count,
+                );
+            }
+        }
+
+        const device = self.context.device;
         pass.begin(self.context, command_buffer, self.mainPassTarget(), .{
             .clear_colour = self.clear_colour,
         });
-        device.cmdBindPipeline(command_buffer, .graphics, self.scenePipelineFor(draw.mesh.streams));
-        device.cmdSetCullMode(command_buffer, self.cull_mode);
-        self.frame.bind(self.context, command_buffer, self.scene_layout, frame_index);
-        device.cmdBindDescriptorSets(
-            command_buffer,
-            .graphics,
-            self.scene_layout,
-            1,
-            &.{self.materials.set(0)},
-            &.{},
-        );
-        draw.mesh.bind(self.context, command_buffer);
-        drawInstanced(self.context, command_buffer, draw.mesh, @intCast(draw.instances.len));
+
+        if (batches.len > 0) {
+            self.frame.bind(self.context, command_buffer, self.scene_layout, frame_index);
+
+            var last_pipeline: ?vk.Pipeline = null;
+            var last_material: ?u32 = null;
+            var last_cull_mode: ?u32 = null;
+            var last_mesh: ?*const mesh_module.Mesh = null;
+
+            for (batches) |batch| {
+                const selected_pipeline = self.scenePipelineFor(batch.mesh.streams);
+                if (last_pipeline == null or last_pipeline.? != selected_pipeline) {
+                    device.cmdBindPipeline(command_buffer, .graphics, selected_pipeline);
+                    last_pipeline = selected_pipeline;
+                }
+
+                const cull_mode = batch.cull_mode.toInt();
+                if (last_cull_mode == null or last_cull_mode.? != cull_mode) {
+                    device.cmdSetCullMode(command_buffer, batch.cull_mode);
+                    last_cull_mode = cull_mode;
+                }
+
+                if (last_material == null or last_material.? != batch.material_index) {
+                    device.cmdBindDescriptorSets(
+                        command_buffer,
+                        .graphics,
+                        self.scene_layout,
+                        1,
+                        &.{self.materials.set(@intCast(batch.material_index))},
+                        &.{},
+                    );
+                    last_material = batch.material_index;
+                }
+
+                if (last_mesh == null or last_mesh.? != batch.mesh) {
+                    batch.mesh.bind(self.context, command_buffer);
+                    last_mesh = batch.mesh;
+                }
+
+                drawInstanced(
+                    self.context,
+                    command_buffer,
+                    batch.mesh,
+                    batch.instance_count,
+                    batch.first_instance,
+                );
+            }
+        }
         pass.end(self.context, command_buffer, self.mainPassTarget());
 
         post.begin(self.context, command_buffer, target);
@@ -357,6 +484,14 @@ pub const Renderer = struct {
             0,
             &.{self.post_sets.set(0)},
             &.{},
+        );
+        device.cmdPushConstants(
+            command_buffer,
+            self.post_layout,
+            post.push_constant_range.stage_flags,
+            post.push_constant_range.offset,
+            post.push_constant_range.size,
+            @ptrCast(&post_constants),
         );
         device.cmdDraw(command_buffer, post.vertex_count, 1, 0, 0);
         post.end(self.context, command_buffer, target);
@@ -370,11 +505,12 @@ fn drawInstanced(
     command_buffer: vk.CommandBuffer,
     mesh: *const mesh_module.Mesh,
     instances: u32,
+    first_instance: u32,
 ) void {
     if (mesh.index_count > 0) {
-        context.device.cmdDrawIndexed(command_buffer, mesh.index_count, instances, 0, 0, 0);
+        context.device.cmdDrawIndexed(command_buffer, mesh.index_count, instances, 0, 0, first_instance);
     } else {
-        context.device.cmdDraw(command_buffer, mesh.vertex_count, instances, 0, 0);
+        context.device.cmdDraw(command_buffer, mesh.vertex_count, instances, 0, first_instance);
     }
 }
 

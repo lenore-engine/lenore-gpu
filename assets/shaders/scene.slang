@@ -47,12 +47,13 @@ struct Instance
     // Where this instance's joint matrices begin in `joints`. Read by
     // `skinnedVertexMain` and by nothing else.
     uint joint_base;
-    // Three scalars and not a `uint3`. A three-component vector aligns to
-    // sixteen bytes, which pushes the padding to offset eighty and rounds the
-    // element to ninety-six; measured, against the host's eighty.
+    // The material and two padding words are scalars and not a `uint3`. A
+    // three-component vector aligns to sixteen bytes, which pushes the tail to
+    // offset eighty and rounds the element to ninety-six; measured, against the
+    // host's eighty.
+    uint material_index;
     uint padding_0;
     uint padding_1;
-    uint padding_2;
 };
 
 [[vk::binding(0, 0)]] ConstantBuffer<CameraUbo> camera;

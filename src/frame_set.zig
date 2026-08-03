@@ -119,14 +119,14 @@ pub const Instance = extern struct {
     // indexes that array.
     joint_base: u32,
 
-    // Three scalars rather than one `[3]u32`, because the shader's mirror is
-    // three fields and is held against this one by name. A three-component
-    // vector there aligns to sixteen bytes, which puts the padding at offset
+    // The material and two padding words are separate scalars because the
+    // shader's mirror is held against this one by field name. A three-component
+    // vector there aligns to sixteen bytes, which puts the tail at offset
     // eighty and strides the element by ninety-six; that was measured against
     // the compiler's own reflection, not derived.
+    material_index: u32 = 0,
     padding_0: u32 = 0,
     padding_1: u32 = 0,
-    padding_2: u32 = 0,
 };
 
 // One joint matrix, as `StructuredBuffer<float4x4>` reads it.

@@ -194,6 +194,22 @@ test "the lights block is what the shader reads, field by field" {
     try expectMirrors(gpu.LightsUniform, try block(lights));
 }
 
+test "the post push constants are what the fullscreen shader reads" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const parsed = try parse(arena.allocator(), reflectionFor("fullscreen"));
+    const post = find(parsed.parameters, "post") orelse return error.MissingPostPushConstants;
+    try testing.expectEqualStrings("pushConstantBuffer", post.binding.kind);
+    try expectMirrors(gpu.PostPass.PushConstants, try block(post));
+
+    var push_count: usize = 0;
+    for (parsed.parameters) |parameter| {
+        if (std.mem.eql(u8, parameter.binding.kind, "pushConstantBuffer")) push_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), push_count);
+}
+
 test "a light is the element the shader's array steps through" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -307,6 +323,24 @@ test "both frame bindings carry a dynamic offset" {
     for (gpu.FrameSetBindings) |binding| {
         try testing.expect(binding.kind != withoutDynamic(binding.kind));
     }
+}
+
+test "the post set declares exactly the fullscreen descriptors" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const parsed = try parse(arena.allocator(), reflectionFor("fullscreen"));
+    var descriptor_count: usize = 0;
+    for (parsed.parameters) |parameter| {
+        if (std.mem.eql(u8, parameter.binding.kind, "pushConstantBuffer")) continue;
+        descriptor_count += 1;
+
+        const declared = for (gpu.PostBindings) |binding| {
+            if (binding.slot == parameter.binding.index) break binding;
+        } else return error.BindingNotDeclared;
+        try testing.expectEqual(try descriptorTypeOf(parameter), declared.kind);
+    }
+    try testing.expectEqual(gpu.PostBindings.len, descriptor_count);
 }
 
 test "an instance is what the shader steps through, field by field" {

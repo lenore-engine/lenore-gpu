@@ -5,6 +5,11 @@ const gpu = @import("lenore-gpu");
 const testing = std.testing;
 const post = gpu.PostPass;
 
+fn expectColour(expected: [3]f32, actual: [3]f32) !void {
+    inline for (0..3) |channel|
+        try testing.expectApproxEqAbs(expected[channel], actual[channel], 1.0e-6);
+}
+
 const target: gpu.PostTarget = .{
     .image = @enumFromInt(7),
     .view = @enumFromInt(8),
@@ -79,4 +84,61 @@ test "the post entry points are reached by the compiler" {
     _ = &post.begin;
     _ = &post.end;
     _ = &post.write;
+}
+
+test "the runtime look fits one fragment push-constant word" {
+    try testing.expectEqual(@as(usize, 4), @sizeOf(post.PushConstants));
+    try testing.expectEqual(@as(usize, 4), @alignOf(post.PushConstants));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(post.PushConstants, "exposure"));
+
+    try testing.expectEqual(@as(u32, 0), post.push_constant_range.offset);
+    try testing.expectEqual(@as(u32, @sizeOf(post.PushConstants)), post.push_constant_range.size);
+    try testing.expectEqual(
+        vk.ShaderStageFlags{ .fragment_bit = true },
+        post.push_constant_range.stage_flags,
+    );
+
+    const constants = try post.pushConstants(.{});
+    try testing.expectEqual(@as(f32, 1), constants.exposure);
+}
+
+test "only finite non-negative exposure reaches command state" {
+    try testing.expectError(error.InvalidExposure, post.pushConstants(.{ .exposure = -1 }));
+    try testing.expectError(error.InvalidExposure, post.pushConstants(.{ .exposure = std.math.nan(f32) }));
+    try testing.expectError(error.InvalidExposure, post.pushConstants(.{ .exposure = std.math.inf(f32) }));
+    try testing.expectError(error.InvalidExposure, post.pushConstants(.{ .exposure = -std.math.inf(f32) }));
+
+    const zero = try post.pushConstants(.{ .exposure = 0 });
+    try testing.expectEqual(@as(f32, 0), zero.exposure);
+}
+
+test "PBR Neutral preserves its near-black and uncompressed branches" {
+    try expectColour(
+        .{ 0.01, 0.07, 0.17 },
+        try post.toneMap(.{ 0.04, 0.10, 0.20 }, .{}),
+    );
+    try expectColour(
+        .{ 0.16, 0.36, 0.56 },
+        try post.toneMap(.{ 0.20, 0.40, 0.60 }, .{}),
+    );
+}
+
+test "PBR Neutral compresses and desaturates an HDR highlight" {
+    const mapped = try post.toneMap(.{ 4, 1, 0.25 }, .{});
+    try expectColour(.{ 0.9832558, 0.4682992, 0.3395600 }, mapped);
+    for (mapped) |channel| try testing.expect(channel >= 0 and channel <= 1);
+}
+
+test "exposure scales linear radiance before the operator" {
+    try expectColour(
+        .{ 0.3050976, 0.6075488, 0.91 },
+        try post.toneMap(.{ 0.20, 0.40, 0.60 }, .{ .exposure = 2 }),
+    );
+}
+
+test "negative radiance is removed before the operator" {
+    try expectColour(
+        .{ 0, 0.10, 0.20 },
+        try post.toneMap(.{ -1, 0.10, 0.20 }, .{}),
+    );
 }

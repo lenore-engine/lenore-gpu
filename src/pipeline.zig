@@ -171,13 +171,17 @@ pub fn createModule(context: *const Context, spirv: []const u32) CreateError!vk.
     }, null);
 }
 
-pub fn createLayout(
-    context: *const Context,
-    set_layouts: []const vk.DescriptorSetLayout,
-) CreateError!vk.PipelineLayout {
+pub const LayoutConfig = struct {
+    descriptor_sets: []const vk.DescriptorSetLayout = &.{},
+    push_constants: []const vk.PushConstantRange = &.{},
+};
+
+pub fn createLayout(context: *const Context, config: LayoutConfig) CreateError!vk.PipelineLayout {
     return context.device.createPipelineLayout(&.{
-        .set_layout_count = @intCast(set_layouts.len),
-        .p_set_layouts = set_layouts.ptr,
+        .set_layout_count = @intCast(config.descriptor_sets.len),
+        .p_set_layouts = config.descriptor_sets.ptr,
+        .push_constant_range_count = @intCast(config.push_constants.len),
+        .p_push_constant_ranges = config.push_constants.ptr,
     }, null);
 }
 
