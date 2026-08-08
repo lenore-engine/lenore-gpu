@@ -90,6 +90,7 @@ test "the masked alpha mode draws with the opaque pipeline" {
 
 test "the pipeline entry points are reached by the compiler" {
     _ = &gpu.Pipeline.create;
+    _ = &gpu.Pipeline.createCompute;
     _ = &gpu.Pipeline.createLayout;
     _ = &gpu.Pipeline.createModule;
 }

@@ -2,6 +2,7 @@ const std = @import("std");
 const vk = @import("vulkan");
 const buffer_module = @import("buffer.zig");
 const Context = @import("context.zig").Context;
+const descriptors = @import("descriptors.zig");
 const MaterialInfo = @import("lenore-resources").MaterialInfo;
 const memory = @import("memory/allocator.zig");
 
@@ -104,6 +105,13 @@ pub const MaterialData = extern struct {
         std.debug.assert(@intFromEnum(TextureSlot.occlusion) == 4);
     }
 
+    // The first flag lane, back as the enum it was packed from. The asserts
+    // above pin the three ordinals, and `fromInfo` is the only writer of the
+    // lane, so every value in a buffer this module filled names a member.
+    pub fn alphaMode(self: MaterialData) MaterialInfo.Rendering.AlphaMode {
+        return @enumFromInt(self.flags[0]);
+    }
+
     pub fn fromInfo(info: *const MaterialInfo) MaterialData {
         const textures = &info.textures;
         var mask: u32 = 0;
@@ -198,4 +206,58 @@ pub const MaterialStorage = struct {
     pub fn byteSize(self: *const MaterialStorage) vk.DeviceSize {
         return @as(vk.DeviceSize, @sizeOf(MaterialData)) * self.count;
     }
+
+    // One descriptor over the whole allocation rather than over the materials in
+    // it. Uploading changes `count` and never the range, so the descriptor is
+    // written once when the buffer reaches the renderer and no later upload has
+    // to rewrite it. A fragment reaching past `count` reads whatever the buffer
+    // was left holding, which is what the recorder's material-index validation
+    // stands between.
+    pub fn descriptor(self: *const MaterialStorage) vk.DescriptorBufferInfo {
+        return .{
+            .buffer = self.buffer.handle,
+            .offset = 0,
+            .range = @as(vk.DeviceSize, @sizeOf(MaterialData)) * self.capacity,
+        };
+    }
 };
+
+// Mirrors set 1 of scene.slang: what the scene supplies to the main pass and no
+// single draw changes. The packed material array is what it holds.
+//
+// Its own set rather than a binding in the frame set or a second binding in each
+// material set, and it sits between them by index. The three are in increasing
+// order of how often they are bound: set 0 once per frame, this one once per
+// recording, set 2 whenever the ordered list reaches a new material. The index
+// an instance carries selects a material out of this array, so which set is
+// bound is not what chooses one.
+pub const bindings = [_]descriptors.Binding{
+    .{ .slot = 0, .kind = .storage_buffer, .stages = .{ .fragment_bit = true } },
+};
+
+// Points the set at a material buffer. Cold: composition owns the buffer and
+// hands it over once, before anything is recorded against it.
+//
+// The set is passed in rather than a typed wrapper around it, because the layout
+// it belongs to is assembled from this list and the environment's; the type for
+// that lives where the two are joined.
+pub fn write(context: *const Context, set: vk.DescriptorSet, storage: *const MaterialStorage) void {
+    const info = storage.descriptor();
+    const writes = [_]vk.WriteDescriptorSet{.{
+        .dst_set = set,
+        .dst_binding = bindings[0].slot,
+        .dst_array_element = 0,
+        .descriptor_count = 1,
+        .descriptor_type = bindings[0].kind,
+        .p_image_info = &no_images,
+        .p_buffer_info = @ptrCast(&info),
+        .p_texel_buffer_view = &no_texel_buffers,
+    }};
+    context.device.updateDescriptorSets(&writes, null);
+}
+
+// Vulkan specification, VkWriteDescriptorSet: the members not selected by
+// descriptorType are ignored, but the pointers are not optional in the
+// structure, so they are given something valid to point at.
+const no_images = [_]vk.DescriptorImageInfo{};
+const no_texel_buffers = [_]vk.BufferView{};

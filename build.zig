@@ -99,6 +99,12 @@ fn addShaders(b: *std.Build, module: *std.Build.Module) void {
             "-profile",
             spirv_profile,
             "-matrix-layout-row-major",
+            // A module with one entry point has it renamed to `main` without
+            // this; several keep their names. Measured on 2026-08-08, and the
+            // reflection JSON reports the source name either way, so nothing
+            // reading that can see the rename. `tests/reflection.zig` scans the
+            // emitted words instead.
+            "-fvk-use-entrypoint-name",
         });
         command.addFileArg(b.path(b.fmt("assets/shaders/{s}", .{name})));
         command.addArg("-o");

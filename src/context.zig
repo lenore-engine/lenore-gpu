@@ -48,10 +48,49 @@ pub const Queue = struct {
     }
 };
 
-const QueueAllocation = struct {
+pub const QueueAllocation = struct {
+    // Also the family every dispatch is recorded on. vk.xml gives vkCmdDispatch
+    // `queues="VK_QUEUE_COMPUTE_BIT"`, and the morph prepass records into the
+    // same command buffer as the draws it feeds, so the two capabilities have to
+    // meet on one family rather than merely both be present on the device.
     graphics_family: u32,
     present_family: u32,
 };
+
+// What one queue family offers, as the choice below reads it.
+pub const QueueSupport = struct {
+    graphics: bool,
+    compute: bool,
+    present: bool,
+};
+
+// Which families a device is taken with, or null when it offers no usable pair.
+//
+// Split from the query for the reason the other validators in this module are:
+// the rule is a scan over flags, and a device and a surface stand between it and
+// a test. Every path through it has been wrong at some point in some engine: the
+// shared family, the split pair, and the graphics family that cannot dispatch.
+//
+// One family serving both is preferred, because a shared family needs no
+// ownership transfer between the draw and the present.
+pub fn chooseQueues(families: []const QueueSupport) ?QueueAllocation {
+    var graphics_family: ?u32 = null;
+    var present_family: ?u32 = null;
+
+    for (families, 0..) |support, index| {
+        const family: u32 = @intCast(index);
+        const usable_graphics = support.graphics and support.compute;
+        if (usable_graphics and support.present)
+            return .{ .graphics_family = family, .present_family = family };
+        if (graphics_family == null and usable_graphics) graphics_family = family;
+        if (present_family == null and support.present) present_family = family;
+    }
+
+    return .{
+        .graphics_family = graphics_family orelse return null,
+        .present_family = present_family orelse return null,
+    };
+}
 
 const DeviceExtensions = struct {
     memory_budget: bool,
@@ -332,27 +371,21 @@ fn allocateQueues(
     const families = try instance.getPhysicalDeviceQueueFamilyPropertiesAlloc(physical_device, allocator);
     defer allocator.free(families);
 
-    var graphics_family: ?u32 = null;
-    var present_family: ?u32 = null;
-    for (families, 0..) |properties, index| {
-        const family: u32 = @intCast(index);
-        const supports_graphics = properties.queue_flags.graphics_bit;
-        const supports_present = try instance.getPhysicalDeviceSurfaceSupportKHR(
-            physical_device,
-            family,
-            surface,
-        ) == .true;
-        if (supports_graphics and supports_present)
-            return .{ .graphics_family = family, .present_family = family };
-        if (graphics_family == null and supports_graphics) graphics_family = family;
-        if (present_family == null and supports_present) present_family = family;
-    }
+    const support = try allocator.alloc(QueueSupport, families.len);
+    defer allocator.free(support);
 
-    if (graphics_family != null and present_family != null) return .{
-        .graphics_family = graphics_family.?,
-        .present_family = present_family.?,
-    };
-    return null;
+    for (families, support, 0..) |properties, *entry, index| {
+        entry.* = .{
+            .graphics = properties.queue_flags.graphics_bit,
+            .compute = properties.queue_flags.compute_bit,
+            .present = try instance.getPhysicalDeviceSurfaceSupportKHR(
+                physical_device,
+                @intCast(index),
+                surface,
+            ) == .true,
+        };
+    }
+    return chooseQueues(support);
 }
 
 fn supportsSurface(
@@ -423,6 +456,11 @@ fn supportsRequiredFeatures(instance: Instance, physical_device: vk.PhysicalDevi
         core.shader_storage_image_extended_formats != .true or
         vulkan_13.dynamic_rendering != .true or
         vulkan_13.synchronization_2 != .true or
+        // The masked alpha path discards, and Slang lowers `discard` to
+        // OpDemoteToHelperInvocation rather than OpKill. A demoted invocation
+        // stays alive as a helper, which is what keeps the implicit-derivative
+        // texture samples around it defined. vk.xml lists this feature as what
+        // enables the DemoteToHelperInvocation capability.
         vulkan_13.shader_demote_to_helper_invocation != .true or
         // An instanced draw reads SV_InstanceID, which Slang emits as the
         // InstanceIndex builtin less the BaseInstance one, and BaseInstance is

@@ -24,18 +24,14 @@ const level_bytes = 16;
 const smallest_level_offset = 192;
 
 const bc7_srgb_format: u32 = 146;
+const rgba16_sfloat_format: u32 = 97;
 
 const File = [file_size]u8;
 
 fn validFile() File {
     var bytes: File = @splat(0);
 
-    const identifier = [12]u8{
-        0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32,
-        0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A,
-    };
-    @memcpy(bytes[0..12], &identifier);
-
+    writeIdentifier(&bytes);
     put32(&bytes, 12, bc7_srgb_format);
     put32(&bytes, 16, 1); // typeSize
     put32(&bytes, 20, 4); // pixelWidth
@@ -77,15 +73,96 @@ fn validFile() File {
     return bytes;
 }
 
-fn put16(bytes: *File, offset: usize, value: u16) void {
+// A 2x2 R16G16B16A16_SFLOAT cube map with a complete two-level chain, in the
+// shape of a prefiltered environment. Every level holds six faces, so its length
+// is six times one face, and the level alignment is the eight-byte texel rather
+// than the sixteen a block-compressed file uses.
+//
+// The descriptor is placed eight bytes past the index so that the first level
+// lands on 168: divisible by the eight-byte texel and not by sixteen. A parser
+// carrying the block-compressed alignment then fails this fixture instead of
+// passing it by coincidence.
+//
+// 0    identifier and header          80
+// 80   level index, two entries       48
+// 128  padding                         8
+// 136  data format descriptor         28
+// 164  padding to the texel alignment  4
+// 168  level 1, 1x1, six faces        48
+// 216  level 0, 2x2, six faces       192
+// 408  end of file
+const cube_file_size = 408;
+const cube_index_offset = 80;
+const cube_dfd_offset = 136;
+const cube_smallest_level_offset = 168;
+const cube_base_level_offset = 216;
+
+const CubeFile = [cube_file_size]u8;
+
+fn validCubeFile() CubeFile {
+    var bytes: CubeFile = @splat(0);
+
+    writeIdentifier(&bytes);
+    put32(&bytes, 12, rgba16_sfloat_format);
+    put32(&bytes, 16, 2); // typeSize, one 16-bit channel
+    put32(&bytes, 20, 2); // pixelWidth
+    put32(&bytes, 24, 2); // pixelHeight
+    put32(&bytes, 28, 0);
+    put32(&bytes, 32, 0);
+    put32(&bytes, 36, 6); // faceCount
+    put32(&bytes, 40, 2); // levelCount
+    put32(&bytes, 44, 0);
+    put32(&bytes, 48, cube_dfd_offset);
+    put32(&bytes, 52, dfd_length);
+    put32(&bytes, 56, 0);
+    put32(&bytes, 60, 0);
+    put64(&bytes, 64, 0);
+    put64(&bytes, 72, 0);
+
+    put64(&bytes, cube_index_offset, cube_base_level_offset);
+    put64(&bytes, cube_index_offset + 8, 192);
+    put64(&bytes, cube_index_offset + 16, 192);
+    put64(&bytes, cube_index_offset + 24, cube_smallest_level_offset);
+    put64(&bytes, cube_index_offset + 32, 48);
+    put64(&bytes, cube_index_offset + 40, 48);
+
+    writePlaceholderDescriptor(&bytes, cube_dfd_offset);
+    return bytes;
+}
+
+// The descriptor Khronos' own prefiltered environments carry, byte for byte:
+// dfdTotalSize zero, colour model and primaries unspecified, no samples and
+// bytesPlane all zero. The parser must accept this file, so the fixture states
+// it exactly rather than writing a conformant descriptor the real assets lack.
+fn writePlaceholderDescriptor(bytes: []u8, offset: usize) void {
+    put32(bytes, offset, 0); // dfdTotalSize, nonconformant and left as written
+    put16(bytes, offset + 4, 0); // vendorId
+    put16(bytes, offset + 6, 0); // descriptorType
+    put16(bytes, offset + 8, 2); // versionNumber
+    put16(bytes, offset + 10, 24); // descriptorBlockSize, no samples
+    bytes[offset + 12] = 0; // colorModel, unspecified
+    bytes[offset + 13] = 0; // colorPrimaries, unspecified
+    bytes[offset + 14] = 1; // transferFunction, linear
+    bytes[offset + 15] = 0; // flags
+}
+
+fn writeIdentifier(bytes: []u8) void {
+    const identifier = [12]u8{
+        0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32,
+        0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A,
+    };
+    @memcpy(bytes[0..12], &identifier);
+}
+
+fn put16(bytes: []u8, offset: usize, value: u16) void {
     std.mem.writeInt(u16, bytes[offset..][0..2], value, .little);
 }
 
-fn put32(bytes: *File, offset: usize, value: u32) void {
+fn put32(bytes: []u8, offset: usize, value: u32) void {
     std.mem.writeInt(u32, bytes[offset..][0..4], value, .little);
 }
 
-fn put64(bytes: *File, offset: usize, value: u64) void {
+fn put64(bytes: []u8, offset: usize, value: u64) void {
     std.mem.writeInt(u64, bytes[offset..][0..8], value, .little);
 }
 
@@ -93,6 +170,8 @@ test "a valid file yields an ascending mip chain" {
     const bytes = validFile();
     const file = try gpu.parseKtx2(&bytes);
 
+    try testing.expectEqual(gpu.Ktx2Kind.texture_2d, file.kind);
+    try testing.expectEqual(@as(u32, 1), file.face_count);
     try testing.expectEqual(@as(u32, 4), file.width);
     try testing.expectEqual(@as(u32, 4), file.height);
     try testing.expectEqual(@as(usize, 3), file.level_count);
@@ -107,7 +186,12 @@ test "a valid file yields an ascending mip chain" {
     try testing.expectEqual(@as(u64, 224), levels[0].byte_offset);
     try testing.expectEqual(@as(u64, 208), levels[1].byte_offset);
     try testing.expectEqual(@as(u64, 192), levels[2].byte_offset);
-    for (levels) |level| try testing.expectEqual(@as(u64, 16), level.byte_length);
+    for (levels) |level| {
+        try testing.expectEqual(@as(u64, 16), level.byte_length);
+        // One face, so the two lengths coincide and a caller that confuses them
+        // is not caught here. The cube fixture below is what separates them.
+        try testing.expectEqual(@as(u64, 16), level.face_byte_length);
+    }
 }
 
 test "the identifier gates everything" {
@@ -123,12 +207,18 @@ test "the identifier gates everything" {
 test "unsupported formats and container features are refused" {
     {
         var bytes = validFile();
-        put32(&bytes, 12, 37); // r8g8b8a8_unorm, not a block format
+        put32(&bytes, 12, 37); // r8g8b8a8_unorm, in no accepted row
         try testing.expectError(error.UnsupportedFormat, gpu.parseKtx2(&bytes));
     }
     {
         var bytes = validFile();
         put32(&bytes, 16, 4); // typeSize, meaningless for a block format
+        try testing.expectError(error.UnsupportedFormat, gpu.parseKtx2(&bytes));
+    }
+    {
+        // The float format's typeSize is its channel size, not one.
+        var bytes = validCubeFile();
+        put32(&bytes, 16, 1);
         try testing.expectError(error.UnsupportedFormat, gpu.parseKtx2(&bytes));
     }
     {
@@ -139,7 +229,8 @@ test "unsupported formats and container features are refused" {
     for ([_]struct { usize, u32 }{
         .{ 28, 1 }, // pixelDepth: a 3D image
         .{ 32, 2 }, // layerCount: an array
-        .{ 36, 6 }, // faceCount: a cube map
+        .{ 36, 2 }, // faceCount: neither a 2D image nor a cube
+        .{ 36, 5 }, // faceCount: an incomplete cube
     }) |patch| {
         var bytes = validFile();
         put32(&bytes, patch[0], patch[1]);
@@ -308,4 +399,93 @@ test "a level range outside the file is refused" {
     var bytes = validFile();
     put64(&bytes, index_offset, 240); // starts exactly at the end
     try testing.expectError(error.Truncated, gpu.parseKtx2(&bytes));
+}
+
+test "a cube map's level spans six faces" {
+    const bytes = validCubeFile();
+    const file = try gpu.parseKtx2(&bytes);
+
+    try testing.expectEqual(gpu.Ktx2Kind.cube, file.kind);
+    try testing.expectEqual(@as(u32, 6), file.face_count);
+    try testing.expectEqual(@as(u32, 2), file.width);
+    try testing.expectEqual(@as(u32, 2), file.height);
+    try testing.expectEqual(@as(usize, 2), file.level_count);
+
+    const levels = file.levels();
+    // 2x2 texels of eight bytes is 32 for one face and 192 for the cube; the
+    // two differ by more than a factor, so a caller using the wrong one cannot
+    // land on a plausible extent.
+    try testing.expectEqual(@as(u64, 192), levels[0].byte_length);
+    try testing.expectEqual(@as(u64, 32), levels[0].face_byte_length);
+    try testing.expectEqual(@as(u64, 48), levels[1].byte_length);
+    try testing.expectEqual(@as(u64, 8), levels[1].face_byte_length);
+    try testing.expectEqual(@as(u64, cube_base_level_offset), levels[0].byte_offset);
+    try testing.expectEqual(@as(u64, cube_smallest_level_offset), levels[1].byte_offset);
+}
+
+// The lambertian irradiance map Khronos publishes is one level at full extent,
+// which the 2D rule would reject as a missing tail.
+test "a cube map may carry fewer levels than its extent allows" {
+    // One index entry ends at 104, the descriptor at 132, and the single level
+    // starts at the next multiple of eight.
+    var bytes: [328]u8 = @splat(0);
+    @memcpy(bytes[0..80], validCubeFile()[0..80]);
+    put32(&bytes, 40, 1); // levelCount
+    put32(&bytes, 48, 104);
+    put32(&bytes, 52, dfd_length);
+    put64(&bytes, cube_index_offset, 136);
+    put64(&bytes, cube_index_offset + 8, 192);
+    put64(&bytes, cube_index_offset + 16, 192);
+    writePlaceholderDescriptor(&bytes, 104);
+
+    const file = try gpu.parseKtx2(&bytes);
+    try testing.expectEqual(@as(usize, 1), file.level_count);
+    try testing.expectEqual(@as(u64, 192), file.levels()[0].byte_length);
+
+    // More levels than the extent can halve into is still a broken file.
+    var too_many = validCubeFile();
+    put32(&too_many, 40, 3);
+    try testing.expectError(error.InvalidMipChain, gpu.parseKtx2(&too_many));
+}
+
+test "a cube map must be square" {
+    var bytes = validCubeFile();
+    put32(&bytes, 24, 4); // pixelHeight, leaving a 2x4 cube
+    try testing.expectError(error.InvalidDimensions, gpu.parseKtx2(&bytes));
+}
+
+// A block-compressed file aligns its levels to sixteen bytes and an eight-byte
+// texel format to eight. Carrying one constant for both silently refuses every
+// real environment, so the fixture pins the smaller one.
+test "an uncompressed level aligns to its texel, not to a block" {
+    const file = try gpu.parseKtx2(&validCubeFile());
+    try testing.expectEqual(@as(u64, 168), file.levels()[1].byte_offset);
+    try testing.expectEqual(@as(u64, 8), file.levels()[1].byte_offset % 16);
+
+    var misaligned = validCubeFile();
+    put64(&misaligned, cube_index_offset + 24, 172);
+    try testing.expectError(error.InvalidLevel, gpu.parseKtx2(&misaligned));
+}
+
+// The placeholder descriptor is accepted only where the table says the format
+// has none. A block-compressed file carrying the same bytes is still refused,
+// so the relaxation cannot leak into the path that has a real check.
+test "the placeholder descriptor does not excuse a block-compressed file" {
+    var bytes = validFile();
+    writePlaceholderDescriptor(&bytes, dfd_offset);
+    try testing.expectError(error.InvalidDataFormat, gpu.parseKtx2(&bytes));
+}
+
+test "a cube map's level length counts every face" {
+    var bytes = validCubeFile();
+    put64(&bytes, cube_index_offset + 8, 32); // the base level as if it held one face
+    try testing.expectError(error.InvalidLevel, gpu.parseKtx2(&bytes));
+}
+
+// An uploader reserves the whole chain as one block and computes each level's
+// offset relative to it, so the block has to be reserved at this alignment or
+// every level inside it is misaligned by the same amount.
+test "the file reports the alignment its own levels were placed on" {
+    try testing.expectEqual(@as(u64, 16), (try gpu.parseKtx2(&validFile())).level_alignment);
+    try testing.expectEqual(@as(u64, 8), (try gpu.parseKtx2(&validCubeFile())).level_alignment);
 }

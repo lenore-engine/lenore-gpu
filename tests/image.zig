@@ -17,6 +17,24 @@ test "a depth view carries the depth aspect and never the colour one" {
     try testing.expect(!colour.depth_bit);
 }
 
+test "a cube map is six layers, cube-compatible, and viewed as a cube" {
+    // The three properties have to agree or the image is unusable: Vulkan
+    // refuses a cube view of an image created without the flag, and a view
+    // asking for six layers of a one-layer image. Pinning them together is what
+    // makes a half-applied shape a failing test rather than a device error.
+    const flat = gpu.ImageShape.texture_2d;
+    const cube = gpu.ImageShape.cube;
+
+    try testing.expectEqual(@as(u32, 1), flat.layerCount());
+    try testing.expectEqual(@as(u32, 6), cube.layerCount());
+
+    try testing.expectEqual(vk.ImageCreateFlags{}, flat.createFlags());
+    try testing.expectEqual(vk.ImageCreateFlags{ .cube_compatible_bit = true }, cube.createFlags());
+
+    try testing.expectEqual(vk.ImageViewType.@"2d", flat.viewType());
+    try testing.expectEqual(vk.ImageViewType.cube, cube.viewType());
+}
+
 test "each usage is refused by the feature that would carry it" {
     // One usage at a time against a feature set holding everything else, so a
     // check wired to the wrong feature shows up as the wrong usage passing.

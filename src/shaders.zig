@@ -38,21 +38,29 @@ pub const EntryPoint = struct {
     name: [*:0]const u8,
 };
 
+// Every entry point is optional and every module states its own. A default
+// spelling would give a compute module a vertex entry it does not contain, and
+// nothing but pipeline creation would say so.
 pub const Module = struct {
     name: []const u8,
     spirv: []const u32,
-    vertex_entry: [*:0]const u8 = "vertexMain",
+    vertex_entry: ?[*:0]const u8 = null,
     // The skinned vertex variant, where a module has one. Same module and same
     // bindings; a pipeline selects it by name.
-    skinned_vertex_entry: [*:0]const u8 = "skinnedVertexMain",
-    fragment_entry: [*:0]const u8 = "fragmentMain",
+    skinned_vertex_entry: ?[*:0]const u8 = null,
+    fragment_entry: ?[*:0]const u8 = null,
+    compute_entry: ?[*:0]const u8 = null,
 
-    pub fn vertex(self: Module) EntryPoint {
-        return .{ .spirv = self.spirv, .name = self.vertex_entry };
+    pub fn vertex(self: Module) ?EntryPoint {
+        return .{ .spirv = self.spirv, .name = self.vertex_entry orelse return null };
     }
 
-    pub fn fragment(self: Module) EntryPoint {
-        return .{ .spirv = self.spirv, .name = self.fragment_entry };
+    pub fn fragment(self: Module) ?EntryPoint {
+        return .{ .spirv = self.spirv, .name = self.fragment_entry orelse return null };
+    }
+
+    pub fn compute(self: Module) ?EntryPoint {
+        return .{ .spirv = self.spirv, .name = self.compute_entry orelse return null };
     }
 };
 
@@ -65,6 +73,7 @@ pub const Reflection = struct {
 
 pub const reflection = [_]Reflection{
     .{ .name = "fullscreen", .json = @embedFile("fullscreen_reflection") },
+    .{ .name = "morph", .json = @embedFile("morph_reflection") },
     .{ .name = "scene", .json = @embedFile("scene_reflection") },
 };
 
@@ -72,13 +81,27 @@ pub const reflection = [_]Reflection{
 pub const scene: Module = .{
     .name = "scene",
     .spirv = words(@embedFile("scene").*),
+    .vertex_entry = "vertexMain",
+    .skinned_vertex_entry = "skinnedVertexMain",
+    .fragment_entry = "fragmentMain",
 };
 
 // The post pass: a screen-covering triangle that samples the HDR target.
 pub const fullscreen: Module = .{
     .name = "fullscreen",
     .spirv = words(@embedFile("fullscreen").*),
+    .vertex_entry = "vertexMain",
+    .fragment_entry = "fragmentMain",
+};
+
+// The morph prepass: shape targets resolved into a vertex buffer the main pass
+// draws in place of the mesh's own. Compute only, and it shares no binding with
+// either pass above.
+pub const morph: Module = .{
+    .name = "morph",
+    .spirv = words(@embedFile("morph").*),
+    .compute_entry = "morphMain",
 };
 
 // Everything above, for the checks that walk the set rather than name one.
-pub const all = [_]Module{ fullscreen, scene };
+pub const all = [_]Module{ fullscreen, morph, scene };

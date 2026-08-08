@@ -12,7 +12,6 @@ const testing = std.testing;
 // freedom rests on review of those methods; this only catches the cheapest way
 // to lose it.
 const frame_types = [_]type{
-    gpu.StagingArena,
     gpu.MaterialStorage,
     gpu.Mesh,
 };
@@ -40,19 +39,9 @@ test "the load-time types are outside that rule" {
     // The texture cache does store one, because acquiring a texture is load-time
     // work that allocates a key and a map entry.
     try testing.expect(holdsHostAllocator(gpu.TextureCache));
-}
 
-// The staging arena is the one per-frame path that hands out memory, and it does
-// so from a fixed reservation rather than from an allocator. Exhausting it is an
-// error, never a growth.
-test "the arena reports exhaustion instead of growing" {
-    const Bump = @import("staging-placement").Bump;
-
-    var bump: Bump = .init(64);
-    _ = try bump.reserve(64, 1);
-    try testing.expectError(error.OutOfSpace, bump.reserve(1, 1));
-    try testing.expectError(error.LargerThanCapacity, bump.reserve(128, 1));
-
-    bump.reset();
-    try testing.expectEqual(@as(u64, 0), try bump.reserve(64, 1));
+    // So does the staging pool, for the block array it allocates once at its
+    // ceiling. Uploading is load-time work and this type is not on the per-frame
+    // path, which is why it is named here rather than in the list above.
+    try testing.expect(holdsHostAllocator(gpu.StagingPool));
 }

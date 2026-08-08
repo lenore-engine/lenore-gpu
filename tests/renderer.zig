@@ -28,39 +28,88 @@ test "a renderer frame index addresses a tracked frame slot" {
     try testing.expectError(error.FrameIndexOutOfRange, gpu.validateRendererFrameIndex(0, 0));
 }
 
-test "a record batch names configured state and a live instance range" {
-    const ready = [_]bool{ true, false };
+// Material 0 is solid, material 1 has never been pointed at its textures, and
+// material 2 blends.
+const modes = [_]?gpu.PipelineMode{ .solid, null, .blended };
 
+test "a record batch names configured state and a live instance range" {
     // Exact fit at the end of the uploaded instance slice.
-    try gpu.validateRendererRecordBatch(&ready, 5, 0, .{ .back_bit = true }, 3, 2);
-    try gpu.validateRendererRecordBatch(&ready, 5, 0, .{}, 0, 5);
+    try gpu.validateRendererRecordBatch(&modes, 5, 0, .{ .back_bit = true }, 3, 2, false);
+    try gpu.validateRendererRecordBatch(&modes, 5, 0, .{}, 0, 5, false);
 
     try testing.expectError(
         error.MaterialIndexOutOfRange,
-        gpu.validateRendererRecordBatch(&ready, 5, 2, .{}, 0, 1),
+        gpu.validateRendererRecordBatch(&modes, 5, 3, .{}, 0, 1, false),
     );
     try testing.expectError(
         error.MaterialNotConfigured,
-        gpu.validateRendererRecordBatch(&ready, 5, 1, .{}, 0, 1),
+        gpu.validateRendererRecordBatch(&modes, 5, 1, .{}, 0, 1, false),
     );
     try testing.expectError(
         error.EmptyBatch,
-        gpu.validateRendererRecordBatch(&ready, 5, 0, .{}, 0, 0),
+        gpu.validateRendererRecordBatch(&modes, 5, 0, .{}, 0, 0, false),
     );
     try testing.expectError(
         error.UnsupportedCullMode,
-        gpu.validateRendererRecordBatch(&ready, 5, 0, .{ .front_bit = true, .back_bit = true }, 0, 1),
+        gpu.validateRendererRecordBatch(
+            &modes,
+            5,
+            0,
+            .{ .front_bit = true, .back_bit = true },
+            0,
+            1,
+            false,
+        ),
     );
     try testing.expectError(
         error.InstanceRangeOutOfBounds,
-        gpu.validateRendererRecordBatch(&ready, 5, 0, .{}, 4, 2),
+        gpu.validateRendererRecordBatch(&modes, 5, 0, .{}, 4, 2, false),
     );
     // Subtraction after testing `first` avoids overflow even for an arbitrary
     // boundary value supplied by composition.
     try testing.expectError(
         error.InstanceRangeOutOfBounds,
-        gpu.validateRendererRecordBatch(&ready, 5, 0, .{}, std.math.maxInt(u32), 1),
+        gpu.validateRendererRecordBatch(&modes, 5, 0, .{}, std.math.maxInt(u32), 1, false),
     );
+}
+
+test "a solid batch is refused once the list has reached its blended run" {
+    // What the ordering buys is that a blended surface is composited over the
+    // scene behind it. A solid batch recorded afterwards would be composited
+    // over the blended one instead, and its depth write would then reject the
+    // blended fragments already in the attachment.
+    try testing.expectError(
+        error.SolidBatchAfterBlended,
+        gpu.validateRendererRecordBatch(&modes, 5, 0, .{}, 0, 1, true),
+    );
+
+    // A blended batch after a blended one is the ordinary case.
+    try gpu.validateRendererRecordBatch(&modes, 5, 2, .{}, 0, 1, true);
+    // And a blended batch may open the run.
+    try gpu.validateRendererRecordBatch(&modes, 5, 2, .{}, 0, 1, false);
+}
+
+test "the layer order is checked against the material, not the batch's position" {
+    // An unconfigured material is refused whichever layer the list has reached,
+    // so the ordering check cannot mask a missing descriptor set.
+    try testing.expectError(
+        error.MaterialNotConfigured,
+        gpu.validateRendererRecordBatch(&modes, 5, 1, .{}, 0, 1, true),
+    );
+    // And an index past the table is still out of range, which has to be caught
+    // before the mode is read out of it.
+    try testing.expectError(
+        error.MaterialIndexOutOfRange,
+        gpu.validateRendererRecordBatch(&modes, 5, 3, .{}, 0, 1, true),
+    );
+}
+
+test "the three glTF alpha modes collapse onto the two pipelines" {
+    // MASK has no pipeline of its own: a masked fragment either survives the
+    // cutoff and behaves exactly like an opaque one or is discarded.
+    try testing.expectEqual(gpu.PipelineMode.solid, gpu.pipelineModeFor(.@"opaque"));
+    try testing.expectEqual(gpu.PipelineMode.solid, gpu.pipelineModeFor(.mask));
+    try testing.expectEqual(gpu.PipelineMode.blended, gpu.pipelineModeFor(.blend));
 }
 
 test "a mesh draws through the pipeline its own streams call for" {

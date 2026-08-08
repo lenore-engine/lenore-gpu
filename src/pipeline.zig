@@ -9,7 +9,8 @@ const AlphaMode = res.MaterialInfo.Rendering.AlphaMode;
 
 pub const CreateError = vk.DeviceWrapper.CreateShaderModuleError ||
     vk.DeviceWrapper.CreatePipelineLayoutError ||
-    vk.DeviceWrapper.CreateGraphicsPipelinesError;
+    vk.DeviceWrapper.CreateGraphicsPipelinesError ||
+    vk.DeviceWrapper.CreateComputePipelinesError;
 
 // How a primitive reaches the colour target. The two differ in more than
 // blending: a blended primitive does not write depth, because it is drawn after
@@ -315,6 +316,34 @@ pub fn create(context: *const Context, config: Config) CreateError!vk.Pipeline {
         .layout = config.layout,
         .render_pass = .null_handle,
         .subpass = 0,
+        .base_pipeline_handle = .null_handle,
+        .base_pipeline_index = -1,
+    }}, null, (&pipeline)[0..1]);
+
+    return pipeline;
+}
+
+pub const ComputeConfig = struct {
+    layout: vk.PipelineLayout,
+    stage: Stage,
+};
+
+// A compute pipeline is one stage and a layout. None of the state above applies:
+// there is no vertex input, no rasterizer and no attachment, so the config that
+// selects them has no compute counterpart rather than a set of ignored fields.
+//
+// The workgroup size is not here either. Vulkan takes it from the module's
+// LocalSize execution mode, so it is declared in the shader and a dispatch has to
+// divide by the same number; see the morph prepass, which holds the two together.
+pub fn createCompute(context: *const Context, config: ComputeConfig) CreateError!vk.Pipeline {
+    var pipeline: vk.Pipeline = undefined;
+    _ = try context.device.createComputePipelines(.null_handle, &.{.{
+        .stage = .{
+            .stage = .{ .compute_bit = true },
+            .module = config.stage.module,
+            .p_name = config.stage.entry_point,
+        },
+        .layout = config.layout,
         .base_pipeline_handle = .null_handle,
         .base_pipeline_index = -1,
     }}, null, (&pipeline)[0..1]);

@@ -4,15 +4,53 @@ const Buffer = @import("buffer.zig").Buffer;
 const Context = @import("context.zig").Context;
 const memory = @import("memory/allocator.zig");
 
-// Every image here is single-sampled, optimal-tiling, single-layer and 2D. That
+// Every image here is single-sampled, optimal-tiling and two-dimensional. That
 // is what the resource path uses and what the allocator's image pool is
 // granularity-separated for, and it is also the shape of a render target.
-// Multisampled and layered attachments are not this type.
-const array_layers: u32 = 1;
+// Multisampled attachments and array textures are not this type; a cube map is,
+// because its six layers are addressed as one image by one view.
 const base_array_layer: u32 = 0;
 const base_mip_level: u32 = 0;
-const image_origin: vk.Offset3D = .{ .x = 0, .y = 0, .z = 0 };
 const single_depth: u32 = 1;
+// A copy names one layer at a time; a barrier covers every layer of the image.
+const single_layer: u32 = 1;
+
+// Vulkan specification, Cube Map Face Selection: the six layers of a cube map
+// are +X, -X, +Y, -Y, +Z, -Z in that order. KTX2 stores its faces in the same
+// order, so an upload copies them as they lie in the file.
+const cube_layers: u32 = 6;
+
+// How many layers the image holds and how its view addresses them. It is a
+// separate axis from `Kind`, which decides the aspect: the two do not
+// constrain each other.
+pub const Shape = enum {
+    texture_2d,
+    cube,
+
+    pub fn layerCount(self: Shape) u32 {
+        return switch (self) {
+            .texture_2d => 1,
+            .cube => cube_layers,
+        };
+    }
+
+    // Vulkan specification, VkImageCreateInfo: a view of type cube requires the
+    // image to have been created cube-compatible, and the flag cannot be added
+    // afterwards.
+    pub fn createFlags(self: Shape) vk.ImageCreateFlags {
+        return switch (self) {
+            .texture_2d => .{},
+            .cube => .{ .cube_compatible_bit = true },
+        };
+    }
+
+    pub fn viewType(self: Shape) vk.ImageViewType {
+        return switch (self) {
+            .texture_2d => .@"2d",
+            .cube => .cube,
+        };
+    }
+};
 
 // What an image holds, which decides its view's aspect and which format feature
 // its usage is checked against. A named pair rather than a free `aspect` field:
@@ -63,12 +101,11 @@ pub const InitError = error{
 
 pub const CopyError = error{
     DifferentDevice,
+    LayerOutOfRange,
     MipLevelOutOfRange,
     MissingTransferDestinationUsage,
     MissingTransferSourceUsage,
-    NoRegions,
-    RegionExtentMismatch,
-    TooManyRegions,
+    RowRangeOutOfBounds,
 };
 
 pub const Config = struct {
@@ -78,20 +115,36 @@ pub const Config = struct {
     mip_levels: u32 = 1,
     usage: vk.ImageUsageFlags,
     kind: Kind = .colour,
+    shape: Shape = .texture_2d,
 };
 
-// One mip level of a buffer-to-image copy. The fields a caller can get wrong are
-// the ones that vary; aspect, layer, origin and tight packing are fixed by what
-// this type is, so they are not restated at every call site.
+// One buffer-to-image copy: a run of rows of one array layer of one mip level.
+//
+// A level that fits the staging space is one of these, and a level that does not
+// is a sequence of them. Rows are the unit because a level is tightly packed, so
+// a run of whole rows is contiguous in the buffer while a rectangle is not.
+//
+// The level's width is not a field. It is the image's own extent halved
+// mip_level times, so a caller computing it a second time could only disagree.
+// Aspect, origin and tight packing are fixed by what this type is.
 //
 // Vulkan specification, vkCmdCopyBufferToImage: bufferOffset must be a multiple
-// of 4 and of the texel block size. The staging arena takes the alignment as an
-// argument for exactly this reason.
+// of 4 and of the texel block size, and for a block compressed format
+// imageOffset and imageExtent must fall on block boundaries unless they reach
+// the image edge. The row range is in texels either way, and deriving one that
+// lands on those boundaries needs the format's block geometry, which this type
+// does not have. The staging pool takes the alignment as an argument for the
+// same reason.
 pub const MipCopy = struct {
     buffer_offset: vk.DeviceSize,
     mip_level: u32,
-    width: u32,
-    height: u32,
+    // One layer per region. A cube map's six faces are consecutive in the buffer
+    // and could be one region while they fit, but a level too large for a
+    // staging block has to be split by layer anyway, so there is one shape here
+    // instead of two.
+    layer: u32 = 0,
+    first_row: u32 = 0,
+    row_count: u32,
 };
 
 // An explicit image memory dependency. No layout pair is translated into masks
@@ -146,6 +199,7 @@ pub const Image = struct {
     mip_levels: u32,
     usage: vk.ImageUsageFlags,
     kind: Kind,
+    shape: Shape,
 
     pub fn init(
         context: *const Context,
@@ -158,9 +212,18 @@ pub const Image = struct {
         if (std.meta.eql(config.usage, vk.ImageUsageFlags{})) return error.EmptyUsage;
         if (!usageSupported(config.usage)) return error.UnsupportedUsage;
 
-        const limit = context.properties.limits.max_image_dimension_2d;
+        // Vulkan specification, VkImageCreateInfo: a cube-compatible image has
+        // equal width and height, and is bounded by maxImageDimensionCube
+        // rather than by maxImageDimension2D. The two limits are reported
+        // separately and a device may set them differently.
+        const limit = switch (config.shape) {
+            .texture_2d => context.properties.limits.max_image_dimension_2d,
+            .cube => context.properties.limits.max_image_dimension_cube,
+        };
         if (config.width > limit or config.height > limit)
             return error.ExtentLimitExceeded;
+        if (config.shape == .cube and config.width != config.height)
+            return error.InvalidExtent;
 
         // Vulkan specification, VkImageCreateInfo: mipLevels must be at least
         // one and must not exceed the number of levels the extent can halve
@@ -174,6 +237,7 @@ pub const Image = struct {
         try verifyFormatSupport(context, config.format, config.usage);
 
         const handle = try context.device.createImage(&.{
+            .flags = config.shape.createFlags(),
             .image_type = .@"2d",
             .format = config.format,
             .extent = .{
@@ -182,7 +246,7 @@ pub const Image = struct {
                 .depth = single_depth,
             },
             .mip_levels = config.mip_levels,
-            .array_layers = array_layers,
+            .array_layers = config.shape.layerCount(),
             .samples = .{ .@"1_bit" = true },
             .tiling = .optimal,
             .usage = config.usage,
@@ -198,7 +262,7 @@ pub const Image = struct {
 
         const view = try context.device.createImageView(&.{
             .image = handle,
-            .view_type = .@"2d",
+            .view_type = config.shape.viewType(),
             .format = config.format,
             .components = .{ .r = .identity, .g = .identity, .b = .identity, .a = .identity },
             .subresource_range = .{
@@ -206,7 +270,7 @@ pub const Image = struct {
                 .base_mip_level = base_mip_level,
                 .level_count = config.mip_levels,
                 .base_array_layer = base_array_layer,
-                .layer_count = array_layers,
+                .layer_count = config.shape.layerCount(),
             },
         }, null);
 
@@ -222,6 +286,7 @@ pub const Image = struct {
             .mip_levels = config.mip_levels,
             .usage = config.usage,
             .kind = config.kind,
+            .shape = config.shape,
         };
     }
 
@@ -237,7 +302,7 @@ pub const Image = struct {
         self.* = undefined;
     }
 
-    // The barrier covers every mip level and the single layer, because a partial
+    // The barrier covers every mip level and every layer, because a partial
     // transition has no user here and a range that does not match the copy is a
     // silent hazard.
     pub fn recordLayoutTransition(
@@ -262,7 +327,7 @@ pub const Image = struct {
                 .base_mip_level = base_mip_level,
                 .level_count = self.mip_levels,
                 .base_array_layer = base_array_layer,
-                .layer_count = array_layers,
+                .layer_count = self.shape.layerCount(),
             },
         }};
         self.context.device.cmdPipelineBarrier2(command_buffer, &.{
@@ -279,57 +344,58 @@ pub const Image = struct {
     //
     // regions is borrowed for the duration of the call. Vulkan copies the
     // structures during recording, so it need not outlive it.
+    // Records one region. There is no slice form because the chunks of a large
+    // level come from different staging blocks, and so from different buffers,
+    // and one vkCmdCopyBufferToImage names a single source.
     pub fn recordCopyFrom(
         self: *const Image,
         source: *const Buffer,
         command_buffer: vk.CommandBuffer,
-        regions: []const MipCopy,
+        region: MipCopy,
     ) CopyError!void {
         if (self.context.device.handle != source.context.device.handle)
             return error.DifferentDevice;
         if (!source.usage.transfer_src_bit) return error.MissingTransferSourceUsage;
         if (!self.usage.transfer_dst_bit) return error.MissingTransferDestinationUsage;
-        if (regions.len == 0) return error.NoRegions;
-        // Creation caps the level count, so one region per level fits the stack
-        // array and this path allocates nothing.
-        if (regions.len > max_mip_levels) return error.TooManyRegions;
+        if (region.mip_level >= self.mip_levels) return error.MipLevelOutOfRange;
+        if (region.layer >= self.shape.layerCount()) return error.LayerOutOfRange;
 
-        var scratch: [max_mip_levels]vk.BufferImageCopy = undefined;
-        for (regions, scratch[0..regions.len]) |region, *out| {
-            if (region.mip_level >= self.mip_levels) return error.MipLevelOutOfRange;
-            if (region.width != mipExtent(self.width, region.mip_level) or
-                region.height != mipExtent(self.height, region.mip_level))
-                return error.RegionExtentMismatch;
-
-            out.* = .{
-                .buffer_offset = region.buffer_offset,
-                // Zero means tightly packed to the image extent. Vulkan
-                // specification, VkBufferImageCopy: bufferRowLength and
-                // bufferImageHeight of zero make the buffer rows match
-                // imageExtent, which is how every uploaded mip is laid out here.
-                .buffer_row_length = 0,
-                .buffer_image_height = 0,
-                .image_subresource = .{
-                    .aspect_mask = self.kind.aspect(),
-                    .mip_level = region.mip_level,
-                    .base_array_layer = base_array_layer,
-                    .layer_count = array_layers,
-                },
-                .image_offset = image_origin,
-                .image_extent = .{
-                    .width = region.width,
-                    .height = region.height,
-                    .depth = single_depth,
-                },
-            };
-        }
+        const level_height = mipExtent(self.height, region.mip_level);
+        // Written as a subtraction so a first row near the end of the level
+        // cannot overflow into looking valid.
+        if (region.row_count == 0 or
+            region.first_row > level_height or
+            region.row_count > level_height - region.first_row)
+            return error.RowRangeOutOfBounds;
 
         self.context.device.cmdCopyBufferToImage(
             command_buffer,
             source.handle,
             self.handle,
             .transfer_dst_optimal,
-            scratch[0..regions.len],
+            &.{.{
+                .buffer_offset = region.buffer_offset,
+                // Zero means tightly packed to the image extent. Vulkan
+                // specification, VkBufferImageCopy: bufferRowLength and
+                // bufferImageHeight of zero make the buffer rows match
+                // imageExtent, which is how every uploaded level is laid out
+                // here. It is the full level width even for a partial run of
+                // rows, because a row is never split.
+                .buffer_row_length = 0,
+                .buffer_image_height = 0,
+                .image_subresource = .{
+                    .aspect_mask = self.kind.aspect(),
+                    .mip_level = region.mip_level,
+                    .base_array_layer = region.layer,
+                    .layer_count = single_layer,
+                },
+                .image_offset = .{ .x = 0, .y = @intCast(region.first_row), .z = 0 },
+                .image_extent = .{
+                    .width = mipExtent(self.width, region.mip_level),
+                    .height = region.row_count,
+                    .depth = single_depth,
+                },
+            }},
         );
     }
 };

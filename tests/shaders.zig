@@ -21,8 +21,8 @@ test "every embedded module is SPIR-V and not something else" {
 
 test "a module's two stages differ only in the entry point they name" {
     const fullscreen = gpu.Shaders.fullscreen;
-    const vertex = fullscreen.vertex();
-    const fragment = fullscreen.fragment();
+    const vertex = fullscreen.vertex() orelse return error.TestExpectedVertexEntry;
+    const fragment = fullscreen.fragment() orelse return error.TestExpectedFragmentEntry;
 
     // One binary, two entry points. Distinct words would mean the build went
     // back to a module per stage without this side noticing.

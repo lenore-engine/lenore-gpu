@@ -54,11 +54,21 @@ test "the device-facing surface is compiled" {
     _ = &gpu.Image.recordLayoutTransition;
     _ = &gpu.Image.recordCopyFrom;
 
-    _ = &gpu.StagingArena.init;
-    _ = &gpu.StagingArena.deinit;
-    _ = &gpu.StagingArena.reserve;
-    _ = &gpu.StagingArena.reset;
-    _ = &gpu.StagingArena.source;
+    _ = &gpu.StagingPool.init;
+    _ = &gpu.StagingPool.deinit;
+    _ = &gpu.StagingPool.reserve;
+    _ = &gpu.StagingPool.recycle;
+    _ = &gpu.StagingPool.blockCount;
+    _ = &gpu.StagingPool.residentBytes;
+    _ = &gpu.StagingPool.blockCapacity;
+
+    _ = &gpu.Transfer.begin;
+    _ = &gpu.Transfer.deinit;
+    _ = &gpu.Transfer.reserve;
+    _ = &gpu.Transfer.flush;
+    _ = &gpu.Transfer.finish;
+    _ = &gpu.Transfer.commandBuffer;
+    _ = &gpu.Transfer.abandoned;
 
     _ = &gpu.TextureCache.init;
     _ = &gpu.TextureCache.deinit;
@@ -73,17 +83,30 @@ test "the device-facing surface is compiled" {
     _ = &gpu.MaterialStorage.deinit;
     _ = &gpu.MaterialStorage.upload;
     _ = &gpu.MaterialStorage.byteSize;
+    _ = &gpu.MaterialStorage.descriptor;
 
-    _ = &gpu.Mesh.init;
     _ = &gpu.Mesh.deinit;
     _ = &gpu.Mesh.bind;
     _ = &gpu.Mesh.draw;
 
+    _ = &gpu.MorphPass.init;
+    _ = &gpu.MorphPass.deinit;
+    _ = &gpu.MorphPass.register;
+    _ = &gpu.MorphPass.registrationCount;
+    _ = &gpu.MorphPass.writeWeights;
+    _ = &gpu.MorphPass.vertexSource;
+    _ = &gpu.MorphPass.record;
+    _ = &gpu.MorphPass.descriptorSetLayout;
+
     _ = &gpu.UploadBatch.begin;
     _ = &gpu.UploadBatch.deinit;
-    _ = &gpu.UploadBatch.addMesh;
     _ = &gpu.UploadBatch.addTextureSet;
     _ = &gpu.UploadBatch.finish;
+
+    // The generic entry points, through the callers below. See why there.
+    _ = &reachMeshInit;
+    _ = &reachAddMesh;
+    _ = &reachAddTexture;
 
     _ = &gpu.ResourceStorage.deinit;
     _ = &gpu.ResourceStorage.mesh;
@@ -101,6 +124,8 @@ test "the device-facing surface is compiled" {
     _ = &gpu.Renderer.resize;
     _ = &gpu.Renderer.update;
     _ = &gpu.Renderer.record;
+    _ = &gpu.Renderer.setMaterialBuffer;
+    _ = &gpu.Renderer.setEnvironment;
     _ = &gpu.Renderer.setMaterialTextures;
     _ = &gpu.Renderer.targetExtent;
     _ = &gpu.Renderer.mainPassTarget;
@@ -112,9 +137,37 @@ test "the device-facing surface is compiled" {
     _ = &gpu.Swapchain.matchesExtent;
     _ = &gpu.Swapchain.renderFinishedSemaphore;
     _ = &gpu.TextureCache.acquireKtx2;
+    _ = &gpu.Environment.neutral;
+    _ = &gpu.writeEnvironment;
     _ = &gpu.ResourceStorage.removeMesh;
     _ = &gpu.ResourceStorage.removeTextureSet;
     _ = &gpu.MemoryAllocation.mappedBytes;
     _ = &gpu.LayoutTransition.toShaderRead;
     _ = &gpu.mipExtent;
+}
+
+// Taking the address of a generic function does not instantiate it, so a line
+// for one in the list above compiles nothing. Proven the same way as the rest of
+// this file: with `addMesh` listed there and nothing else calling it, its body
+// was made nonsense and `zig build test` stayed green.
+//
+// A caller fixes the comptime arguments, and compiling the caller is what
+// compiles the instantiation. One instantiation per function is enough for what
+// this file checks, which is that the body is analysed at all.
+
+fn reachMeshInit(
+    context: *const gpu.Context,
+    memory_allocator: *gpu.MemoryAllocator,
+    transfer: *gpu.Transfer,
+    upload: gpu.MeshUpload(u32),
+) !gpu.Mesh {
+    return gpu.Mesh.init(u32, context, memory_allocator, transfer, upload);
+}
+
+fn reachAddMesh(batch: *gpu.UploadBatch, upload: gpu.MeshUpload(u32)) !gpu.MeshHandle {
+    return batch.addMesh(u32, upload);
+}
+
+fn reachAddTexture(batch: *gpu.UploadBatch, request: gpu.TextureRequest) !gpu.BoundTexture {
+    return batch.addTexture(.base_colour, request);
 }

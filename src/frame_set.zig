@@ -35,7 +35,14 @@ const Entry = struct {
 
 const entries = [_]Entry{
     .{
-        .binding = .{ .slot = 0, .kind = .uniform_buffer_dynamic, .stages = .{ .vertex_bit = true } },
+        // Both stages: the vertex stage transforms by the view-projection and
+        // the fragment stage reads the eye for the view-dependent half of the
+        // BRDF.
+        .binding = .{
+            .slot = 0,
+            .kind = .uniform_buffer_dynamic,
+            .stages = .{ .vertex_bit = true, .fragment_bit = true },
+        },
         .ring = .camera,
     },
     .{

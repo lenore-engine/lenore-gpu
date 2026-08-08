@@ -1,15 +1,15 @@
 const std = @import("std");
 const vk = @import("vulkan");
 
-const commands = @import("commands.zig");
 const Context = @import("context.zig").Context;
 const memory = @import("memory/allocator.zig");
 const mesh_module = @import("mesh/resource.zig");
 const pool_module = @import("pool.zig");
 const resource_storage = @import("resource_storage.zig");
 const sampler_module = @import("sampler.zig");
-const staging = @import("staging/arena.zig");
+const staging = @import("staging/pool.zig");
 const texture_cache = @import("texture_cache.zig");
+const transfer_module = @import("transfer.zig");
 
 const Allocator = std.mem.Allocator;
 const Bound = texture_cache.Bound;
@@ -17,8 +17,9 @@ const Mesh = mesh_module.Mesh;
 const MeshHandle = resource_storage.MeshHandle;
 const ResourceStorage = resource_storage.ResourceStorage;
 const SamplerConfig = @import("lenore-resources").SamplerConfig;
-const StagingArena = staging.StagingArena;
+const StagingPool = staging.StagingPool;
 const TextureCache = texture_cache.TextureCache;
+const Transfer = transfer_module.Transfer;
 const TextureSet = resource_storage.TextureSet;
 const TextureSetHandle = resource_storage.TextureSetHandle;
 
@@ -40,34 +41,54 @@ pub const TextureRequest = struct {
     sampler: SamplerConfig = .{},
 };
 
+// What fills one slot of a set: bytes this batch is to upload, or an image it
+// has already uploaded through addTexture.
+//
+// The second exists because a source image and a material slot are not the same
+// unit. Several materials name one image, and a loader that walks materials
+// decodes and uploads it once per naming. Walking images first and binding
+// second is what makes each image cost one decode, and this is what the second
+// pass has to say.
+pub const TextureSlot = union(enum) {
+    request: TextureRequest,
+    // The sampler is the use's own. It is not the one addTexture was given,
+    // because in glTF a sampler belongs to the texture that references an image
+    // rather than to the image, so two references may filter it differently.
+    resident: struct {
+        texture: texture_cache.Resident,
+        sampler: SamplerConfig = .{},
+    },
+};
+
 // The five slots, each either a texture to load or nothing, in which case the
 // slot binds its neutral fallback.
 pub const TextureSetRequest = struct {
-    base_colour: ?TextureRequest = null,
-    metallic_roughness: ?TextureRequest = null,
-    normal: ?TextureRequest = null,
-    emissive: ?TextureRequest = null,
-    occlusion: ?TextureRequest = null,
+    base_colour: ?TextureSlot = null,
+    metallic_roughness: ?TextureSlot = null,
+    normal: ?TextureSlot = null,
+    emissive: ?TextureSlot = null,
+    occlusion: ?TextureSlot = null,
 };
 
 // What a slot's data must be, and what stands in when it is absent. Colour is
 // sRGB and everything else is linear, because a roughness read through an sRGB
 // transfer function is a wrong number rather than a wrong shade.
-const Slot = enum {
+//
+// Public because addTexture uploads one texture outside a set and the format is
+// this policy, not the caller's: a loader says which slot the image is for and
+// the interpretation follows.
+pub const MaterialSlot = enum {
     base_colour,
     metallic_roughness,
     normal,
     emissive,
     occlusion,
 
-    fn format(self: Slot, source: TextureSource) vk.Format {
+    fn format(self: MaterialSlot, source: TextureSource) vk.Format {
         return switch (source) {
             .ktx2 => switch (self) {
                 .base_colour, .emissive => .bc7_srgb_block,
-                .metallic_roughness, .occlusion => .bc7_unorm_block,
-                // Two channels are enough for a tangent-space normal: the third
-                // is reconstructed from them.
-                .normal => .bc5_unorm_block,
+                .metallic_roughness, .normal, .occlusion => .bc7_unorm_block,
             },
             .rgba8 => switch (self) {
                 .base_colour, .emissive => .r8g8b8a8_srgb,
@@ -76,7 +97,7 @@ const Slot = enum {
         };
     }
 
-    fn fallback(self: Slot) texture_cache.Fallback {
+    fn fallback(self: MaterialSlot) texture_cache.Fallback {
         return switch (self) {
             .base_colour, .emissive => .white,
             .metallic_roughness => .metallic_roughness,
@@ -90,7 +111,7 @@ comptime {
     // The request, the bound set and the slot list describe the same five slots
     // under the same names. A slot added to one and not the others would
     // otherwise be silently dropped at upload.
-    const slots = @typeInfo(Slot).@"enum".fields;
+    const slots = @typeInfo(MaterialSlot).@"enum".fields;
     std.debug.assert(slots.len == @typeInfo(TextureSetRequest).@"struct".fields.len);
     std.debug.assert(slots.len == @typeInfo(TextureSet).@"struct".fields.len);
     for (slots) |slot| {
@@ -119,11 +140,12 @@ fn interpretedKey(
     return key;
 }
 
-pub const BeginError = commands.BeginError || Allocator.Error;
+pub const BeginError = transfer_module.BeginError || Allocator.Error;
 pub const AddMeshError = mesh_module.InitError || pool_module.AddError;
-pub const AddTextureSetError = error{TextureKeyTooLong} ||
-    texture_cache.AcquireError || sampler_module.GetError || pool_module.AddError;
-pub const FinishError = commands.SubmitError;
+pub const AddTextureError = error{TextureKeyTooLong} ||
+    texture_cache.AcquireError || sampler_module.GetError;
+pub const AddTextureSetError = AddTextureError || pool_module.AddError;
+pub const FinishError = transfer_module.FinishError;
 
 // What one completed batch put into the storage and the cache. It exists so a
 // scene can hand back exactly what it took, and no more: releasing a texture key
@@ -174,45 +196,28 @@ pub const Uploaded = struct {
 
 // A failure-atomic upload transaction.
 //
-// Every copy is recorded into one command buffer and submitted once by finish.
-// Dropping a batch that was never finished frees that command buffer first and
-// only then destroys what it registered, because commands must not name a
-// destroyed resource: a buffer holding such a command cannot even be ended.
-// That ordering is the reason this type exists rather than a loop over
-// individual uploads.
+// Dropping a batch that was never finished retires its transfer first and only
+// then destroys what it registered, because commands must not name a destroyed
+// resource: a command buffer holding such a command cannot even be ended. That
+// ordering is the reason this type exists rather than a loop over individual
+// uploads.
 //
 // The batch holds every texture reference it takes until finish returns, for the
-// same reason. Releasing one earlier destroys an image the recorded copy still
+// same reason. Releasing one earlier destroys an image a recorded copy still
 // names.
-// Three states, because ownership of the command buffer and permission to free
-// it are not the same thing.
 //
-// Vulkan specification, vkFreeCommandBuffers: a command buffer must not be freed
-// while it may still be pending. A submission that fails after the work reached
-// the queue establishes neither completion nor that it never started, so the
-// buffer stays ours and stays unfreeable. Collapsing that into one boolean is
-// what made an earlier version free a possibly pending buffer.
-const CommandState = enum {
-    // Ours, not submitted, safe to free.
-    recording,
-    // Submitted with an unknown outcome. Freeing it, and destroying anything its
-    // commands name, is forbidden until completion or device loss is
-    // established, and nothing here can establish either.
-    pending,
-    // Submitted and waited for. Already freed by the submission path.
-    consumed,
-};
-
+// What it no longer promises is a single submission. The transfer submits and
+// waits whenever the staging pool has to be reclaimed, so a large batch reaches
+// the device in several pieces. Atomicity is unaffected: every piece has
+// completed before the next is recorded, so rolling back is still only a
+// question of what may still be pending, and that is what the transfer answers.
 pub const Batch = struct {
     allocator: Allocator,
     context: *const Context,
     memory_allocator: *memory.MemoryAllocator,
     storage: *ResourceStorage,
     cache: *TextureCache,
-    arena: *StagingArena,
-    pool: vk.CommandPool,
-    command_buffer: vk.CommandBuffer,
-    command_state: CommandState,
+    transfer: Transfer,
     // Set by any failed registration. A batch that has partly failed cannot be
     // finished, because what it recorded no longer matches what it registered.
     failed: bool,
@@ -227,20 +232,16 @@ pub const Batch = struct {
         memory_allocator: *memory.MemoryAllocator,
         storage: *ResourceStorage,
         cache: *TextureCache,
-        arena: *StagingArena,
+        staging_pool: *StagingPool,
         pool: vk.CommandPool,
     ) BeginError!Batch {
-        const command_buffer = try commands.beginOneShot(context, pool);
         return .{
             .allocator = allocator,
             .context = context,
             .memory_allocator = memory_allocator,
             .storage = storage,
             .cache = cache,
-            .arena = arena,
-            .pool = pool,
-            .command_buffer = command_buffer,
-            .command_state = .recording,
+            .transfer = try .begin(context, pool, staging_pool),
             .failed = false,
             .meshes = .empty,
             .texture_sets = .empty,
@@ -248,9 +249,9 @@ pub const Batch = struct {
         };
     }
 
-    // Rolls the batch back. Freeing the command buffer comes first: it holds
-    // commands naming the resources destroyed below, and Vulkan requires those
-    // to outlive it.
+    // Rolls the batch back. Retiring the transfer comes first: its command
+    // buffer holds commands naming the resources released below, and Vulkan
+    // requires those to outlive it.
     //
     // A batch whose submission failed after reaching the queue is the one case
     // that cannot be rolled back at all. Its buffer may be pending, so neither
@@ -258,18 +259,17 @@ pub const Batch = struct {
     // available here proves otherwise. Everything is abandoned and reported: a
     // leak is recoverable and a use-after-free is not.
     pub fn deinit(self: *Batch) void {
-        switch (self.command_state) {
-            .recording => {
-                self.context.device.freeCommandBuffers(self.pool, &.{self.command_buffer});
-                self.releaseRegistered();
-            },
-            .consumed => self.releaseRegistered(),
-            .pending => std.log.err(
-                "upload batch abandoned after a failed submission: {d} meshes, " ++
-                    "{d} texture sets and one command buffer are leaked because " ++
-                    "the submission may still be pending",
+        const abandoned = self.transfer.abandoned();
+        self.transfer.deinit();
+        if (abandoned) {
+            std.log.err(
+                "upload batch abandoned after a failed submission: {d} meshes " ++
+                    "and {d} texture sets are leaked because the submission may " ++
+                    "still be pending",
                 .{ self.meshes.items.len, self.texture_sets.items.len },
-            ),
+            );
+        } else {
+            self.releaseRegistered();
         }
 
         self.meshes.deinit(self.allocator);
@@ -294,7 +294,7 @@ pub const Batch = struct {
         comptime IndexType: type,
         upload: mesh_module.Upload(IndexType),
     ) AddMeshError!MeshHandle {
-        std.debug.assert(self.command_state == .recording);
+        std.debug.assert(self.transfer.state == .recording);
         errdefer self.failed = true;
 
         try self.meshes.ensureUnusedCapacity(self.allocator, 1);
@@ -302,8 +302,7 @@ pub const Batch = struct {
             IndexType,
             self.context,
             self.memory_allocator,
-            self.arena,
-            self.command_buffer,
+            &self.transfer,
             upload,
         );
         const handle = try self.storage.addMesh(self.allocator, mesh);
@@ -313,22 +312,42 @@ pub const Batch = struct {
 
     // Resolves the five slots, loading what is absent from the cache and binding
     // the neutral fallback where a request supplies nothing.
+    // Uploads one texture on its own and hands back the image a later set binds.
+    // The batch holds that reference until the caller releases what it took,
+    // exactly as for a texture named inside a set.
+    //
+    // This is what a loader that walks source images before materials calls. The
+    // sets it builds afterwards fill their slots with `.resident`, so an image
+    // several materials name is decoded once and uploaded once per format it is
+    // interpreted in.
+    pub fn addTexture(
+        self: *Batch,
+        comptime slot: MaterialSlot,
+        request: TextureRequest,
+    ) AddTextureError!Bound {
+        std.debug.assert(self.transfer.state == .recording);
+        errdefer self.failed = true;
+
+        try self.texture_keys.ensureUnusedCapacity(self.allocator, 1);
+        return self.resolveSlot(slot, .{ .request = request });
+    }
+
     pub fn addTextureSet(
         self: *Batch,
         request: TextureSetRequest,
     ) AddTextureSetError!TextureSetHandle {
-        std.debug.assert(self.command_state == .recording);
+        std.debug.assert(self.transfer.state == .recording);
         errdefer self.failed = true;
 
         try self.texture_sets.ensureUnusedCapacity(self.allocator, 1);
         try self.texture_keys.ensureUnusedCapacity(
             self.allocator,
-            @typeInfo(Slot).@"enum".fields.len,
+            @typeInfo(MaterialSlot).@"enum".fields.len,
         );
 
         var set: TextureSet = undefined;
-        inline for (@typeInfo(Slot).@"enum".fields) |field| {
-            const slot = @field(Slot, field.name);
+        inline for (@typeInfo(MaterialSlot).@"enum".fields) |field| {
+            const slot = @field(MaterialSlot, field.name);
             @field(set, field.name) = try self.resolveSlot(
                 slot,
                 @field(request, field.name),
@@ -340,20 +359,18 @@ pub const Batch = struct {
         return handle;
     }
 
-    // Ends the command buffer, submits it and waits. On success the batch owns
-    // nothing: the storage holds the resources and the caller holds the record
-    // of what to release.
+    // Submits the last of the recorded work and waits for it. On success the
+    // batch owns nothing: the storage holds the resources and the caller holds
+    // the record of what to release.
     //
-    // The state moves before the call, not after. A failure inside it may leave
-    // the buffer pending, and a rollback that assumed otherwise would free it
-    // and destroy what its commands name.
+    // A failure here leaves the transfer to say whether its buffer may be
+    // pending, and the caller's deinit is what asks.
     pub fn finish(self: *Batch) FinishError!Uploaded {
-        std.debug.assert(self.command_state == .recording);
+        std.debug.assert(self.transfer.state == .recording);
         std.debug.assert(!self.failed);
 
-        self.command_state = .pending;
-        try commands.submitOneShotAndWait(self.context, self.pool, self.command_buffer);
-        self.command_state = .consumed;
+        try self.transfer.finish();
+        self.transfer.deinit();
 
         const uploaded: Uploaded = .{
             .meshes = self.meshes,
@@ -369,11 +386,21 @@ pub const Batch = struct {
 
     fn resolveSlot(
         self: *Batch,
-        comptime slot: Slot,
-        request: ?TextureRequest,
-    ) AddTextureSetError!Bound {
-        const wanted = request orelse
+        comptime slot: MaterialSlot,
+        filling: ?TextureSlot,
+    ) AddTextureError!Bound {
+        const filled = filling orelse
             return self.cache.fallback(slot.fallback(), .{});
+
+        const wanted = switch (filled) {
+            // No key is recorded: the reference that keeps this image alive was
+            // taken when addTexture uploaded it, and releasing a set must not
+            // drop it twice.
+            .resident => |held| return held.texture.bind(
+                try self.cache.sampler(held.sampler),
+            ),
+            .request => |request| request,
+        };
 
         const format = slot.format(wanted.source);
         // The batch owns the interpreted key because it outlives the request,
@@ -386,17 +413,18 @@ pub const Batch = struct {
                 key,
                 bytes,
                 format,
+                // Every slot of a material texture set is a 2D sampler. An
+                // environment is not acquired through here.
+                .texture_2d,
                 wanted.sampler,
-                self.arena,
-                self.command_buffer,
+                &self.transfer,
             ),
             .rgba8 => |source| try self.cache.acquireRgba8(
                 key,
                 source,
                 format,
                 wanted.sampler,
-                self.arena,
-                self.command_buffer,
+                &self.transfer,
             ),
         };
         // Recorded before the reference is registered, so a failure between the
