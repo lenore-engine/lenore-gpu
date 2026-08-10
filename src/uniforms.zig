@@ -1,19 +1,21 @@
 const std = @import("std");
 const zm = @import("zmath");
 
-// The uniform blocks the shaders declare, mirrored on this side.
+// The uniform blocks the frame rings are filled with, and the layout a shader
+// created against this module has to declare.
 //
-// Written by hand and checked against the compiler's reflection output rather
-// than generated from it. Generating would move authorship of the layout to the
-// tool; checking keeps it here and still fails the build when the two disagree.
-// The check is `tests/reflection.zig`, which reads the JSON the build emits
-// beside each SPIR-V module.
+// These are the authored side of that agreement rather than a transcription of
+// one: nothing here is generated, because generating would move authorship of
+// the layout to whichever compiler ran last. Holding a shader against them
+// needs that compiler's reflection, which this build does not produce; it is
+// the responsibility of whatever supplies the words.
 //
 // Every block is `extern` so the field order is the declaration order, and
 // every one is written into a `PerFrame` ring whose stride the device's offset
 // alignment decides.
 
-// Mirrors `CameraUbo` in scene.slang.
+// The camera every pass reads: the main pass to transform by, the background
+// to cast rays along.
 pub const Camera = extern struct {
     // Row vectors, so a position multiplies from the left. zmath stores a `Mat`
     // as four rows and the shader reads it the same way; nothing transposes.
@@ -23,6 +25,22 @@ pub const Camera = extern struct {
     // sixteen-byte alignment would insert anyway, so it is named rather than
     // left to the compiler.
     position: [4]f32 align(16),
+
+    // The view ray a pass covering the target reconstructs, in the shape
+    // `lenore-scene`'s `Camera.rayBasis` produces: for a device coordinate
+    // (x, y) the ray leaving the eye is `ray_front + ray_right * x + ray_up * y`.
+    // Affine in that coordinate, so it interpolates exactly across a triangle
+    // covering the whole target and no shader stage divides.
+    //
+    // In device coordinates, like `view_projection` above: `vulkanClipCamera`
+    // negates `ray_up` where it negates the matrix's second column, because +1
+    // is the last row of the framebuffer and the top of the scene's clip space.
+    //
+    // The fourth lane of each is the alignment's padding, named for the same
+    // reason `position`'s is.
+    ray_right: [4]f32 align(16),
+    ray_up: [4]f32 align(16),
+    ray_front: [4]f32 align(16),
 };
 
 // How many lights one frame's block holds.
@@ -37,7 +55,7 @@ pub const Camera = extern struct {
 // `FrameSet.update` reports rather than truncates.
 pub const max_lights = 16;
 
-// Mirrors `Light` in scene.slang, one element of the block below.
+// One element of the light block below.
 //
 // Flat rather than a union, because a shader reads a fixed layout and the loop
 // over lights branches on `kind`. Each kind still has its own fields: a
@@ -47,7 +65,7 @@ pub const max_lights = 16;
 // there is nothing to guard.
 //
 // The offsets are std140's, which is what a Slang constant buffer lays a struct
-// out as. Nothing here restates them: `tests/reflection.zig` holds every field
+// out as. Nothing here restates them: `tests/shader_reflection.zig` holds every field
 // against the compiler's own account of the shader.
 pub const Light = extern struct {
     pub const Kind = enum(u32) { directional, point, spot };
@@ -126,7 +144,7 @@ pub const Light = extern struct {
     }
 };
 
-// Mirrors `LightsUbo` in scene.slang.
+// The light block, read by every shaded fragment.
 //
 // A fixed array rather than a storage buffer sized to the scene. The block is
 // read by every fragment, so it wants the constant path; the array's length is
@@ -153,6 +171,55 @@ pub const Lights = extern struct {
     }
 };
 
+// The sun's fit, read by the bake and by the lookup through the same binding:
+// both transform by one matrix, so they take it from one block.
+//
+// Not lanes added to the light it shadows. The bake binds no light array at all,
+// and a scene with several directional lights has at most one map, so folding
+// these fields into `Light` would put them on every entry to be read on one.
+pub const SunShadow = extern struct {
+    // World space to the sun's clip space, from `SunShadowFit` in lenore-scene.
+    //
+    // `vulkanClip` is not applied to it, unlike the camera's. The bake
+    // rasterizes through this matrix and the lookup turns its own product with
+    // it into texture coordinates, so a flip on one side has to be matched on
+    // the other; leaving it out of both is what makes the two cancel.
+    view_projection: zm.Mat align(16),
+
+    // How much of the sun's direct term a shadowed surface loses, in [0, 1],
+    // which `SunShadowSettings.clampedStrength` is what holds it to. Zero is the
+    // off state and the shader tests it rather than a separate flag: a disabled
+    // shadow and a shadow of no strength are the same picture.
+    strength: f32,
+
+    // How far the lookup point is pushed off the surface along its normal, in
+    // world units. `SunShadowSettings.normalOffsetWorld` converts the authored
+    // texel count through the fit's own texel size, so it follows scene scale
+    // and map resolution without being retuned.
+    normal_offset: f32,
+
+    // Which entry of the light block this map was baked for. A fit is built from
+    // one direction, so exactly one light can be shadowed through it, and naming
+    // the index here is what keeps the pairing from being an ordering convention
+    // that the host and the shader each state separately.
+    light: u32,
+
+    // Reaching the sixteen-byte multiple the block is strided to. Named rather
+    // than left to the compiler so the shader's own padding field has something
+    // to match.
+    padding: u32 = 0,
+
+    // A frame that casts no sun shadow. The matrix is never read at this
+    // strength, on either side: the lookup returns before transforming anything,
+    // and a bake is not recorded at all.
+    pub const off: SunShadow = .{
+        .view_projection = zm.identity(),
+        .strength = 0,
+        .normal_offset = 0,
+        .light = 0,
+    };
+};
+
 // The camera's clip space with the Vulkan Y flip applied.
 //
 // `lenore-scene` produces clip space with Y up; a framebuffer counts rows
@@ -170,4 +237,34 @@ pub fn vulkanClip(view_projection: zm.Mat) zm.Mat {
     var flipped = view_projection;
     inline for (0..4) |row| flipped[row][1] = -flipped[row][1];
     return flipped;
+}
+
+// A camera block in the coordinates the framebuffer counts in, which is the
+// only kind a frame may be filled with.
+//
+// A distinct type rather than a convention, because the two are the same fields
+// and differ only in a sign that nothing but a picture can check. `Camera` alone
+// left "flipped" and "not flipped" indistinguishable at every call site, and a
+// path that flipped the matrix while leaving the ray basis alone type-checked,
+// passed every test, and rendered the background upside down.
+//
+// `vulkanClipCamera` is the only thing that produces one.
+pub const FramebufferCamera = struct {
+    block: Camera,
+};
+
+// The whole camera block in the coordinates the framebuffer counts in.
+//
+// Both halves of the flip in one call because they describe one axis. A shader
+// that transforms a vertex by the matrix and a shader that reconstructs a ray
+// from the basis have to agree about which way device y points, and applying
+// one of the two is a background upside down against the scene in front of it.
+//
+// The padding lane of `ray_up` is left alone. It is not read on either side, and
+// negating a zero is a difference between two values that mean the same thing.
+pub fn vulkanClipCamera(camera: Camera) FramebufferCamera {
+    var flipped = camera;
+    flipped.view_projection = vulkanClip(camera.view_projection);
+    inline for (0..3) |axis| flipped.ray_up[axis] = -camera.ray_up[axis];
+    return .{ .block = flipped };
 }

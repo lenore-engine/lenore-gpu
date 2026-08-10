@@ -51,37 +51,48 @@ pub const SamplerCache = struct {
     }
 
     fn create(self: *const SamplerCache, config: SamplerConfig) vk.DeviceWrapper.CreateSamplerError!vk.Sampler {
-        return self.context.device.createSampler(&.{
-            .mag_filter = vulkanFilter(config.mag_filter),
-            .min_filter = vulkanFilter(config.min_filter),
-            .mipmap_mode = vulkanMipmapMode(config.mipmap_mode),
-            .address_mode_u = vulkanAddressMode(config.address_mode_u),
-            .address_mode_v = vulkanAddressMode(config.address_mode_v),
-            .address_mode_w = vulkanAddressMode(config.address_mode_w),
-            .mip_lod_bias = 0.0,
-            // Context requires the samplerAnisotropy feature and records the
-            // limit this value must not exceed.
-            .anisotropy_enable = if (config.anisotropic) .true else .false,
-            .max_anisotropy = if (config.anisotropic)
-                self.context.max_sampler_anisotropy
-            else
-                1.0,
-            .compare_enable = .false,
-            .compare_op = .always,
-            .min_lod = 0.0,
-            // Vulkan specification, Texel Input Operations: the level of detail
-            // used is clamped both by maxLod and by the level count of the view
-            // being sampled. Leaving maxLod unclamped therefore makes a sampler
-            // independent of any one image's mip depth, which is what lets a
-            // single cached sampler serve images with different chains.
-            .max_lod = vk.LOD_CLAMP_NONE,
-            // No exposed address mode is clamp_to_border, so this is never
-            // sampled. It is stated because the field has no default.
-            .border_color = .int_opaque_black,
-            .unnormalized_coordinates = .false,
-        }, null);
+        return self.context.device.createSampler(
+            &createInfo(config, self.context.max_sampler_anisotropy),
+            null,
+        );
     }
 };
+
+// The whole translation from a sampler identity to Vulkan state, split from the
+// call that consumes it so a device is not what stands between the mapping and a
+// test. `max_anisotropy` is the device limit the caller must not exceed; Context
+// requires the samplerAnisotropy feature and records it.
+pub fn createInfo(config: SamplerConfig, max_anisotropy: f32) vk.SamplerCreateInfo {
+    return .{
+        .mag_filter = vulkanFilter(config.mag_filter),
+        .min_filter = vulkanFilter(config.min_filter),
+        .mipmap_mode = vulkanMipmapMode(config.mipmap_mode),
+        .address_mode_u = vulkanAddressMode(config.address_mode_u),
+        .address_mode_v = vulkanAddressMode(config.address_mode_v),
+        .address_mode_w = vulkanAddressMode(config.address_mode_w),
+        .mip_lod_bias = 0.0,
+        .anisotropy_enable = if (config.anisotropic) .true else .false,
+        .max_anisotropy = if (config.anisotropic) max_anisotropy else 1.0,
+        .compare_enable = .false,
+        .compare_op = .always,
+        .min_lod = 0.0,
+        // Vulkan specification, Texel Input Operations: the level of detail used
+        // is clamped both by maxLod and by the level count of the view being
+        // sampled. Leaving maxLod unclamped therefore makes a sampler
+        // independent of any one image's mip depth, which is what lets a single
+        // cached sampler serve images with different chains.
+        //
+        // Zero is the other end of that same clamp, and it is how a minification
+        // filter asking for no mipmapping is expressed. The level of detail then
+        // cannot leave the base level whatever the mipmap mode says, which is
+        // the one-level sampler `shadow.zig` builds by hand for its map.
+        .max_lod = if (config.mipmap_mode == .none) 0.0 else vk.LOD_CLAMP_NONE,
+        // No exposed address mode is clamp_to_border, so this is never sampled.
+        // It is stated because the field has no default.
+        .border_color = .int_opaque_black,
+        .unnormalized_coordinates = .false,
+    };
+}
 
 // Explicit mappings rather than a reflected name bridge. The tag names match
 // Vulkan's, and a switch states which pairing is intended instead of resting on
@@ -93,9 +104,12 @@ fn vulkanFilter(filter: Filter) vk.Filter {
     };
 }
 
+// No Vulkan mipmap mode means "no mipmapping": the clamp above is what says
+// that, and nearest is what the clamp makes free, because it resolves to one
+// level instead of blending the base level with itself.
 fn vulkanMipmapMode(mode: MipmapMode) vk.SamplerMipmapMode {
     return switch (mode) {
-        .nearest => .nearest,
+        .none, .nearest => .nearest,
         .linear => .linear,
     };
 }

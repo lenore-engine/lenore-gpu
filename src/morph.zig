@@ -7,7 +7,6 @@ const memory = @import("memory/allocator.zig");
 const mesh_module = @import("mesh/resource.zig");
 const per_frame = @import("per_frame.zig");
 const pipeline = @import("pipeline.zig");
-const shaders = @import("shaders.zig");
 const vertex_module = @import("mesh/vertex.zig");
 
 const Allocator = std.mem.Allocator;
@@ -29,17 +28,19 @@ const VertexSource = mesh_module.VertexSource;
 // data does, so they are resolved in different places.
 //
 // The output is a whole GpuVertex, so nothing downstream is aware of it: the
-// recorder binds this buffer at binding 0 instead of the mesh's, and both the
-// vertex input and scene.slang are unchanged. A mesh that is also skinned skins
-// in the vertex stage over these vertices.
-//
-// Mirrors assets/shaders/morph.slang. `tests/reflection.zig` holds the bindings,
-// the push block and the workgroup size against the compiler's account of it.
+// recorder binds this buffer at binding 0 instead of the mesh's, and neither
+// the vertex input nor the main pass's shading changes. A mesh that is also
+// skinned skins in the vertex stage over these vertices.
 
-// One group of threads covers this many vertices. It is declared in the shader,
-// where Vulkan reads it from as an execution mode, and repeated here because the
-// dispatch has to divide by the same number. Reflection is what holds the two
-// together rather than this comment.
+// One group of threads covers this many vertices, and it is half of a contract
+// with the supplied shader. Vulkan takes the local size from the shader's own
+// execution mode, so this number is not communicated to it; the dispatch
+// divides its vertex count by this instead.
+//
+// A shader declaring a different local size therefore resolves a fraction of
+// the vertices dispatched for, or runs threads past the end of a mesh, and the
+// device reports neither. Whatever supplies the words is what has to hold the
+// two together.
 pub const group_size: u32 = 64;
 
 pub const bindings = [_]descriptors.Binding{
@@ -87,6 +88,16 @@ pub const push_constant_range: vk.PushConstantRange = .{
     .stage_flags = .{ .compute_bit = true },
     .offset = 0,
     .size = @sizeOf(PushConstants),
+};
+
+// What a resolve shader has to supply for this prepass to be built from it.
+//
+// One entry point, and the whole interface it may read is `bindings` above
+// together with the push block `PushConstants` mirrors. Its local size is the
+// one `group_size` states.
+pub const Shader = struct {
+    spirv: []const u32,
+    compute_entry: [*:0]const u8,
 };
 
 pub const InitError = descriptors.InitError ||
@@ -229,6 +240,7 @@ pub const MorphPass = struct {
         allocator: Allocator,
         frames: usize,
         capacity: Capacity,
+        shader: Shader,
     ) InitError!MorphPass {
         var sets = try Sets.init(context, allocator, capacity.meshes);
         errdefer sets.deinit(context, allocator);
@@ -242,7 +254,7 @@ pub const MorphPass = struct {
         );
         errdefer weights.deinit();
 
-        const module = try pipeline.createModule(context, shaders.morph.spirv);
+        const module = try pipeline.createModule(context, shader.spirv);
         errdefer context.device.destroyShaderModule(module, null);
 
         const layout = try pipeline.createLayout(context, .{
@@ -255,7 +267,7 @@ pub const MorphPass = struct {
             .layout = layout,
             .stage = .{
                 .module = module,
-                .entry_point = shaders.morph.compute_entry.?,
+                .entry_point = shader.compute_entry,
             },
         });
         errdefer context.device.destroyPipeline(built, null);
@@ -365,6 +377,30 @@ pub const MorphPass = struct {
 
     pub fn registrationCount(self: *const MorphPass) usize {
         return self.entries.items.len;
+    }
+
+    // Drops every registration, so the pass can take a different model.
+    //
+    // Vulkan specification, vkDestroyBuffer: every submission naming a buffer
+    // must have completed before it is destroyed. The destinations released
+    // here are read as vertex buffers by draws and written by dispatches, so
+    // the caller drains the device first. Same precondition as `deinit`, and
+    // for the same reason.
+    //
+    // The descriptor sets are left as they are. A set whose destination has
+    // been destroyed is stale, and nothing binds one: `record` walks
+    // `entries.items`, and `register` rewrites each set before its entry
+    // exists again. So the sets past the new registration count are never
+    // reached rather than being cleared to something harmless.
+    //
+    // The capacity is retained. It was fixed at the descriptor set count in
+    // `init` and `register` appends assuming it, so releasing it here would
+    // turn the next registration into an allocation that cannot fail into one
+    // that can.
+    pub fn reset(self: *MorphPass) void {
+        for (self.entries.items) |*entry| entry.destination.deinit();
+        self.entries.clearRetainingCapacity();
+        self.weights_used = 0;
     }
 
     // Fill one registration's weights in one frame's slot.

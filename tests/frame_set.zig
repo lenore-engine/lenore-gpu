@@ -5,6 +5,19 @@ const gpu = @import("lenore-gpu");
 
 const testing = std.testing;
 
+// A camera the capacity checks below never read. Named once so that a block
+// which grows does not spread through tests whose subject is the ring bounds.
+//
+// It goes through the flip like any other camera, because that is the only way
+// to obtain what a frame's camera field holds.
+const any_camera: gpu.FramebufferCamera = gpu.vulkanClipCamera(.{
+    .view_projection = zm.identity(),
+    .position = .{ 0, 0, 0, 1 },
+    .ray_right = .{ 1, 0, 0, 0 },
+    .ray_up = .{ 0, 1, 0, 0 },
+    .ray_front = .{ 0, 0, -1, 0 },
+});
+
 test "the frame set's own methods are reached by the compiler" {
     // Every one needs a device to call.
     _ = &gpu.FrameSet.init;
@@ -81,22 +94,18 @@ test "a frame that fits is accepted at every bound and one past any of them is n
     const models = [_]gpu.Instance{.{ .model = zm.identity(), .joint_base = 0 }} ** 4;
     const joints = [_]gpu.Joint{zm.identity()} ** 6;
     var lights = [_]gpu.LightUniform{gpu.LightUniform.directional(.{ 1, 1, 1 }, 1, .{ 0, -1, 0 })} ** (gpu.max_lights + 1);
-    const camera: gpu.CameraUniform = .{
-        .view_projection = zm.identity(),
-        .position = .{ 0, 0, 0, 1 },
-    };
 
     // Exactly full on every axis. The bound is the last index that fits, so a
     // check written with the wrong comparison rejects this and nothing else.
     try gpu.validateFrameContents(.{ .instances = 4, .joints = 6 }, .{
-        .camera = camera,
+        .camera = any_camera,
         .models = &models,
         .joints = &joints,
         .lights = lights[0..gpu.max_lights],
     });
 
     try testing.expectError(error.InstanceCapacityExceeded, gpu.validateFrameContents(.{ .instances = 3, .joints = 6 }, .{
-        .camera = camera,
+        .camera = any_camera,
         .models = &models,
         .joints = &joints,
         .lights = &.{},
@@ -105,13 +114,13 @@ test "a frame that fits is accepted at every bound and one past any of them is n
     // carry more matrices than the ring holds, since one instance's skeleton
     // decides how many it brings.
     try testing.expectError(error.JointCapacityExceeded, gpu.validateFrameContents(.{ .instances = 4, .joints = 5 }, .{
-        .camera = camera,
+        .camera = any_camera,
         .models = &models,
         .joints = &joints,
         .lights = &.{},
     }));
     try testing.expectError(error.LightCapacityExceeded, gpu.validateFrameContents(.{ .instances = 4, .joints = 6 }, .{
-        .camera = camera,
+        .camera = any_camera,
         .models = &models,
         .joints = &joints,
         .lights = &lights,
@@ -122,7 +131,7 @@ test "a frame with no skinned instance carries no joints" {
     // The unskinned case is the common one and it must not need a ring: a
     // capacity of zero accepts an empty joint slice.
     try gpu.validateFrameContents(.{ .instances = 1, .joints = 0 }, .{
-        .camera = .{ .view_projection = zm.identity(), .position = .{ 0, 0, 0, 1 } },
+        .camera = any_camera,
         .models = &.{.{ .model = zm.identity(), .joint_base = 0 }},
         .joints = &.{},
         .lights = &.{},

@@ -96,7 +96,7 @@ test "the pipeline entry points are reached by the compiler" {
 }
 
 test "positive-determinant glTF faces are counter-clockwise" {
-    const state = gpu.Pipeline.rasterizationState(.dynamic);
+    const state = gpu.Pipeline.rasterizationState(.dynamic, null);
 
     // `vulkanClip` negates clip y before the positive-height viewport maps it
     // to framebuffer rows. Under Vulkan's signed framebuffer-area convention,
@@ -116,9 +116,9 @@ test "scene culling is dynamic and fullscreen culling is fixed off" {
         gpu.Pipeline.dynamicStates(.{ .fixed = .{} }),
     );
 
-    const fixed_back = gpu.Pipeline.rasterizationState(.{ .fixed = .{ .back_bit = true } });
+    const fixed_back = gpu.Pipeline.rasterizationState(.{ .fixed = .{ .back_bit = true } }, null);
     try testing.expect(fixed_back.cull_mode.back_bit);
-    const fixed_none = gpu.Pipeline.rasterizationState(.{ .fixed = .{} });
+    const fixed_none = gpu.Pipeline.rasterizationState(.{ .fixed = .{} }, null);
     try testing.expectEqual(@as(u32, 0), fixed_none.cull_mode.toInt());
 }
 
@@ -135,6 +135,25 @@ test "only the opaque pipeline adds to depth, and both read it" {
     // depth as one already drawn does not replace it.
     try testing.expectEqual(vk.CompareOp.less, solid.depth_compare_op);
     try testing.expectEqual(solid.depth_compare_op, blended.depth_compare_op);
+}
+
+test "the background passes at the far plane and leaves no depth behind" {
+    const background = gpu.pipelineDepthStencilState(.background);
+
+    // The one mode that has to accept equality. It draws at depth one, the
+    // pixels it belongs in are the ones the main pass cleared to that same
+    // value, and under a strict comparison every one of them fails: the
+    // background would be a pass that draws nothing whatever it samples.
+    try testing.expectEqual(vk.CompareOp.less_or_equal, background.depth_compare_op);
+    try testing.expectEqual(vk.Bool32.true, background.depth_test_enable);
+
+    // The test is still what keeps it behind the geometry, so switching it off
+    // would paint over the scene rather than around it.
+    try testing.expectEqual(vk.Bool32.false, background.depth_write_enable);
+
+    // Nothing blends. The background is the first thing in the target wherever
+    // it passes, so there is nothing underneath to composite against.
+    try testing.expectEqual(vk.Bool32.false, gpu.pipelineBlendAttachment(.background).blend_enable);
 }
 
 test "blending is the only thing the blend state changes between modes" {

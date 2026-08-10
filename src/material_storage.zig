@@ -41,16 +41,27 @@ pub const TexTransform = extern struct {
     rs: [4]f32 align(16),
     params: [4]f32 align(16),
 
-    // The combined glTF transform is translation, then rotation, then scale, so
-    // the upper-left 2x2 is rotation times scale and the offset is the raw
-    // translation.
+    // The combined transform is translation, then rotation, then scale, so the
+    // upper-left 2x2 is rotation times scale and the offset is the raw
+    // translation. What the rotation's sign is takes more than that to settle,
+    // because KHR_texture_transform states it twice and the two disagree.
     //
-    // The sine signs are transposed relative to the column-major GLSL snippet in
-    // the extension's own README. UV space has V pointing down, so the
-    // extension's positive rotation is clockwise, and the sampling matrix needs
-    // the opposite sign. The Khronos TextureTransformTest asset shows which
-    // direction is in effect: its rotated quad hits a green marker for the
-    // correct one and a red marker for the reverse.
+    // Its Overview writes the transform out as a GLSL `mat3` triple. A `mat3`
+    // constructor takes columns, so read literally those nine numbers give a
+    // matrix with the rows (cos, -sin) and (sin, cos).
+    //
+    // Its property table says the rotation turns the UVs counter-clockwise, and
+    // the image clockwise. In UV space, where v points down, a matrix with the
+    // rows (cos, sin) and (-sin, cos) turns a coordinate from +u toward -v,
+    // which is counter-clockwise, and carries the image the other way. That is
+    // the transpose of the first reading, and it satisfies both halves of the
+    // sentence where the first reading satisfies neither.
+    //
+    // The prose and the extension's own TextureTransformTest agree, and the
+    // snippet is the odd one out, so this is the prose. The asset is what
+    // settles it rather than either reading on its own: its rotated quad points
+    // an arrow at a green marker for this direction and at a red one for the
+    // other.
     pub fn fromUv(uv: UvTransform) TexTransform {
         const cosine = @cos(uv.rotation);
         const sine = @sin(uv.rotation);
@@ -110,6 +121,22 @@ pub const MaterialData = extern struct {
     // lane, so every value in a buffer this module filled names a member.
     pub fn alphaMode(self: MaterialData) MaterialInfo.Rendering.AlphaMode {
         return @enumFromInt(self.flags[0]);
+    }
+
+    // Whether the fragment path samples this slot, which is also what decides
+    // whether the slot's transform is observable at all. Base colour has no
+    // presence bit and is always true: a material without one is bound to the
+    // neutral white fallback and sampled through the same transform anyway. The
+    // other four are read only where the mask says the texture is real.
+    pub fn samplesSlot(self: MaterialData, slot: TextureSlot) bool {
+        const mask = self.flags[2];
+        return switch (slot) {
+            .base_colour => true,
+            .metallic_roughness => mask & texture_present.metallic_roughness != 0,
+            .normal => mask & texture_present.normal != 0,
+            .emissive => mask & texture_present.emissive != 0,
+            .occlusion => mask & texture_present.occlusion != 0,
+        };
     }
 
     pub fn fromInfo(info: *const MaterialInfo) MaterialData {
@@ -222,8 +249,8 @@ pub const MaterialStorage = struct {
     }
 };
 
-// Mirrors set 1 of scene.slang: what the scene supplies to the main pass and no
-// single draw changes. The packed material array is what it holds.
+// Set 1: what the scene supplies to the main pass and no single draw changes.
+// The packed material array is what it holds.
 //
 // Its own set rather than a binding in the frame set or a second binding in each
 // material set, and it sits between them by index. The three are in increasing

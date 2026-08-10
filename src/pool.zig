@@ -2,20 +2,22 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
-// A handle packs a slot index and a generation counter into one u32. The split
+// A handle packs a slot index and a generation counter into one u64. The split
 // is pinned by the assert below: widening one narrows the other.
-const Index = u24;
-// DECIDE: 255 reuse cycles of one slot bring a handle back to a live
-// generation, and it then reads the current occupant as if it were the
-// original. That count is driven on a real pool by tests/pool.zig. Whether any
-// pool churns one slot that often is a property of a running application, so
-// this marker stays open until one exists to measure. Widening to a 64-bit
-// handle (32-bit index, 32-bit generation) removes the wrap by construction and
-// doubles every stored handle.
-const Generation = u8;
+const Index = u32;
+// Reusing one slot often enough returns its generation to a value an outstanding
+// handle still holds, and that handle then reads the current occupant as if it
+// were the original. The width is what puts that out of reach: the counter is
+// per slot rather than shared, so the wrap needs 2^32 releases of the same slot,
+// which is fifty days of releasing one a millisecond.
+//
+// Half a handle spent on the counter is the split Godot reaches for the same
+// reason. An RID is a 64-bit id carrying a 32-bit index and a validator in the
+// high half, core/templates/rid.h and core/templates/rid_owner.h.
+const Generation = u32;
 
 comptime {
-    std.debug.assert(@bitSizeOf(Index) + @bitSizeOf(Generation) == @bitSizeOf(u32));
+    std.debug.assert(@bitSizeOf(Index) + @bitSizeOf(Generation) == @bitSizeOf(u64));
 }
 
 // Indices cover 0..maxInt(Index), so the slot array holds one more entry than
@@ -40,7 +42,7 @@ pub fn ResourcePool(comptime T: type) type {
     return struct {
         const Self = @This();
 
-        pub const Handle = enum(u32) {
+        pub const Handle = enum(u64) {
             // Generation zero is never live, so the zero handle resolves to null
             // whatever slot count the pool has.
             invalid = 0,
@@ -55,7 +57,7 @@ pub fn ResourcePool(comptime T: type) type {
             }
 
             fn pack(idx: Index, gen: Generation) Handle {
-                return @enumFromInt((@as(u32, gen) << @bitSizeOf(Index)) | idx);
+                return @enumFromInt((@as(u64, gen) << @bitSizeOf(Index)) | @as(u64, idx));
             }
         };
 

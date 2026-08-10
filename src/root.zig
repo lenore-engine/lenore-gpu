@@ -21,7 +21,6 @@ const ref_cache = @import("ref_cache.zig");
 const sampler = @import("sampler.zig");
 const renderer = @import("renderer.zig");
 const resource_storage = @import("resource_storage.zig");
-const shaders = @import("shaders.zig");
 const staging = @import("staging/pool.zig");
 const environment = @import("environment.zig");
 const texture_cache = @import("texture_cache.zig");
@@ -83,6 +82,7 @@ pub const MaterialArrayBindings = material_storage.bindings;
 pub const Shading = @import("shading.zig");
 
 pub const SamplerCache = sampler.SamplerCache;
+pub const samplerCreateInfo = sampler.createInfo;
 
 pub const Mesh = mesh.Mesh;
 pub const MeshUpload = mesh.Upload;
@@ -116,9 +116,37 @@ pub const packSnorm3x10_1x2 = vertex.packSnorm3x10_1x2;
 pub const CameraUniform = uniforms.Camera;
 pub const LightUniform = uniforms.Light;
 pub const LightsUniform = uniforms.Lights;
+pub const SunShadowUniform = uniforms.SunShadow;
 pub const max_lights = uniforms.max_lights;
 pub const vulkanClip = uniforms.vulkanClip;
+pub const vulkanClipCamera = uniforms.vulkanClipCamera;
+pub const FramebufferCamera = uniforms.FramebufferCamera;
 pub const Uniforms = uniforms;
+
+const shadow = @import("shadow.zig");
+pub const ShadowPass = shadow.ShadowPass;
+pub const Shadow = shadow;
+
+const sky = @import("sky.zig");
+pub const Sky = sky;
+pub const Background = sky.Background;
+
+const bloom = @import("bloom.zig");
+pub const Bloom = bloom;
+pub const BloomPass = bloom.BloomPass;
+pub const BloomSettings = bloom.Settings;
+pub const BloomSettingsError = bloom.SettingsError;
+pub const BloomLook = bloom.Look;
+pub const BloomPushConstants = bloom.PushConstants;
+pub const BloomLevelTransition = bloom.LevelTransition;
+pub const bloom_bindings = bloom.bindings;
+pub const bloom_max_levels = bloom.max_levels;
+pub const bloomResolve = bloom.resolve;
+pub const bloomBaseExtent = bloom.baseExtent;
+pub const bloomChainDepth = bloom.chainDepth;
+pub const bloomTexelSize = bloom.texelSize;
+pub const bloomLevelBarrier = bloom.levelBarrierFor;
+pub const bloomPushConstantRange = bloom.push_constant_range;
 
 pub const UploadBatch = upload.Batch;
 pub const Uploaded = upload.Uploaded;
@@ -135,15 +163,39 @@ pub const RendererRecordError = renderer.RecordError;
 pub const validateRendererMaterialIndex = renderer.validateMaterialIndex;
 pub const validateRendererFrameIndex = renderer.validateFrameIndex;
 pub const validateRendererRecordBatch = renderer.validateRecordBatch;
+pub const backgroundSlot = renderer.backgroundSlot;
+pub const RecordRequest = renderer.RecordRequest;
+pub const RecordState = renderer.RecordState;
+pub const RecordPlan = renderer.RecordPlan;
+pub const planRecording = renderer.planRecording;
 pub const SceneVariant = renderer.SceneVariant;
 pub const sceneVariantFor = renderer.sceneVariantFor;
+pub const sceneVariantIndex = renderer.sceneVariantIndex;
+pub const scenePipelineIndex = renderer.scenePipelineIndex;
+pub const scene_variants = renderer.scene_variants;
+pub const scene_pipeline_count = renderer.scene_pipeline_count;
+pub const scene_modes = renderer.scene_modes;
 pub const RecordBatch = renderer.RecordBatch;
+pub const MaterialRecord = renderer.MaterialRecord;
+pub const ShadowBake = renderer.ShadowBake;
 pub const batchVertexSource = renderer.batchVertexSource;
+// What the shading this module is built from has to supply, one struct per
+// pass. The words are authored by whoever owns the look; nothing here embeds
+// any, and these are the shapes that composition fills.
+pub const Shaders = renderer.Shaders;
+pub const SceneShader = renderer.SceneShader;
+pub const SkyShader = sky.Shader;
+pub const PostShader = post.Shader;
+pub const BloomShader = bloom.Shader;
+pub const ShadowShader = shadow.Shader;
+pub const MorphShader = morph.Shader;
+
 pub const RendererMaterialBindings = renderer.material_bindings;
 pub const SceneSetBindings = renderer.scene_bindings;
 pub const frame_set_index = renderer.frame_set_index;
 pub const scene_set_index = renderer.scene_set_index;
 pub const material_set_index = renderer.material_set_index;
+pub const shadow_set_index = renderer.shadow_set_index;
 
 pub const ResourceStorage = resource_storage.ResourceStorage;
 pub const TextureSet = resource_storage.TextureSet;
@@ -160,10 +212,6 @@ pub const environment_bindings = environment.bindings;
 pub const environmentSampler = environment.sampler_config;
 pub const writeEnvironment = environment.write;
 
-pub const Shaders = shaders;
-pub const ShaderModule = shaders.Module;
-pub const ShaderEntryPoint = shaders.EntryPoint;
-
 pub const StagingPool = staging.StagingPool;
 pub const StagingConfig = staging.Config;
 pub const StagingReservation = staging.Reservation;
@@ -177,6 +225,19 @@ pub const attachmentFirstSupported = attachment.firstSupported;
 
 pub const DescriptorBinding = descriptors.Binding;
 pub const DescriptorSets = descriptors.Sets;
+
+// The bindings this module was generated against.
+//
+// A caller recording draws of its own speaks Vulkan; there is no way around
+// that, and a wrapper over `Pipeline` above would be a second way to do what is
+// already public. What the caller must not do is generate its own bindings: two
+// generations from the same registry produce two distinct sets of types, so a
+// pipeline built by one would not fit a command buffer named by the other, and
+// the compiler would say so somewhere far from the cause.
+//
+// One generation, reached through the module that owns it.
+pub const vk = @import("vulkan");
+pub const DescriptorType = vk.DescriptorType;
 
 pub const MainPass = pass;
 pub const MainPassTarget = pass.Target;

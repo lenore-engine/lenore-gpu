@@ -16,8 +16,7 @@ const Allocator = std.mem.Allocator;
 // count off the frame axis: a set per frame would have to be written again for
 // every ring added.
 //
-// Mirrors set 0 of scene.slang. `tests/reflection.zig` holds this table against
-// the compiler's account of that shader.
+// Set 0, and the whole of what a shader may read out of it.
 //
 // Each entry names the ring behind it as well as the binding, in one literal.
 // Both the descriptor write and the dynamic offsets are derived from this, so
@@ -26,7 +25,7 @@ const Allocator = std.mem.Allocator;
 // ring the other's offset without failing anything.
 // The order here is the order `init` builds its descriptor infos in, which is
 // what lets an entry select its own by the tag alone.
-const Ring = enum { camera, instances, lights, joints };
+const Ring = enum { camera, instances, lights, joints, sun_shadow };
 
 const Entry = struct {
     binding: descriptors.Binding,
@@ -59,6 +58,19 @@ const entries = [_]Entry{
         // a whole scene, and the joint array is per scene and not per skeleton.
         .binding = .{ .slot = 3, .kind = .storage_buffer_dynamic, .stages = .{ .vertex_bit = true } },
         .ring = .joints,
+    },
+    .{
+        // Both stages, and for once not the same reason on each side: the bake's
+        // vertex stage transforms casters by this matrix, and the main pass's
+        // fragment stage transforms the shaded point by the same one to find the
+        // texel to compare against. The lookup is a fragment-stage operation
+        // because the point it needs is the shaded one, not a vertex.
+        .binding = .{
+            .slot = 4,
+            .kind = .uniform_buffer_dynamic,
+            .stages = .{ .vertex_bit = true, .fragment_bit = true },
+        },
+        .ring = .sun_shadow,
     },
 };
 
@@ -172,6 +184,7 @@ pub const FrameSet = struct {
     instances: per_frame.PerFrame(Instance),
     lights: per_frame.PerFrame(uniforms.Lights),
     joints: per_frame.PerFrame(Joint),
+    sun_shadow: per_frame.PerFrame(uniforms.SunShadow),
     sets: Sets,
 
     pub fn init(
@@ -221,6 +234,18 @@ pub const FrameSet = struct {
         );
         errdefer joints.deinit();
 
+        // One block per frame, like the camera: the fit it carries is the
+        // scene's rather than any one draw's, and both the bake and the lookup
+        // read the same copy.
+        var sun_shadow = try per_frame.PerFrame(uniforms.SunShadow).init(
+            context,
+            memory_allocator,
+            frames,
+            1,
+            usageFor(entryFor(.sun_shadow).binding.kind),
+        );
+        errdefer sun_shadow.deinit();
+
         var sets = try Sets.init(context, allocator, 1);
         errdefer sets.deinit(context, allocator);
 
@@ -234,6 +259,7 @@ pub const FrameSet = struct {
             instances.descriptor(),
             lights.descriptor(),
             joints.descriptor(),
+            sun_shadow.descriptor(),
         };
         var writes: [entries.len]vk.WriteDescriptorSet = undefined;
         inline for (entries, &writes) |entry, *write| {
@@ -251,12 +277,14 @@ pub const FrameSet = struct {
             .instances = instances,
             .lights = lights,
             .joints = joints,
+            .sun_shadow = sun_shadow,
             .sets = sets,
         };
     }
 
     pub fn deinit(self: *FrameSet, context: *const Context, allocator: Allocator) void {
         self.sets.deinit(context, allocator);
+        self.sun_shadow.deinit();
         self.joints.deinit();
         self.lights.deinit();
         self.instances.deinit();
@@ -274,12 +302,20 @@ pub const FrameSet = struct {
     // What one frame reads. Grouped rather than passed as three parameters
     // because they are written together, under one fence wait.
     pub const Frame = struct {
-        camera: uniforms.Camera,
+        // Already in the framebuffer's coordinates. The type is what says so:
+        // the ring is the last place the value passes through, and nothing here
+        // could tell a flipped block from an unflipped one.
+        camera: uniforms.FramebufferCamera,
         models: []const Instance,
         // Every drawn skeleton's matrices, already packed into one run per
         // instance. The bases in `models` index this.
         joints: []const Joint,
         lights: []const uniforms.Light,
+
+        // Defaulted to the off state, which is what a frame that casts no sun
+        // shadow carries: it is a supported configuration and not an omission,
+        // so it does not have to be written out at every call site that means it.
+        sun_shadow: uniforms.SunShadow = .off,
     };
 
     // Fill one frame's slot. The caller has waited on that slot's fence; see
@@ -287,10 +323,11 @@ pub const FrameSet = struct {
     pub fn update(self: *FrameSet, frame: usize, contents: Frame) UpdateError!void {
         try validate(self.capacity(), contents);
 
-        self.camera.slice(frame)[0] = contents.camera;
+        self.camera.slice(frame)[0] = contents.camera.block;
         @memcpy(self.instances.slice(frame)[0..contents.models.len], contents.models);
         @memcpy(self.joints.slice(frame)[0..contents.joints.len], contents.joints);
         self.lights.slice(frame)[0].fill(contents.lights);
+        self.sun_shadow.slice(frame)[0] = contents.sun_shadow;
     }
 
     // Vulkan specification, vkCmdBindDescriptorSets: dynamic offsets are
@@ -305,6 +342,7 @@ pub const FrameSet = struct {
                 .instances => self.instances.dynamicOffset(frame),
                 .lights => self.lights.dynamicOffset(frame),
                 .joints => self.joints.dynamicOffset(frame),
+                .sun_shadow => self.sun_shadow.dynamicOffset(frame),
             };
         }
         return offsets;

@@ -51,29 +51,32 @@ test "a released slot is reused under a new handle" {
 }
 
 // The generation is what makes a stale handle fail, and it is finite: reusing
-// one slot often enough returns to the generation a live handle already holds.
-// This drives that cycle on a real pool and pins the count, so the width of
-// Generation is a measured property rather than an assumed one.
-test "a handle aliases again after a measured number of reuses of its slot" {
+// one slot often enough returns to the generation an outstanding handle still
+// holds. Driving the cycle to that point is what the width is chosen to make
+// impossible, so this drives a hundred thousand reuses of one slot instead and
+// requires the stale handle to be dead through every one of them. That is a
+// lower bound on the width and not a measurement of it: it fails on anything up
+// to a 16-bit generation and passes on anything above.
+test "a stale handle stays dead however often its slot is reused" {
     var pool: Pool = .empty;
     defer pool.deinit(testing.allocator);
 
     const stale = try pool.add(testing.allocator, 1);
     _ = pool.remove(stale);
 
-    var cycles: u32 = 0;
-    const collision = while (cycles < 4096) {
-        const handle = try pool.add(testing.allocator, cycles + 2);
-        cycles += 1;
-        if (handle == stale) break handle;
-        _ = pool.remove(handle);
-    } else null;
+    // One slot serves every insert below, which is what advances its
+    // generation. An allocator that refuses everything is the proof: taking a
+    // new slot needs one and reusing a freed slot needs none.
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const allocator = failing.allocator();
 
-    try testing.expect(collision != null);
-    try testing.expectEqual(@as(u32, 255), cycles);
-    // The occupant is the new one; the stale handle reads it as if it were the
-    // original. Only the slot count bounds how long a handle stays safe.
-    try testing.expectEqual(@as(u32, 256), pool.get(stale).?.*);
+    var cycles: u32 = 0;
+    while (cycles < 100_000) : (cycles += 1) {
+        const handle = try pool.add(allocator, cycles + 2);
+        try testing.expect(handle != stale);
+        try testing.expect(pool.get(stale) == null);
+        try testing.expectEqual(@as(?u32, cycles + 2), pool.remove(handle));
+    }
 }
 
 test "the iterator visits live entries and skips released slots" {

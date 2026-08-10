@@ -84,21 +84,22 @@ const supported_formats = [_]Supported{
         .descriptor = .{ .colour_model = 134, .transfer_function = 2 },
     },
     // The format every prefiltered environment Khronos publishes is stored in.
-    // Its descriptor is null because those files do not carry a usable one: the
-    // section is present and 28 bytes long, but declares dfdTotalSize 0, colour
-    // model 0, no samples and bytesPlane entirely zero, written that way by
-    // "UX3D SlimKTX2 v1.0". Requiring a conformant descriptor here rejects the
+    // Its descriptor is null because those files do not carry a conformant one:
+    // the section is present and 28 bytes long, but declares dfdTotalSize 0,
+    // colour model 0, no samples and bytesPlane entirely zero, written that way
+    // by "UX3D SlimKTX2 v1.0". KTX File Format Specification v2 section 3.9.2
+    // requires dfdByteLength to equal dfdTotalSize, so those files are invalid
+    // as they stand, and requiring a conformant descriptor here would reject the
     // reference environments themselves.
     //
-    // DECIDE: this trusts vkFormat for uncompressed files, and the level-length
-    // check below cannot recover what the descriptor was doing. That check
-    // proves the payload is the right *size*, which pins the texel size at eight
-    // bytes, but not which eight-byte format it is: R16G16B16A16_SFLOAT and
-    // R16G16B16A16_UNORM are indistinguishable to it, and the second read as the
-    // first is a wrong picture rather than a failed load. Options are to accept
-    // that for files we control the provenance of, to re-encode the
-    // environments with a conformant writer at import, or to check the payload
-    // statistically. Kira's call; nothing here is blocked on it.
+    // Taking the format from vkFormat alone loses nothing. Section 3.10.1
+    // requires the descriptor's texel block dimensions, bytesPlane and sample
+    // information to match the format's definition whenever vkFormat is not
+    // VK_FORMAT_UNDEFINED, so a conformant descriptor restates vkFormat and
+    // cannot qualify it. R16G16B16A16_SFLOAT and R16G16B16A16_UNORM are distinct
+    // vkFormat values, 97 and 91, so telling those two apart was never the
+    // descriptor's work. That is what makes the check in `validateDataFormat` a
+    // consistency test against the row it matched, not the source of the format.
     .{
         .format = .r16g16b16a16_sfloat,
         .type_size = 2,

@@ -1,21 +1,31 @@
 const std = @import("std");
 const material_storage = @import("material_storage.zig");
 
-// The host account of what `fragmentMain` in scene.slang computes from a
-// material. It calls no Vulkan and holds no device state, so the arithmetic the
-// picture depends on can be answered by a test rather than by a screenshot.
+// The host account of what a main-pass fragment stage computes from a material.
+// It calls no Vulkan and holds no device state, so the arithmetic the picture
+// depends on can be answered by a test rather than by a screenshot.
 //
-// It lives beside the material it reads for the reason `staging/placement.zig`
-// lives beside the arena it serves: the shader is the only consumer, and the
-// shader belongs to this module. A second backend would reuse these bodies
-// unchanged.
+// The formulas are glTF 2.0 Appendix B.3, and a shader is written from the same
+// section. Nothing generates one side from the other, so a divergence shows up
+// as a golden vector that stops matching rather than as a build error.
 //
-// The formulas are glTF 2.0 Appendix B.3, and the shader is written from the
-// same section. Nothing generates one side from the other, so a divergence
-// shows up as a golden vector that stops matching rather than as a build error.
+// It stays in this module although nothing in `src/` calls it, and the reason
+// is the record it reads. Every function here interprets a field of
+// `material_storage.MaterialData`, whose packing this module owns and whose
+// meaning is fixed by the same specification section. Splitting the two would
+// put a layout and its interpretation in different repositories.
+//
+// A second backend would reuse these bodies unchanged, which usually places a
+// file elsewhere. It does not here, for the reason `staging/placement.zig` is
+// also neutral arithmetic that stays: what a file serves decides where it
+// lives. This serves the packed material record.
+//
+// What would move it is a second shading model with a host mirror of its own.
+// Two mirrors in two repositories is the state this arrangement cannot
+// describe.
 
-// The floor the roughness is held above, matching `min_roughness` in
-// scene.slang. A punctual light is a delta, so at the mirror direction the
+// The floor the roughness is held above, and a shader holds it above the same
+// one. A punctual light is a delta, so at the mirror direction the
 // distribution below is 1/(pi * a^2) with a = roughness^2, and the specular
 // term approaches intensity / (4 * pi * a^2). The HDR attachment's narrowest
 // channel is an unsigned 10-bit float whose largest finite value is
@@ -226,29 +236,20 @@ pub fn normalFromMaterial(
     ));
 }
 
-// The metallic-roughness BRDF, Appendix B.3.5, in the form that section reaches
-// after folding the metal and dielectric mixes together. The result is the
-// reflectance, so the caller still multiplies by the light's radiance and by
-// N.L.
+// The metallic-roughness BRDF in the form Appendix B.3.5 calls the final BRDF
+// for the material. That section builds the mix of a metal and a dielectric
+// BRDF, then folds it and states the folded result as what to implement, which
+// is what this is. The result is the reflectance, so the caller still multiplies
+// by the light's radiance and by N.L.
 //
-// DECIDE: this folded form and the mixture Appendix B.1 states,
-// `mix(dielectric_brdf, metal_brdf, metallic)`, are not the same function. Their
-// specular terms are identical — measured, agreeing to 1e-15 over 200 000 random
-// parameter sets — but their diffuse terms are not. This form attenuates diffuse
-// by `1 - F` with F built from the metal-blended f0; the mixture attenuates by
-// `1 - F` with the dielectric f0 alone and then scales by `1 - metallic`. They
-// agree at metallic 0 and at metallic 1 and differ in between, by up to 0.075 in
-// reflectance for a bright base colour at metallic 0.54. The image-based path
-// below is written as the mixture, because that is what the specification and
-// the reference implementation both state; leaving the direct path folded means
-// two different diffuse attenuations in one frame.
-//
-// What closes it is a rendered scene carrying a metallic-roughness texture with
-// intermediate metalness over a bright base colour, shaded both ways, compared
-// against the same asset in the reference viewer. The difference is a diffuse
-// term at partial metalness, which no offline test can rank: both forms are
-// self-consistent, and only the picture says which one the asset was authored
-// against. It outlives this stage for that reason.
+// The fold is not an identity, and the difference is worth knowing before this
+// is compared against a renderer written to the unfolded mix. The two specular
+// terms agree to 1e-15 over 200 000 random parameter sets, measured, but the
+// diffuse terms do not. This one attenuates by `1 - F` with F built from the
+// metal-blended f0, where the mix attenuates by `1 - F` from the dielectric f0
+// alone and then scales by `1 - metallic`. They meet at metallic 0 and at
+// metallic 1 and part in between, by up to 0.075 in reflectance for a bright
+// base colour around metallic 0.54.
 pub fn brdf(surface: Surface, geometry: Geometry) [3]f32 {
     const half_vector = normalize(add(geometry.to_light, geometry.to_eye));
     const n_dot_l = @max(dot(geometry.normal, geometry.to_light), 0);
@@ -353,6 +354,15 @@ pub fn iblFresnel(f0: [3]f32, roughness: f32, n_dot_v: f32, f_ab: [2]f32) [3]f32
 // rather than a base colour already scaled by `1 - metallic`: the mixture is
 // what removes a metal's diffuse lobe here, so scaling twice would remove it
 // twice.
+//
+// Left as the mixture on purpose, where the direct path uses the form B.3.5
+// folds the same mix into. That fold does not carry over. `iblFresnel` is the
+// multiple-scattering term and not a plain Schlick, and it is not linear in f0,
+// so one blended f0 is not the mix of two. Folding this one moves the picture
+// visibly at intermediate metalness, not marginally.
+//
+// The two paths therefore attenuate diffuse differently there. Each follows the
+// construction its Fresnel term was written for, and that is the trade.
 pub fn imageBasedLight(surface: Surface, n_dot_v: f32, samples: EnvironmentSamples) [3]f32 {
     const metal_fresnel = iblFresnel(surface.base_colour, surface.roughness, n_dot_v, samples.f_ab);
     const dielectric_fresnel = iblFresnel(

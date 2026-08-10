@@ -59,10 +59,10 @@ test "the presentable image is written whole and never read first" {
 }
 
 test "the pass samples what the main pass left behind" {
-    // One binding, and its layout is the one `pass.end` transitions the HDR
-    // target into. A different layout here is a validation error at draw time
-    // and nothing sooner.
-    try testing.expectEqual(@as(usize, 1), gpu.PostBindings.len);
+    // Slot zero is the HDR target, and the layout its descriptor declares is the
+    // one `pass.end` transitions that target into. A different layout is a
+    // validation error at draw time and nothing sooner.
+    try testing.expectEqual(@as(u32, 0), gpu.PostBindings[0].slot);
     try testing.expectEqual(vk.DescriptorType.combined_image_sampler, gpu.PostBindings[0].kind);
     try testing.expect(gpu.PostBindings[0].stages.fragment_bit);
 
@@ -86,10 +86,11 @@ test "the post entry points are reached by the compiler" {
     _ = &post.write;
 }
 
-test "the runtime look fits one fragment push-constant word" {
-    try testing.expectEqual(@as(usize, 4), @sizeOf(post.PushConstants));
+test "the runtime look fits two fragment push-constant words" {
+    try testing.expectEqual(@as(usize, 8), @sizeOf(post.PushConstants));
     try testing.expectEqual(@as(usize, 4), @alignOf(post.PushConstants));
     try testing.expectEqual(@as(usize, 0), @offsetOf(post.PushConstants, "exposure"));
+    try testing.expectEqual(@as(usize, 4), @offsetOf(post.PushConstants, "bloom"));
 
     try testing.expectEqual(@as(u32, 0), post.push_constant_range.offset);
     try testing.expectEqual(@as(u32, @sizeOf(post.PushConstants)), post.push_constant_range.size);
@@ -98,18 +99,44 @@ test "the runtime look fits one fragment push-constant word" {
         post.push_constant_range.stage_flags,
     );
 
-    const constants = try post.pushConstants(.{});
+    const constants = try post.pushConstants(.{}, null);
     try testing.expectEqual(@as(f32, 1), constants.exposure);
 }
 
 test "only finite non-negative exposure reaches command state" {
-    try testing.expectError(error.InvalidExposure, post.pushConstants(.{ .exposure = -1 }));
-    try testing.expectError(error.InvalidExposure, post.pushConstants(.{ .exposure = std.math.nan(f32) }));
-    try testing.expectError(error.InvalidExposure, post.pushConstants(.{ .exposure = std.math.inf(f32) }));
-    try testing.expectError(error.InvalidExposure, post.pushConstants(.{ .exposure = -std.math.inf(f32) }));
+    try testing.expectError(error.InvalidExposure, post.pushConstants(.{ .exposure = -1 }, null));
+    try testing.expectError(error.InvalidExposure, post.pushConstants(.{ .exposure = std.math.nan(f32) }, null));
+    try testing.expectError(error.InvalidExposure, post.pushConstants(.{ .exposure = std.math.inf(f32) }, null));
+    try testing.expectError(error.InvalidExposure, post.pushConstants(.{ .exposure = -std.math.inf(f32) }, null));
+    try testing.expectError(error.InvalidExposure, post.exposure(.{ .exposure = -1 }));
 
-    const zero = try post.pushConstants(.{ .exposure = 0 });
+    const zero = try post.pushConstants(.{ .exposure = 0 }, null);
     try testing.expectEqual(@as(f32, 0), zero.exposure);
+}
+
+test "a recording with no chain composites nothing, and says so with a weight" {
+    // The weight is zero without a look, but that is not what switches the
+    // composite off: the pipeline built on the entry point that never samples
+    // the chain is. A chain nothing recorded this frame holds whatever its
+    // memory held, and an unsigned float format has bit patterns that decode to
+    // NaN, which multiplying by zero does not remove.
+    const without = try post.pushConstants(.{}, null);
+    try testing.expectEqual(@as(f32, 0), without.bloom);
+
+    const look = try gpu.bloomResolve(.{}, 7);
+    const with = try post.pushConstants(.{}, look);
+    try testing.expectEqual(look.composite, with.bloom);
+    try testing.expect(with.bloom > 0);
+}
+
+test "the post set names the target and the chain, both in the sampled layout" {
+    try testing.expectEqual(@as(usize, 2), post.bindings.len);
+    try testing.expectEqual(@as(u32, 0), post.bindings[0].slot);
+    try testing.expectEqual(@as(u32, 1), post.bindings[1].slot);
+    for (post.bindings) |binding| {
+        try testing.expectEqual(vk.DescriptorType.combined_image_sampler, binding.kind);
+        try testing.expect(binding.stages.fragment_bit);
+    }
 }
 
 test "PBR Neutral preserves its near-black and uncompressed branches" {

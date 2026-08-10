@@ -93,10 +93,30 @@ test "the device-facing surface is compiled" {
     _ = &gpu.MorphPass.deinit;
     _ = &gpu.MorphPass.register;
     _ = &gpu.MorphPass.registrationCount;
+    _ = &gpu.MorphPass.reset;
     _ = &gpu.MorphPass.writeWeights;
     _ = &gpu.MorphPass.vertexSource;
     _ = &gpu.MorphPass.record;
     _ = &gpu.MorphPass.descriptorSetLayout;
+
+    _ = &gpu.ShadowPass.init;
+    _ = &gpu.ShadowPass.deinit;
+    _ = &gpu.ShadowPass.descriptorSetLayout;
+    _ = &gpu.ShadowPass.descriptorSet;
+    _ = &gpu.ShadowPass.mapSize;
+    _ = &gpu.ShadowPass.pipelineFor;
+    _ = &gpu.ShadowPass.begin;
+    _ = &gpu.ShadowPass.end;
+
+    _ = &gpu.Sky.record;
+
+    _ = &gpu.BloomPass.init;
+    _ = &gpu.BloomPass.deinit;
+    _ = &gpu.BloomPass.recreate;
+    _ = &gpu.BloomPass.record;
+    _ = &gpu.BloomPass.levelCount;
+    _ = &gpu.BloomPass.compositeView;
+    _ = &gpu.BloomPass.compositeSampler;
 
     _ = &gpu.UploadBatch.begin;
     _ = &gpu.UploadBatch.deinit;
@@ -123,12 +143,26 @@ test "the device-facing surface is compiled" {
     _ = &gpu.Renderer.deinit;
     _ = &gpu.Renderer.resize;
     _ = &gpu.Renderer.update;
-    _ = &gpu.Renderer.record;
+    _ = &gpu.Renderer.plan;
+    // The frame's stages, in the order they are recorded. Named one by one and
+    // not through a whole-frame entry point, because there is no longer one:
+    // composition sequences them.
+    _ = &gpu.Renderer.recordShadowBake;
+    _ = &gpu.Renderer.beginMain;
+    _ = &gpu.Renderer.recordScene;
+    _ = &gpu.Renderer.endMain;
+    _ = &gpu.Renderer.recordBloom;
+    _ = &gpu.Renderer.recordPost;
     _ = &gpu.Renderer.setMaterialBuffer;
     _ = &gpu.Renderer.setEnvironment;
     _ = &gpu.Renderer.setMaterialTextures;
+    _ = &gpu.Renderer.clearMaterials;
+    _ = &gpu.Renderer.shadowBakes;
+    _ = &gpu.Renderer.backgroundDraws;
+    _ = &gpu.Renderer.shadowMapSize;
     _ = &gpu.Renderer.targetExtent;
     _ = &gpu.Renderer.mainPassTarget;
+    _ = &gpu.Renderer.mainPassFormats;
 
     _ = &gpu.Attachment.createHdr;
     _ = &gpu.Attachment.createDepth;

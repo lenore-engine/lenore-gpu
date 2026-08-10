@@ -12,13 +12,32 @@ pub const CreateError = vk.DeviceWrapper.CreateShaderModuleError ||
     vk.DeviceWrapper.CreateGraphicsPipelinesError ||
     vk.DeviceWrapper.CreateComputePipelinesError;
 
-// How a primitive reaches the colour target. The two differ in more than
-// blending: a blended primitive does not write depth, because it is drawn after
-// the opaque set in an order that is only approximately back to front, and
-// depth writes would let one transparent surface hide another.
+// How a primitive reaches the colour target. They differ in more than blending:
+// a blended primitive does not write depth, because it is drawn after the opaque
+// set in an order that is only approximately back to front, and depth writes
+// would let one transparent surface hide another.
 pub const Mode = enum {
     solid,
     blended,
+
+    // The background, drawn at the far plane between the two sets above. It
+    // composites by the depth test alone: nothing blends, and nothing is
+    // written back, because the only value it could write is the one the clear
+    // already put there.
+    //
+    // Not a mode any material maps to. `modeFor` cannot produce it, and the
+    // table of scene pipelines names its own two rather than counting the
+    // members here.
+    background,
+
+    // The bloom chain's upsample: the filtered coarser level summed onto the
+    // level under it. The shader has already scaled its result by that level's
+    // weight, so the blend unit's whole part is the sum.
+    //
+    // The one mode with no depth in it at all. The chain is colour only, and
+    // where the others answer what a primitive does about depth, this one
+    // answers that there is none to do anything about.
+    additive,
 };
 
 // glTF's third alpha mode has no pipeline of its own. A masked primitive
@@ -34,7 +53,10 @@ pub fn modeFor(alpha: AlphaMode) Mode {
 // Dynamic rendering takes the attachment formats at creation instead of a
 // render pass object.
 pub const Formats = struct {
-    colour: vk.Format,
+    // Null for a pass that writes no colour. The shadow bake is one: the depth
+    // the rasterizer writes is its whole output, and declaring an attachment
+    // nothing writes would demand a fragment shader to write it.
+    colour: ?vk.Format = null,
     // Null for a pass that declares no depth attachment. The post pass is one:
     // it covers the screen with a triangle and has nothing to occlude.
     depth: ?vk.Format = null,
@@ -51,7 +73,33 @@ pub const Stage = struct {
 
 pub const Stages = struct {
     vertex: Stage,
-    fragment: Stage,
+    // Null for a pipeline that writes no colour and needs no per-fragment test.
+    // The opaque half of the shadow bake is one, and leaving the stage out is
+    // not merely an economy: a fragment shader is what would stand between the
+    // rasterizer and the depth write.
+    fragment: ?Stage = null,
+};
+
+// The two factors the rasterizer offsets a fragment's depth by, held together
+// because neither is meaningful without depth bias being enabled at all. Null
+// in `Config` is the disabled state, so there is no enable flag beside values
+// that would then be ignored.
+//
+// Vulkan specification, Rasterization, "Depth Bias Computation"
+// (primsrast-depthbias-computation): the slope factor scales the maximum depth
+// slope of the polygon, the constant factor scales the depth attachment's
+// parameter r, and the two scaled terms are summed. Both are passed through
+// unchanged.
+//
+// The two are not interchangeable, and the reason lands on whoever picks the
+// numbers. The slope term is in units of the primitive's own depth gradient.
+// The constant term is in units of r, which for a floating-point depth
+// attachment the same section defines per primitive as 2^(e - n), where e is the
+// maximum exponent over the z values the primitive spans; there is no single
+// minimum resolvable difference for such an attachment.
+pub const DepthBias = struct {
+    constant: f32 = 0,
+    slope: f32,
 };
 
 // Cull mode is fixed for a pass whose geometry does not vary by material and
@@ -74,6 +122,10 @@ pub const Config = struct {
     formats: Formats,
     layout: vk.PipelineLayout,
     stages: Stages,
+    // Null leaves the rasterizer's depth untouched, which is what every pass
+    // writing into the camera's depth buffer wants: the value it writes is the
+    // one it is later tested against.
+    depth_bias: ?DepthBias = null,
 };
 
 // The whole set of streams: base, skin, colour and second UV, contributing four
@@ -126,14 +178,28 @@ fn addStream(input: *VertexInput, comptime Stream: type) void {
     }
 }
 
-// Both modes test depth against what the opaque set already wrote. Only the
-// solid one adds to it: a blended surface that wrote depth would hide the
-// blended surfaces behind it, which is the one thing sorting cannot repair.
+// Every mode drawn into the camera's target tests depth against what the opaque
+// set already wrote. Only the solid one adds to it: a blended surface that wrote
+// depth would hide the blended surfaces behind it, which is the one thing
+// sorting cannot repair.
+//
+// The background is the one that has to accept equality. It is drawn at the far
+// plane, and the pixels it belongs in are exactly those still holding the clear,
+// which is that same value; a strict comparison would reject all of them and
+// draw nothing at all.
+//
+// The additive mode states no depth behaviour because it has none. `create`
+// hands this structure to the driver only when the rendering info declares a
+// depth attachment, and the bloom chain declares none.
 pub fn depthStencilState(mode: Mode) vk.PipelineDepthStencilStateCreateInfo {
     return .{
-        .depth_test_enable = .true,
+        .depth_test_enable = if (mode == .additive) .false else .true,
         .depth_write_enable = if (mode == .solid) .true else .false,
-        .depth_compare_op = .less,
+        .depth_compare_op = switch (mode) {
+            .solid, .blended => .less,
+            .background => .less_or_equal,
+            .additive => .always,
+        },
         .depth_bounds_test_enable = .false,
         .stencil_test_enable = .false,
         .front = std.mem.zeroes(vk.StencilOpState),
@@ -146,14 +212,30 @@ pub fn depthStencilState(mode: Mode) vk.PipelineDepthStencilStateCreateInfo {
 // Source alpha over destination, with the destination's alpha left alone: the
 // HDR target is opaque and its alpha is composited against nothing.
 //
-// The factors are set in both modes. A disabled blend ignores them, and giving
-// the solid mode its own set of values would be two states to read where the
+// The additive mode is the exception in the colour factors, and it reads no
+// alpha at all: what the bloom chain's upsample wants is the plain sum of the
+// tent-filtered coarser level and the level already in the attachment. Its
+// weight is not here either. It is a uniform the shader applies, so the value
+// stays where a test can evaluate it rather than becoming blend state that
+// nothing offline can read back.
+//
+// The modes that do not blend still carry factors. A disabled blend ignores
+// them, and giving each its own set would be several states to read where the
 // enable bit is the only difference that reaches the device.
 pub fn blendAttachment(mode: Mode) vk.PipelineColorBlendAttachmentState {
     return .{
-        .blend_enable = if (mode == .blended) .true else .false,
-        .src_color_blend_factor = .src_alpha,
-        .dst_color_blend_factor = .one_minus_src_alpha,
+        .blend_enable = switch (mode) {
+            .blended, .additive => .true,
+            .solid, .background => .false,
+        },
+        .src_color_blend_factor = switch (mode) {
+            .additive => .one,
+            .solid, .blended, .background => .src_alpha,
+        },
+        .dst_color_blend_factor = switch (mode) {
+            .additive => .one,
+            .solid, .blended, .background => .one_minus_src_alpha,
+        },
         .color_blend_op = .add,
         .src_alpha_blend_factor = .one,
         .dst_alpha_blend_factor = .zero,
@@ -192,7 +274,10 @@ pub fn createLayout(context: *const Context, config: LayoutConfig) CreateError!v
 // clip y before the positive-height viewport maps it to framebuffer rows, so
 // that winding is `counter_clockwise` here. Draws with a negative determinant
 // must reverse the culled side or use the opposite front-face state.
-pub fn rasterizationState(culling: Culling) vk.PipelineRasterizationStateCreateInfo {
+pub fn rasterizationState(
+    culling: Culling,
+    bias: ?DepthBias,
+) vk.PipelineRasterizationStateCreateInfo {
     return .{
         .depth_clamp_enable = .false,
         .rasterizer_discard_enable = .false,
@@ -202,10 +287,13 @@ pub fn rasterizationState(culling: Culling) vk.PipelineRasterizationStateCreateI
             .dynamic => .{},
         },
         .front_face = .counter_clockwise,
-        .depth_bias_enable = .false,
-        .depth_bias_constant_factor = 0,
+        .depth_bias_enable = if (bias == null) .false else .true,
+        .depth_bias_constant_factor = if (bias) |values| values.constant else 0,
+        // Unclamped. A clamp bounds the offset a steep primitive receives, and
+        // what it is worth cannot be settled without a scene steep enough to
+        // need one.
         .depth_bias_clamp = 0,
-        .depth_bias_slope_factor = 0,
+        .depth_bias_slope_factor = if (bias) |values| values.slope else 0,
         .line_width = 1,
     };
 }
@@ -223,18 +311,21 @@ pub fn dynamicStates(culling: Culling) []const vk.DynamicState {
 }
 
 pub fn create(context: *const Context, config: Config) CreateError!vk.Pipeline {
-    const stages = [_]vk.PipelineShaderStageCreateInfo{
-        .{
-            .stage = .{ .vertex_bit = true },
-            .module = config.stages.vertex.module,
-            .p_name = config.stages.vertex.entry_point,
-        },
-        .{
-            .stage = .{ .fragment_bit = true },
-            .module = config.stages.fragment.module,
-            .p_name = config.stages.fragment.entry_point,
-        },
+    var stages: [2]vk.PipelineShaderStageCreateInfo = undefined;
+    stages[0] = .{
+        .stage = .{ .vertex_bit = true },
+        .module = config.stages.vertex.module,
+        .p_name = config.stages.vertex.entry_point,
     };
+    var stage_count: u32 = 1;
+    if (config.stages.fragment) |fragment| {
+        stages[1] = .{
+            .stage = .{ .fragment_bit = true },
+            .module = fragment.module,
+            .p_name = fragment.entry_point,
+        };
+        stage_count = 2;
+    }
 
     const input = if (config.streams) |streams| vertexInput(streams) else VertexInput{
         .bindings = undefined,
@@ -261,7 +352,7 @@ pub fn create(context: *const Context, config: Config) CreateError!vk.Pipeline {
         .scissor_count = 1,
     };
 
-    const rasterization = rasterizationState(config.culling);
+    const rasterization = rasterizationState(config.culling, config.depth_bias);
 
     const multisample = vk.PipelineMultisampleStateCreateInfo{
         .rasterization_samples = .{ .@"1_bit" = true },
@@ -274,10 +365,15 @@ pub fn create(context: *const Context, config: Config) CreateError!vk.Pipeline {
     const depth_stencil = depthStencilState(config.mode);
     const blend_attachment = blendAttachment(config.mode);
 
+    // A pipeline with no colour attachment has nothing to blend, and the state
+    // is still handed over with a count of zero rather than left out: a valid
+    // structure describing no attachments is accepted wherever the state is
+    // read at all, and it is one branch fewer than reasoning about when the
+    // pointer may be null.
     const blend_state = vk.PipelineColorBlendStateCreateInfo{
         .logic_op_enable = .false,
         .logic_op = .copy,
-        .attachment_count = 1,
+        .attachment_count = if (config.formats.colour == null) 0 else 1,
         .p_attachments = @ptrCast(&blend_attachment),
         .blend_constants = .{ 0, 0, 0, 0 },
     };
@@ -288,10 +384,12 @@ pub fn create(context: *const Context, config: Config) CreateError!vk.Pipeline {
         .p_dynamic_states = dynamic_states.ptr,
     };
 
-    const colour_format = config.formats.colour;
+    // Named rather than passed inline: the structure holds a pointer to it and
+    // it has to outlive the call below.
+    const colour_format = config.formats.colour orelse .undefined;
     const rendering = vk.PipelineRenderingCreateInfo{
         .view_mask = 0,
-        .color_attachment_count = 1,
+        .color_attachment_count = if (config.formats.colour == null) 0 else 1,
         .p_color_attachment_formats = @ptrCast(&colour_format),
         .depth_attachment_format = config.formats.depth orelse .undefined,
         .stencil_attachment_format = .undefined,
@@ -300,7 +398,7 @@ pub fn create(context: *const Context, config: Config) CreateError!vk.Pipeline {
     var pipeline: vk.Pipeline = undefined;
     _ = try context.device.createGraphicsPipelines(.null_handle, &.{.{
         .p_next = @ptrCast(&rendering),
-        .stage_count = stages.len,
+        .stage_count = stage_count,
         .p_stages = &stages,
         .p_vertex_input_state = &vertex_input_state,
         .p_input_assembly_state = &input_assembly,

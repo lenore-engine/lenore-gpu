@@ -108,6 +108,10 @@ pub const CopyError = error{
     RowRangeOutOfBounds,
 };
 
+pub const MipViewError = error{
+    MipLevelOutOfRange,
+} || vk.DeviceWrapper.CreateImageViewError;
+
 pub const Config = struct {
     width: u32,
     height: u32,
@@ -300,6 +304,44 @@ pub const Image = struct {
             error.InvalidAllocation => @panic("image owns an invalid memory allocation"),
         };
         self.* = undefined;
+    }
+
+    // A view of one level, for a pass that renders into the levels of a chain one
+    // at a time. `view` above spans the whole chain and is what a sampler reads
+    // across levels; a colour attachment names exactly one level, and so does a
+    // descriptor that must not reach the level being written beside it.
+    //
+    // The caller owns the result and destroys it with the device. It is not kept
+    // here because how many levels a consumer renders into is the consumer's
+    // business, and storing an array of them would allocate for every image to
+    // serve the one kind that needs it.
+    pub fn createMipView(self: *const Image, level: u32) MipViewError!vk.ImageView {
+        if (level >= self.mip_levels) return error.MipLevelOutOfRange;
+
+        return self.context.device.createImageView(&.{
+            .image = self.handle,
+            .view_type = self.shape.viewType(),
+            .format = self.format,
+            .components = .{ .r = .identity, .g = .identity, .b = .identity, .a = .identity },
+            .subresource_range = .{
+                .aspect_mask = self.kind.aspect(),
+                .base_mip_level = level,
+                .level_count = 1,
+                .base_array_layer = base_array_layer,
+                .layer_count = self.shape.layerCount(),
+            },
+        }, null);
+    }
+
+    // The extent of one level, which is the render area a pass covering that
+    // level asks for. Derived from the image's own extent rather than carried
+    // beside it, so a chain and the pass drawing into it cannot disagree.
+    pub fn levelExtent(self: *const Image, level: u32) vk.Extent2D {
+        std.debug.assert(level < self.mip_levels);
+        return .{
+            .width = mipExtent(self.width, level),
+            .height = mipExtent(self.height, level),
+        };
     }
 
     // The barrier covers every mip level and every layer, because a partial

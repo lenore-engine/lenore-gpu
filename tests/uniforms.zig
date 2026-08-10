@@ -32,7 +32,7 @@ test "a light kind fills only the lanes it owns" {
 }
 
 test "the light record is laid out as the shader's array steps through it" {
-    // Measured against the compiler's reflection in `reflection.zig`; this is
+    // Measured against the compiler's reflection in `tests/shader_reflection.zig`; this is
     // the same statement without the shader, so a change to the record fails
     // here even when the shaders are not rebuilt.
     try testing.expectEqual(@as(usize, 64), @sizeOf(gpu.LightUniform));
@@ -134,4 +134,65 @@ test "a point above the eye lands below the centre of the framebuffer" {
     try testing.expectEqual(unflipped[0], flipped[0]);
     try testing.expectEqual(unflipped[2], flipped[2]);
     try testing.expectEqual(unflipped[3], flipped[3]);
+}
+
+test "the camera flip turns the ray basis over with the matrix" {
+    // One axis, two representations. A background reconstructing its ray from a
+    // basis that was not flipped draws the environment upside down behind a
+    // scene that was, and both halves are one call for that reason.
+    const camera: gpu.CameraUniform = .{
+        .view_projection = zm.perspectiveFovRh(std.math.pi / 4.0, 1.7778, 0.1, 100),
+        .position = .{ 1, 2, 3, 0 },
+        .ray_right = .{ 0.5, 0, 0, 0 },
+        .ray_up = .{ 0, 0.3, 0, 0 },
+        .ray_front = .{ 0, 0, -1, 0 },
+    };
+    const flipped = gpu.vulkanClipCamera(camera);
+
+    inline for (0..4) |row| {
+        inline for (0..4) |column| {
+            const expected = if (column == 1)
+                -camera.view_projection[row][column]
+            else
+                camera.view_projection[row][column];
+            try testing.expectEqual(expected, flipped.block.view_projection[row][column]);
+        }
+    }
+
+    inline for (0..3) |axis| try testing.expectEqual(-camera.ray_up[axis], flipped.block.ray_up[axis]);
+
+    // Nothing else is touched. Device x runs the same way on both sides, and
+    // the centre ray is on neither axis the flip names.
+    try testing.expectEqual(camera.ray_right, flipped.block.ray_right);
+    try testing.expectEqual(camera.ray_front, flipped.block.ray_front);
+    try testing.expectEqual(camera.position, flipped.block.position);
+}
+
+test "the ray a device coordinate names survives the flip" {
+    // The property the pair has to hold: a ray built from the flipped basis at
+    // a device coordinate lands on that same coordinate under the flipped
+    // matrix. Stated against both flipped values at once, because either one
+    // alone is consistent with itself.
+    const view = zm.lookToRh(zm.f32x4(0, 0, 0, 1), zm.f32x4(0, 0, -1, 0), zm.f32x4(0, 1, 0, 0));
+    const half_height = @tan(std.math.pi / 8.0);
+    const camera: gpu.CameraUniform = .{
+        .view_projection = zm.mul(view, zm.perspectiveFovRh(std.math.pi / 4.0, 1, 0.1, 100)),
+        .position = .{ 0, 0, 0, 0 },
+        .ray_right = .{ half_height, 0, 0, 0 },
+        .ray_up = .{ 0, half_height, 0, 0 },
+        .ray_front = .{ 0, 0, -1, 0 },
+    };
+    const flipped = gpu.vulkanClipCamera(camera);
+
+    const device: [2]f32 = .{ 0.4, -0.6 };
+    var point = zm.f32x4(0, 0, 0, 1);
+    inline for (0..3) |axis| {
+        point[axis] = flipped.block.ray_front[axis] +
+            flipped.block.ray_right[axis] * device[0] +
+            flipped.block.ray_up[axis] * device[1];
+    }
+
+    const clip = zm.mul(point, flipped.block.view_projection);
+    try testing.expectApproxEqAbs(device[0], clip[0] / clip[3], 1e-5);
+    try testing.expectApproxEqAbs(device[1], clip[1] / clip[3], 1e-5);
 }

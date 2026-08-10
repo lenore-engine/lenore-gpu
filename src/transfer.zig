@@ -146,15 +146,15 @@ pub const Transfer = struct {
         self.* = undefined;
     }
 
-    // DECIDE: this waits on the whole graphics queue, not on this submission.
-    // commands.submitOneShotAndWait ends in vkQueueWaitIdle, so a flush stalls
-    // every queue user rather than the one command buffer whose blocks are
-    // being reclaimed. While exactly one buffer is in flight the two are the
-    // same wait, and the cost only appears once a second submission exists,
-    // which is the transfer-worker layer. Closed by a fence per submission and
-    // a submission tag per block, and the measurement that says whether it is
-    // worth it is the load time of a corpus model against the flush count this
-    // type already records. Nothing here is blocked on it.
+    // This waits on the whole graphics queue and not on this submission:
+    // commands.submitOneShotAndWait ends in vkQueueWaitIdle. The two are the
+    // same wait whenever nothing else holds work on the queue, which is what a
+    // caller that uploads between frames rather than during them gets.
+    //
+    // Narrowing it means a fence per submission and a submission tag per block,
+    // so that a flush waits for the blocks it is reclaiming instead of for
+    // everything in flight. That bookkeeping earns its place only for a caller
+    // that uploads while frame work is still pending.
     fn submitAndWait(self: *Transfer) commands.SubmitError!void {
         std.debug.assert(self.state == .recording);
 
