@@ -3,6 +3,8 @@ const build_options = @import("build_options");
 const platform = @import("lenore-platform");
 const vk = @import("vulkan");
 
+const Loader = @import("loader.zig").Loader;
+
 const Allocator = std.mem.Allocator;
 const BaseWrapper = vk.BaseWrapper;
 const InstanceWrapper = vk.InstanceWrapper;
@@ -16,7 +18,10 @@ const required_device_extensions = [_][*:0]const u8{
     vk.extensions.khr_swapchain.name,
 };
 
-const SurfaceError = InstanceWrapper.CreateWaylandSurfaceKHRError;
+// Every window system the platform can hand back, because the union it returns
+// declares them all and this switch has to be exhaustive on any target.
+const SurfaceError = InstanceWrapper.CreateWaylandSurfaceKHRError ||
+    InstanceWrapper.CreateWin32SurfaceKHRError;
 const LayerQueryError = BaseWrapper.EnumerateInstanceLayerPropertiesAllocError;
 const DeviceQueryError = Allocator.Error ||
     InstanceWrapper.EnumeratePhysicalDevicesAllocError ||
@@ -27,10 +32,9 @@ const DeviceQueryError = Allocator.Error ||
 const DevicePickError = DeviceQueryError || error{NoSuitableDevice};
 
 pub const InitError = error{
-    MissingLoaderSymbol,
     MissingValidationLayer,
     NoSuitableDevice,
-} || std.DynLib.Error || Allocator.Error || BaseWrapper.CreateInstanceError ||
+} || Loader.Error || Allocator.Error || BaseWrapper.CreateInstanceError ||
     LayerQueryError || SurfaceError || DeviceQueryError ||
     InstanceWrapper.CreateDebugUtilsMessengerEXTError || InstanceWrapper.CreateDeviceError;
 
@@ -109,7 +113,7 @@ pub const Context = struct {
     pub const CommandBuffer = vk.CommandBufferProxy;
 
     allocator: Allocator,
-    loader: std.DynLib,
+    loader: Loader,
     base_wrapper: BaseWrapper,
     instance: Instance,
     debug_messenger: ?vk.DebugUtilsMessengerEXT,
@@ -132,13 +136,9 @@ pub const Context = struct {
         application_name: [:0]const u8,
         native_handles: platform.NativeHandles,
     ) InitError!Context {
-        var loader = try std.DynLib.open("libvulkan.so.1");
+        var loader = try Loader.open();
         errdefer loader.close();
-        const get_instance_proc_addr = loader.lookup(
-            vk.PfnGetInstanceProcAddr,
-            "vkGetInstanceProcAddr",
-        ) orelse return error.MissingLoaderSymbol;
-        const base_wrapper = BaseWrapper.load(get_instance_proc_addr);
+        const base_wrapper = BaseWrapper.load(try loader.getInstanceProcAddr());
 
         var extension_names: std.ArrayList([*:0]const u8) = .empty;
         defer extension_names.deinit(allocator);
@@ -294,6 +294,10 @@ fn appendSurfaceExtensions(
     try names.append(allocator, vk.extensions.khr_surface.name);
     switch (handles) {
         .wayland => try names.append(allocator, vk.extensions.khr_wayland_surface.name),
+        // The extra underscore is not a typo. vulkan-zig generates
+        // VK_KHR_win32_surface under this spelling; the string it carries is
+        // the registry's.
+        .win32 => try names.append(allocator, vk.extensions.khr_win_32_surface.name),
     }
 }
 
@@ -302,6 +306,10 @@ fn createSurface(instance: Instance, handles: platform.NativeHandles) SurfaceErr
         .wayland => |wayland| instance.createWaylandSurfaceKHR(&.{
             .display = @ptrCast(wayland.display),
             .surface = @ptrCast(wayland.surface),
+        }, null),
+        .win32 => |win32| instance.createWin32SurfaceKHR(&.{
+            .hinstance = @ptrCast(win32.hinstance),
+            .hwnd = @ptrCast(win32.hwnd),
         }, null),
     };
 }
