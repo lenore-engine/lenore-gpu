@@ -205,7 +205,7 @@ pub const Context = struct {
         const surface = try createSurface(instance, native_handles);
         errdefer instance.destroySurfaceKHR(surface, null);
 
-        const candidate = try pickIntegratedDevice(instance, allocator, surface);
+        const candidate = try pickDevice(instance, allocator, surface);
         const raw_device = try createDevice(instance, candidate);
         const loaded_device_wrapper = DeviceWrapper.load(
             raw_device,
@@ -326,7 +326,18 @@ fn hasInstanceLayer(
     return false;
 }
 
-fn pickIntegratedDevice(
+// The first device that passes inspectDevice, in preference order by type.
+//
+// Integrated leads because it is what the engine is tuned and measured for: a
+// part sharing one memory bus with the CPU, where the format and bandwidth
+// choices elsewhere in this module were timed. A discrete part runs the same
+// code correctly, those measurements simply do not describe it. Last come the
+// remaining types, which in practice means a software rasterizer, so that one
+// is taken only when nothing else answers.
+//
+// A device that cannot win is never inspected: the rank test precedes the
+// query, which is several allocations and a round of driver calls per device.
+fn pickDevice(
     instance: Instance,
     allocator: Allocator,
     surface: vk.SurfaceKHR,
@@ -334,13 +345,29 @@ fn pickIntegratedDevice(
     const physical_devices = try instance.enumeratePhysicalDevicesAlloc(allocator);
     defer allocator.free(physical_devices);
 
+    var best: ?DeviceCandidate = null;
+    var best_rank: u8 = std.math.maxInt(u8);
+
     for (physical_devices) |physical_device| {
         const properties = instance.getPhysicalDeviceProperties(physical_device);
-        if (properties.device_type != .integrated_gpu) continue;
-        if (try inspectDevice(instance, physical_device, properties, allocator, surface)) |candidate|
-            return candidate;
+        const rank: u8 = switch (properties.device_type) {
+            .integrated_gpu => 0,
+            .discrete_gpu => 1,
+            else => 2,
+        };
+        if (rank >= best_rank) continue;
+        const candidate = try inspectDevice(
+            instance,
+            physical_device,
+            properties,
+            allocator,
+            surface,
+        ) orelse continue;
+        if (rank == 0) return candidate;
+        best = candidate;
+        best_rank = rank;
     }
-    return error.NoSuitableDevice;
+    return best orelse error.NoSuitableDevice;
 }
 
 fn inspectDevice(
