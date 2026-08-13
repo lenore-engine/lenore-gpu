@@ -4,6 +4,7 @@ const platform = @import("lenore-platform");
 const vk = @import("vulkan");
 
 const Loader = @import("loader.zig").Loader;
+const timing = @import("timing.zig");
 
 const Allocator = std.mem.Allocator;
 const BaseWrapper = vk.BaseWrapper;
@@ -66,6 +67,12 @@ pub const QueueSupport = struct {
     graphics: bool,
     compute: bool,
     present: bool,
+    // How wide a timestamp written on this family is. Vulkan specification,
+    // VkQueueFamilyProperties: timestampValidBits is zero where timestamps are
+    // not supported at all, and between 36 and 64 where they are. Not part of
+    // choosing a family, and carried here because this is where the properties
+    // are read.
+    timestamp_valid_bits: u32 = 0,
 };
 
 // Which families a device is taken with, or null when it offers no usable pair.
@@ -98,6 +105,11 @@ pub fn chooseQueues(families: []const QueueSupport) ?QueueAllocation {
 
 const DeviceExtensions = struct {
     memory_budget: bool,
+    // VK_KHR_pipeline_executable_properties. Named for what it delivers rather
+    // than for the extension: what comes back is per-shader register counts and
+    // code size. `pipeline_statistics` below is the unrelated core feature that
+    // counts primitives and invocations through a query pool.
+    shader_statistics: bool,
 };
 
 const DeviceCandidate = struct {
@@ -105,6 +117,8 @@ const DeviceCandidate = struct {
     properties: vk.PhysicalDeviceProperties,
     extensions: DeviceExtensions,
     queues: QueueAllocation,
+    // Of the graphics family, which is the only one anything is recorded on.
+    timestamp_valid_bits: u32,
     pipeline_statistics: bool,
     max_buffer_size: vk.DeviceSize,
 };
@@ -128,6 +142,23 @@ pub const Context = struct {
     present_queue: Queue,
     pipeline_statistics_enabled: bool,
     memory_budget_enabled: bool,
+    // Whether a pipeline can be asked what the driver compiled it into. The
+    // answer is only available for a pipeline created with the capture flag,
+    // which is what `pipeline.Config.capture_statistics` asks for, so this
+    // says the query exists and not that any pipeline carries an answer.
+    shader_statistics_enabled: bool,
+    // What a timestamp written on the graphics queue is worth, as the device
+    // reports it. Zero is a queue that cannot carry one.
+    timestamp_valid_bits: u32,
+
+    // Nanoseconds per timestamp tick, and what a device pass duration is scaled
+    // by. Vulkan specification, VkPhysicalDeviceLimits::timestampPeriod.
+    pub fn timestampSupport(self: *const Context) timing.Support {
+        return .{
+            .valid_bits = self.timestamp_valid_bits,
+            .period_ns = self.properties.limits.timestamp_period,
+        };
+    }
 
     // Initialization may return the Context by value: every proxy references a
     // separately allocated wrapper, and no callback retains the Context address.
@@ -205,7 +236,7 @@ pub const Context = struct {
         const surface = try createSurface(instance, native_handles);
         errdefer instance.destroySurfaceKHR(surface, null);
 
-        const candidate = try pickDevice(instance, allocator, surface);
+        const candidate = try pickIntegratedDevice(instance, allocator, surface);
         const raw_device = try createDevice(instance, candidate);
         const loaded_device_wrapper = DeviceWrapper.load(
             raw_device,
@@ -239,6 +270,8 @@ pub const Context = struct {
             .present_queue = .init(device, candidate.queues.present_family),
             .pipeline_statistics_enabled = candidate.pipeline_statistics,
             .memory_budget_enabled = candidate.extensions.memory_budget,
+            .shader_statistics_enabled = candidate.extensions.shader_statistics,
+            .timestamp_valid_bits = candidate.timestamp_valid_bits,
         };
     }
 
@@ -326,18 +359,7 @@ fn hasInstanceLayer(
     return false;
 }
 
-// The first device that passes inspectDevice, in preference order by type.
-//
-// Integrated leads because it is what the engine is tuned and measured for: a
-// part sharing one memory bus with the CPU, where the format and bandwidth
-// choices elsewhere in this module were timed. A discrete part runs the same
-// code correctly, those measurements simply do not describe it. Last come the
-// remaining types, which in practice means a software rasterizer, so that one
-// is taken only when nothing else answers.
-//
-// A device that cannot win is never inspected: the rank test precedes the
-// query, which is several allocations and a round of driver calls per device.
-fn pickDevice(
+fn pickIntegratedDevice(
     instance: Instance,
     allocator: Allocator,
     surface: vk.SurfaceKHR,
@@ -345,29 +367,13 @@ fn pickDevice(
     const physical_devices = try instance.enumeratePhysicalDevicesAlloc(allocator);
     defer allocator.free(physical_devices);
 
-    var best: ?DeviceCandidate = null;
-    var best_rank: u8 = std.math.maxInt(u8);
-
     for (physical_devices) |physical_device| {
         const properties = instance.getPhysicalDeviceProperties(physical_device);
-        const rank: u8 = switch (properties.device_type) {
-            .integrated_gpu => 0,
-            .discrete_gpu => 1,
-            else => 2,
-        };
-        if (rank >= best_rank) continue;
-        const candidate = try inspectDevice(
-            instance,
-            physical_device,
-            properties,
-            allocator,
-            surface,
-        ) orelse continue;
-        if (rank == 0) return candidate;
-        best = candidate;
-        best_rank = rank;
+        if (properties.device_type != .integrated_gpu) continue;
+        if (try inspectDevice(instance, physical_device, properties, allocator, surface)) |candidate|
+            return candidate;
     }
-    return best orelse error.NoSuitableDevice;
+    return error.NoSuitableDevice;
 }
 
 fn inspectDevice(
@@ -390,7 +396,8 @@ fn inspectDevice(
     return .{
         .physical_device = physical_device,
         .properties = properties,
-        .queues = queues,
+        .queues = queues.allocation,
+        .timestamp_valid_bits = queues.timestamp_valid_bits,
         .extensions = extensions,
         .pipeline_statistics = pipeline_statistics,
         .max_buffer_size = queryMaxBufferSize(instance, physical_device),
@@ -402,7 +409,7 @@ fn allocateQueues(
     physical_device: vk.PhysicalDevice,
     allocator: Allocator,
     surface: vk.SurfaceKHR,
-) (Allocator.Error || InstanceWrapper.GetPhysicalDeviceSurfaceSupportKHRError)!?QueueAllocation {
+) (Allocator.Error || InstanceWrapper.GetPhysicalDeviceSurfaceSupportKHRError)!?ChosenQueues {
     const families = try instance.getPhysicalDeviceQueueFamilyPropertiesAlloc(physical_device, allocator);
     defer allocator.free(families);
 
@@ -418,10 +425,24 @@ fn allocateQueues(
                 @intCast(index),
                 surface,
             ) == .true,
+            .timestamp_valid_bits = properties.timestamp_valid_bits,
         };
     }
-    return chooseQueues(support);
+    const allocation = chooseQueues(support) orelse return null;
+    return .{
+        .allocation = allocation,
+        // Of the family everything is recorded on. Read here rather than
+        // re-enumerated later: the properties are in hand exactly once.
+        .timestamp_valid_bits = support[allocation.graphics_family].timestamp_valid_bits,
+    };
 }
+
+// The families chosen, together with what a timestamp on the graphics one is
+// worth. Two answers from one enumeration of the same properties.
+const ChosenQueues = struct {
+    allocation: QueueAllocation,
+    timestamp_valid_bits: u32,
+};
 
 fn supportsSurface(
     instance: Instance,
@@ -455,6 +476,10 @@ fn inspectDeviceExtensions(
         .memory_budget = hasDeviceExtension(
             available,
             vk.extensions.ext_memory_budget.name,
+        ),
+        .shader_statistics = hasDeviceExtension(
+            available,
+            vk.extensions.khr_pipeline_executable_properties.name,
         ),
     };
 }
@@ -574,12 +599,31 @@ fn createDevice(instance: Instance, candidate: DeviceCandidate) InstanceWrapper.
     var extension_names = [_][*:0]const u8{
         vk.extensions.khr_swapchain.name,
         undefined,
+        undefined,
     };
     var extension_count: u32 = required_device_extensions.len;
     if (candidate.extensions.memory_budget) {
         extension_names[extension_count] = vk.extensions.ext_memory_budget.name;
         extension_count += 1;
     }
+    if (candidate.extensions.shader_statistics) {
+        extension_names[extension_count] =
+            vk.extensions.khr_pipeline_executable_properties.name;
+        extension_count += 1;
+    }
+
+    // Appended to the tail of the chain rather than to its head: the head is
+    // where the 1.1 and 1.3 feature structures already are, and taking their
+    // place would ask for neither.
+    //
+    // Chained only when the extension is enabled beside it. A feature structure
+    // for an extension the device was not given is not a request the driver has
+    // to understand.
+    var executable_properties = vk.PhysicalDevicePipelineExecutablePropertiesFeaturesKHR{
+        .pipeline_executable_info = .true,
+    };
+    if (candidate.extensions.shader_statistics)
+        vulkan_13.p_next = @ptrCast(&executable_properties);
 
     return instance.createDevice(candidate.physical_device, &.{
         .p_next = @ptrCast(&features),

@@ -40,9 +40,9 @@ const TextureCache = texture_cache.TextureCache;
 // is where the two lists are joined into one layout. Splitting them this way
 // keeps each list next to the code that writes it.
 pub const bindings = [_]descriptors.Binding{
-    .{ .slot = 1, .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
-    .{ .slot = 2, .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
-    .{ .slot = 3, .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
+    .{ .slot = 1, .name = "lambertian", .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
+    .{ .slot = 2, .name = "ggx", .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
+    .{ .slot = 3, .name = "brdf_lut", .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
 };
 
 const lambertian_slot = bindings[0].slot;

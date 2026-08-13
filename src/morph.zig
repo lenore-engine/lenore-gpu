@@ -1,12 +1,14 @@
 const std = @import("std");
 const vk = @import("vulkan");
 const buffer_module = @import("buffer.zig");
+const commands = @import("commands.zig");
 const Context = @import("context.zig").Context;
 const descriptors = @import("descriptors.zig");
 const memory = @import("memory/allocator.zig");
 const mesh_module = @import("mesh/resource.zig");
 const per_frame = @import("per_frame.zig");
 const pipeline = @import("pipeline.zig");
+const retirement = @import("retirement.zig");
 const vertex_module = @import("mesh/vertex.zig");
 
 const Allocator = std.mem.Allocator;
@@ -45,15 +47,15 @@ pub const group_size: u32 = 64;
 
 pub const bindings = [_]descriptors.Binding{
     // The mesh's own packed vertices, read and not written.
-    .{ .slot = 0, .kind = .storage_buffer, .stages = .{ .compute_bit = true } },
+    .{ .slot = 0, .name = "vertices", .kind = .storage_buffer, .stages = .{ .compute_bit = true } },
     // Its displacements, one element per (vertex, target) pair.
-    .{ .slot = 1, .kind = .storage_buffer, .stages = .{ .compute_bit = true } },
+    .{ .slot = 1, .name = "deltas", .kind = .storage_buffer, .stages = .{ .compute_bit = true } },
     // The frame's weights. Dynamic, because it is one ring over every frame in
     // flight and the slot is chosen at bind time, exactly as the joint array is.
-    .{ .slot = 2, .kind = .storage_buffer_dynamic, .stages = .{ .compute_bit = true } },
+    .{ .slot = 2, .name = "weights", .kind = .storage_buffer_dynamic, .stages = .{ .compute_bit = true } },
     // The destination. Not dynamic: it is per mesh and device-local rather than
     // a host-visible ring, so the frame it writes is a push constant instead.
-    .{ .slot = 3, .kind = .storage_buffer, .stages = .{ .compute_bit = true } },
+    .{ .slot = 3, .name = "destination", .kind = .storage_buffer, .stages = .{ .compute_bit = true } },
 };
 
 const Sets = descriptors.Sets(&bindings);
@@ -233,6 +235,9 @@ pub const MorphPass = struct {
     // The running total that lays the weights out. Registration is the only
     // thing that moves it, so no separate planning pass exists.
     weights_used: usize,
+    // Borrowed. Destinations outlive a reset by a ring's depth, and the ring
+    // belongs to whoever drives the frame loop.
+    retirement: *retirement.ResourceRetirement,
 
     pub fn init(
         context: *const Context,
@@ -241,6 +246,7 @@ pub const MorphPass = struct {
         frames: usize,
         capacity: Capacity,
         shader: Shader,
+        resource_retirement: *retirement.ResourceRetirement,
     ) InitError!MorphPass {
         var sets = try Sets.init(context, allocator, capacity.meshes);
         errdefer sets.deinit(context, allocator);
@@ -287,6 +293,7 @@ pub const MorphPass = struct {
             .weights = weights,
             .entries = entries,
             .weights_used = 0,
+            .retirement = resource_retirement,
         };
     }
 
@@ -340,27 +347,16 @@ pub const MorphPass = struct {
 
         // Written before the entry is appended, so a failure above leaves the
         // set pointing at nothing rather than a registration nothing dispatches.
-        // The infos are named because the write holds a pointer to each.
-        const infos = [_]vk.DescriptorBufferInfo{
-            .{ .buffer = mesh.vertex_buffer.handle, .offset = 0, .range = vk.WHOLE_SIZE },
-            .{ .buffer = deltas.handle, .offset = 0, .range = vk.WHOLE_SIZE },
-            self.weights.descriptor(),
-            .{ .buffer = destination.handle, .offset = 0, .range = vk.WHOLE_SIZE },
-        };
-        var writes: [bindings.len]vk.WriteDescriptorSet = undefined;
-        for (bindings, &infos, &writes) |binding, *info, *write| {
-            write.* = .{
-                .dst_set = self.sets.set(index),
-                .dst_binding = binding.slot,
-                .dst_array_element = 0,
-                .descriptor_count = 1,
-                .descriptor_type = binding.kind,
-                .p_image_info = &no_images,
-                .p_buffer_info = @ptrCast(info),
-                .p_texel_buffer_view = &no_texel_buffers,
-            };
-        }
-        self.context.device.updateDescriptorSets(&writes, null);
+        //
+        // The weights are the one binding that is not a whole buffer: the ring
+        // covers a single frame's payload and the slot is chosen by the dynamic
+        // offset at bind time, which is what `source` states.
+        self.sets.writeBuffers(self.context, index, .{
+            .vertices = &mesh.vertex_buffer,
+            .deltas = &deltas,
+            .weights = self.weights.source(),
+            .destination = &destination,
+        });
 
         self.entries.appendAssumeCapacity(.{
             .source = mesh.vertex_buffer.handle,
@@ -397,8 +393,14 @@ pub const MorphPass = struct {
     // `init` and `register` appends assuming it, so releasing it here would
     // turn the next registration into an allocation that cannot fail into one
     // that can.
+    //
+    // The destinations are retired rather than destroyed. This is reached when a
+    // level is unloaded, which need not be a moment at which the device is idle,
+    // and a destination is read by the vertex fetch of any frame still in
+    // flight.
     pub fn reset(self: *MorphPass) void {
-        for (self.entries.items) |*entry| entry.destination.deinit();
+        for (self.entries.items) |*entry|
+            retirement.retireOrDestroy(self.retirement, self.allocator, .{ .buffer = entry.destination });
         self.entries.clearRetainingCapacity();
         self.weights_used = 0;
     }
@@ -475,11 +477,7 @@ pub const MorphPass = struct {
             device.cmdDispatch(command_buffer, entry.groups, 1, 1);
         }
 
-        const barriers = [_]vk.MemoryBarrier2{barrier()};
-        device.cmdPipelineBarrier2(command_buffer, &.{
-            .memory_barrier_count = barriers.len,
-            .p_memory_barriers = &barriers,
-        });
+        commands.recordMemoryBarrier(self.context, command_buffer, dependency());
     }
 
     // The layout a compute pipeline for this pass is built from, exposed for the
@@ -501,16 +499,11 @@ pub const MorphPass = struct {
 // destination scope is the vertex input stage. Naming `vertex_shader_bit`
 // instead is the mistake this function exists to make once: the fetch happens
 // before the shader runs, and the barrier would order nothing.
-pub fn barrier() vk.MemoryBarrier2 {
+pub fn dependency() commands.Dependency {
     return .{
-        .src_stage_mask = .{ .compute_shader_bit = true },
-        .src_access_mask = .{ .shader_storage_write_bit = true },
-        .dst_stage_mask = .{ .vertex_attribute_input_bit = true },
-        .dst_access_mask = .{ .vertex_attribute_read_bit = true },
+        .src_stage = .{ .compute_shader_bit = true },
+        .src_access = .{ .shader_storage_write_bit = true },
+        .dst_stage = .{ .vertex_attribute_input_bit = true },
+        .dst_access = .{ .vertex_attribute_read_bit = true },
     };
 }
-
-// Vulkan specification, VkWriteDescriptorSet: the members not selected by
-// descriptorType are ignored, but the pointers are not optional.
-const no_images = [_]vk.DescriptorImageInfo{};
-const no_texel_buffers = [_]vk.BufferView{};

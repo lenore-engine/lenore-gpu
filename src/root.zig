@@ -3,6 +3,7 @@ const buffer = @import("buffer.zig");
 const commands = @import("commands.zig");
 const context = @import("context.zig");
 const descriptors = @import("descriptors.zig");
+const effect = @import("effect.zig");
 const frame = @import("frame.zig");
 const frame_set = @import("frame_set.zig");
 const image = @import("image.zig");
@@ -14,10 +15,12 @@ const morph = @import("morph.zig");
 const vertex = @import("mesh/vertex.zig");
 const pass = @import("pass.zig");
 const pipeline = @import("pipeline.zig");
+const timing = @import("timing.zig");
 const per_frame = @import("per_frame.zig");
 const post = @import("post.zig");
 const pool = @import("pool.zig");
 const ref_cache = @import("ref_cache.zig");
+const retirement = @import("retirement.zig");
 const sampler = @import("sampler.zig");
 const renderer = @import("renderer.zig");
 const resource_storage = @import("resource_storage.zig");
@@ -73,6 +76,7 @@ pub const Ktx2File = ktx2.File;
 pub const Ktx2Kind = ktx2.Kind;
 pub const Ktx2Level = ktx2.Level;
 pub const parseKtx2 = ktx2.parse;
+pub const ktx2CubeFaces = ktx2.cube_faces;
 pub const isKtx2 = ktx2.isKtx2;
 
 pub const MaterialData = material_storage.MaterialData;
@@ -94,7 +98,7 @@ pub const MorphPass = morph.MorphPass;
 pub const MorphCapacity = morph.Capacity;
 pub const MorphPushConstants = morph.PushConstants;
 pub const morph_bindings = morph.bindings;
-pub const morphBarrier = morph.barrier;
+pub const morphDependency = morph.dependency;
 pub const morphGroupSize = morph.group_size;
 pub const morphGroupsFor = morph.groupsFor;
 pub const morphDestinationElements = morph.destinationElements;
@@ -225,6 +229,8 @@ pub const attachmentFirstSupported = attachment.firstSupported;
 
 pub const DescriptorBinding = descriptors.Binding;
 pub const DescriptorSets = descriptors.Sets;
+pub const DescriptorBufferSource = descriptors.BufferSource;
+pub const DescriptorImageSource = descriptors.ImageSource;
 
 // The bindings this module was generated against.
 //
@@ -245,7 +251,12 @@ pub const MainPassOptions = pass.Options;
 pub const mainPassSampledLayout = pass.sampled_layout;
 
 pub const Pipeline = pipeline;
+pub const ShaderEffect = effect.ShaderEffect;
+pub const ShaderEffectSpec = effect.Spec;
+pub const ShaderEffectStage = effect.Stage;
+pub const ShaderEffectGraphics = effect.Graphics;
 pub const PipelineConfig = pipeline.Config;
+pub const PipelineLayoutConfig = pipeline.LayoutConfig;
 pub const PipelineMode = pipeline.Mode;
 pub const PipelineFormats = pipeline.Formats;
 pub const PipelineStages = pipeline.Stages;
@@ -254,6 +265,19 @@ pub const pipelineVertexInput = pipeline.vertexInput;
 pub const pipelineModeFor = pipeline.modeFor;
 pub const pipelineDepthStencilState = pipeline.depthStencilState;
 pub const pipelineBlendAttachment = pipeline.blendAttachment;
+pub const captureShaderStatistics = pipeline.capture_statistics;
+pub const PipelineStatisticsError = pipeline.StatisticsError;
+pub const pipelineExecutables = pipeline.executables;
+pub const pipelineStatistics = pipeline.statistics;
+pub const pipelineDescribedName = pipeline.describedName;
+
+pub const GpuTimer = timing.GpuTimer;
+pub const GpuTimerSupport = timing.Support;
+pub const GpuTimings = timing.Frame;
+pub const GpuPass = timing.Pass;
+pub const GpuTimestampEdge = timing.Edge;
+pub const gpuTimestampSlot = timing.slot;
+pub const gpuDurationNs = timing.durationNs;
 
 pub const PerFrame = per_frame.PerFrame;
 pub const perFrameLayout = per_frame.layout;
@@ -278,6 +302,15 @@ pub const RefCache = ref_cache.RefCache;
 pub const RefCacheInsertError = ref_cache.InsertError;
 pub const RefCacheDeinitStatus = ref_cache.DeinitStatus;
 
+pub const Retirement = retirement.Retirement;
+pub const RetirementInitError = retirement.InitError;
+pub const RetiredResource = retirement.Resource;
+pub const ResourceRetirement = retirement.ResourceRetirement;
+pub const retireOrDestroy = retirement.retireOrDestroy;
+
 pub const OneShotPool = commands.OneShotPool;
 pub const beginOneShot = commands.beginOneShot;
 pub const submitOneShotAndWait = commands.submitOneShotAndWait;
+pub const Dependency = commands.Dependency;
+pub const memoryBarrier = commands.memoryBarrier;
+pub const recordMemoryBarrier = commands.recordMemoryBarrier;

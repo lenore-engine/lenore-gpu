@@ -36,7 +36,7 @@ const AlphaMode = res.MaterialInfo.Rendering.AlphaMode;
 // the image is never both an attachment and a bound descriptor, rather than
 // relying on a shader not to declare what it must not read.
 pub const bindings = [_]descriptors.Binding{
-    .{ .slot = 0, .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
+    .{ .slot = 0, .name = "sun_map", .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
 };
 
 pub const Sets = descriptors.Sets(&bindings);

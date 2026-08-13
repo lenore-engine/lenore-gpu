@@ -1,9 +1,11 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const vk = @import("vulkan");
 const res = @import("lenore-resources");
 const Context = @import("context.zig").Context;
 const vertex = @import("mesh/vertex.zig");
 
+const Allocator = std.mem.Allocator;
 const VertexStreams = res.VertexStreams;
 const AlphaMode = res.MaterialInfo.Rendering.AlphaMode;
 
@@ -127,6 +129,18 @@ pub const Config = struct {
     // one it is later tested against.
     depth_bias: ?DepthBias = null,
 };
+
+// Whether the driver is asked to keep what it compiled a pipeline into, so
+// `statistics` can be asked for it afterwards.
+//
+// One answer for the whole build rather than a field on every configuration:
+// which pipelines an instrument reads is not a property of any one of them, and
+// a per-pipeline flag would let a build capture some and then be asked about the
+// rest. Vulkan specification, VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR: the
+// statistics exist only for a pipeline created with the flag, and setting it may
+// cost pipeline creation time, so a build asks for it with `-Dshader-stats` when
+// someone is going to read the answer.
+pub const capture_statistics = build_options.capture_shader_statistics;
 
 // The whole set of streams: base, skin, colour and second UV, contributing four
 // attributes, two, one and one.
@@ -299,14 +313,22 @@ pub fn rasterizationState(
 }
 
 const fixed_dynamic_states = [_]vk.DynamicState{ .viewport, .scissor };
-const cull_dynamic_states = fixed_dynamic_states ++ [_]vk.DynamicState{.cull_mode};
+// The winding travels with the culled side. A draw whose transform mirrors it
+// needs the opposite front face whether or not it culls anything, because the
+// fragment stage learns which side it is shading from the same state, so a
+// pipeline that can vary one varies both. Both commands are required by
+// `VK_GRAPHICS_VERSION_1_3` in vk.xml, so neither asks for anything this device
+// was not already built with.
+const facing_dynamic_states = fixed_dynamic_states ++
+    [_]vk.DynamicState{ .cull_mode, .front_face };
 
-// A fixed pipeline ignores cull mode left by an earlier dynamic draw. A dynamic
-// one must receive `vkCmdSetCullMode` before each draw whose mode can differ.
+// A fixed pipeline ignores the cull mode and winding left by an earlier dynamic
+// draw. A dynamic one must receive `vkCmdSetCullMode` and `vkCmdSetFrontFace`
+// before each draw whose state can differ.
 pub fn dynamicStates(culling: Culling) []const vk.DynamicState {
     return switch (culling) {
         .fixed => &fixed_dynamic_states,
-        .dynamic => &cull_dynamic_states,
+        .dynamic => &facing_dynamic_states,
     };
 }
 
@@ -398,6 +420,7 @@ pub fn create(context: *const Context, config: Config) CreateError!vk.Pipeline {
     var pipeline: vk.Pipeline = undefined;
     _ = try context.device.createGraphicsPipelines(.null_handle, &.{.{
         .p_next = @ptrCast(&rendering),
+        .flags = .{ .capture_statistics_bit_khr = capture_statistics },
         .stage_count = stage_count,
         .p_stages = &stages,
         .p_vertex_input_state = &vertex_input_state,
@@ -436,6 +459,7 @@ pub const ComputeConfig = struct {
 pub fn createCompute(context: *const Context, config: ComputeConfig) CreateError!vk.Pipeline {
     var pipeline: vk.Pipeline = undefined;
     _ = try context.device.createComputePipelines(.null_handle, &.{.{
+        .flags = .{ .capture_statistics_bit_khr = capture_statistics },
         .stage = .{
             .stage = .{ .compute_bit = true },
             .module = config.stage.module,
@@ -447,4 +471,75 @@ pub fn createCompute(context: *const Context, config: ComputeConfig) CreateError
     }}, null, (&pipeline)[0..1]);
 
     return pipeline;
+}
+
+// What the driver compiled a pipeline into, as VK_KHR_pipeline_executable_properties
+// reports it. One pipeline may hold several executables: a graphics pipeline on
+// this class of device usually has one per stage, and a driver is free to merge
+// or split them, so the count is asked for rather than assumed.
+//
+// Only a pipeline created with `Config.capture_statistics` has any of this, and
+// only a device with the extension can be asked at all. Both are the caller's to
+// establish; `Context.shader_statistics_enabled` answers the second.
+pub const StatisticsError = vk.DeviceWrapper.GetPipelineExecutablePropertiesKHRError ||
+    vk.DeviceWrapper.GetPipelineExecutableStatisticsKHRError ||
+    Allocator.Error;
+
+// A name or description as the specification declares it: a fixed array padded
+// with zeroes rather than a slice. Trimmed at the first zero, and whole when
+// there is none.
+pub fn describedName(field: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, field, 0) orelse field.len;
+    return field[0..end];
+}
+
+// The executables of one pipeline. The caller owns the slice.
+pub fn executables(
+    context: *const Context,
+    allocator: Allocator,
+    handle: vk.Pipeline,
+) StatisticsError![]vk.PipelineExecutablePropertiesKHR {
+    const info = vk.PipelineInfoKHR{ .pipeline = handle };
+    var count: u32 = 0;
+    _ = try context.device.getPipelineExecutablePropertiesKHR(&info, &count, null);
+    const result = try allocator.alloc(vk.PipelineExecutablePropertiesKHR, count);
+    errdefer allocator.free(result);
+    // Every entry is written by the driver, and the struct carries a type tag
+    // the caller never sets. Cleared rather than left undefined so that a driver
+    // writing fewer entries than it counted leaves zeroes and not stack noise.
+    @memset(result, .{
+        .stages = .{},
+        .name = @splat(0),
+        .description = @splat(0),
+        .subgroup_size = 0,
+    });
+    _ = try context.device.getPipelineExecutablePropertiesKHR(&info, &count, result.ptr);
+    return result[0..count];
+}
+
+// One executable's statistics: on this driver the register counts and the size
+// of the compiled code. What is reported is the driver's choice, so nothing here
+// names an individual statistic.
+pub fn statistics(
+    context: *const Context,
+    allocator: Allocator,
+    handle: vk.Pipeline,
+    executable_index: u32,
+) StatisticsError![]vk.PipelineExecutableStatisticKHR {
+    const info = vk.PipelineExecutableInfoKHR{
+        .pipeline = handle,
+        .executable_index = executable_index,
+    };
+    var count: u32 = 0;
+    _ = try context.device.getPipelineExecutableStatisticsKHR(&info, &count, null);
+    const result = try allocator.alloc(vk.PipelineExecutableStatisticKHR, count);
+    errdefer allocator.free(result);
+    @memset(result, .{
+        .name = @splat(0),
+        .description = @splat(0),
+        .format = .uint64_khr,
+        .value = .{ .u_64 = 0 },
+    });
+    _ = try context.device.getPipelineExecutableStatisticsKHR(&info, &count, result.ptr);
+    return result[0..count];
 }

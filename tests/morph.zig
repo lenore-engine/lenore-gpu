@@ -47,18 +47,18 @@ test "a destination too large for its own index is refused" {
 }
 
 test "the prepass barrier releases to the vertex fetch, not to a shader" {
-    const released = gpu.morphBarrier();
+    const released = gpu.morphDependency();
 
-    try testing.expect(released.src_stage_mask.compute_shader_bit);
-    try testing.expect(released.src_access_mask.shader_storage_write_bit);
+    try testing.expect(released.src_stage.compute_shader_bit);
+    try testing.expect(released.src_access.shader_storage_write_bit);
 
     // The destination is read by the vertex input stage, which runs before the
     // vertex shader. Naming `vertex_shader_bit` here orders nothing that reads
     // this buffer, and no layer reports it: the barrier is legal and the fetch
     // is simply unsynchronised.
-    try testing.expect(released.dst_stage_mask.vertex_attribute_input_bit);
-    try testing.expect(!released.dst_stage_mask.vertex_shader_bit);
-    try testing.expect(released.dst_access_mask.vertex_attribute_read_bit);
+    try testing.expect(released.dst_stage.vertex_attribute_input_bit);
+    try testing.expect(!released.dst_stage.vertex_shader_bit);
+    try testing.expect(released.dst_access.vertex_attribute_read_bit);
 }
 
 test "exactly one binding of the prepass set is dynamic" {
@@ -159,6 +159,7 @@ test "a batch with no prepass output fetches the mesh's own vertices" {
         .mesh = &mesh,
         .material_index = 0,
         .cull_mode = .{},
+        .front_face = .counter_clockwise,
         .first_instance = 0,
         .instance_count = 1,
     });
@@ -169,6 +170,7 @@ test "a batch with no prepass output fetches the mesh's own vertices" {
         .mesh = &mesh,
         .material_index = 0,
         .cull_mode = .{},
+        .front_face = .counter_clockwise,
         .first_instance = 0,
         .instance_count = 1,
         .vertex_source = .{ .handle = @enumFromInt(0xbeef), .offset = 48 },

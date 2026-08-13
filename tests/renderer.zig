@@ -118,6 +118,7 @@ fn batch(material_index: u32) gpu.RecordBatch {
         .mesh = &unread_mesh,
         .material_index = material_index,
         .cull_mode = .{ .back_bit = true },
+        .front_face = .counter_clockwise,
         .first_instance = 0,
         .instance_count = 1,
     };
@@ -355,38 +356,42 @@ test "a mesh draws through the pipeline its own streams call for" {
     // second-UV pipeline is the only one declaring binding 3, so missing it
     // leaves a slot on set 1 sampling zeros.
     try testing.expectEqual(
-        gpu.SceneVariant{ .skinned = false, .uv1 = false },
+        gpu.SceneVariant{ .skinned = false, .uv1 = false, .colour = false },
         gpu.sceneVariantFor(.{}),
     );
     try testing.expectEqual(
-        gpu.SceneVariant{ .skinned = true, .uv1 = false },
+        gpu.SceneVariant{ .skinned = true, .uv1 = false, .colour = false },
         gpu.sceneVariantFor(.{ .skinned = true }),
     );
     try testing.expectEqual(
-        gpu.SceneVariant{ .skinned = false, .uv1 = true },
+        gpu.SceneVariant{ .skinned = false, .uv1 = true, .colour = false },
         gpu.sceneVariantFor(.{ .uv1 = true }),
     );
     try testing.expectEqual(
-        gpu.SceneVariant{ .skinned = true, .uv1 = true },
+        gpu.SceneVariant{ .skinned = true, .uv1 = true, .colour = false },
         gpu.sceneVariantFor(.{ .skinned = true, .uv1 = true }),
     );
 }
 
-test "the colour stream does not select a variant of its own" {
-    // Colour is carried by a mesh and bound by `Mesh.bind`, and no entry point
-    // reads it. A mesh with it draws through the same pipeline as one without.
-    try testing.expectEqual(
+test "every stream is an axis of the variant, and none masks another" {
+    // Section 3.9.2 puts COLOR_0 in the base-colour product, so it selects an
+    // entry point of its own rather than being carried and ignored: a mesh with
+    // the stream draws through a different pipeline from one without.
+    try testing.expect(!std.meta.eql(
         gpu.sceneVariantFor(.{}),
         gpu.sceneVariantFor(.{ .colour = true }),
-    );
+    ));
 
-    // And it must mask neither axis: every combination projects to exactly the
-    // two streams that have a shader path.
     for (0..8) |bits| {
         const streams: res.VertexStreams = @bitCast(@as(u3, @intCast(bits)));
         const variant = gpu.sceneVariantFor(streams);
         try testing.expectEqual(streams.skinned, variant.skinned);
         try testing.expectEqual(streams.uv1, variant.uv1);
+        try testing.expectEqual(streams.colour, variant.colour);
+        // The vertex input a pipeline of this variant declares is the mesh's
+        // own set of streams, which is what keeps `Mesh.bind` and the pipeline
+        // naming the same bindings.
+        try testing.expectEqual(streams, variant.streams());
     }
 }
 
@@ -417,10 +422,14 @@ test "every variant and mode lands on its own slot in the pipeline table" {
     // past the end writes off the array.
     var filled: [gpu.scene_pipeline_count]bool = @splat(false);
     for ([_]gpu.SceneVariant{
-        .{ .skinned = false, .uv1 = false },
-        .{ .skinned = false, .uv1 = true },
-        .{ .skinned = true, .uv1 = false },
-        .{ .skinned = true, .uv1 = true },
+        .{ .skinned = false, .uv1 = false, .colour = false },
+        .{ .skinned = false, .uv1 = false, .colour = true },
+        .{ .skinned = false, .uv1 = true, .colour = false },
+        .{ .skinned = false, .uv1 = true, .colour = true },
+        .{ .skinned = true, .uv1 = false, .colour = false },
+        .{ .skinned = true, .uv1 = false, .colour = true },
+        .{ .skinned = true, .uv1 = true, .colour = false },
+        .{ .skinned = true, .uv1 = true, .colour = true },
     }) |variant| {
         for (gpu.scene_modes) |mode| {
             const index = gpu.scenePipelineIndex(variant, mode);
@@ -466,10 +475,14 @@ test "a variant's vertex slot is the one its pipeline is built into" {
     // entry read out of one order and a pipeline written into another is every
     // draw transformed by the wrong variant with nothing reporting it.
     for ([_]gpu.SceneVariant{
-        .{ .skinned = false, .uv1 = false },
-        .{ .skinned = false, .uv1 = true },
-        .{ .skinned = true, .uv1 = false },
-        .{ .skinned = true, .uv1 = true },
+        .{ .skinned = false, .uv1 = false, .colour = false },
+        .{ .skinned = false, .uv1 = false, .colour = true },
+        .{ .skinned = false, .uv1 = true, .colour = false },
+        .{ .skinned = false, .uv1 = true, .colour = true },
+        .{ .skinned = true, .uv1 = false, .colour = false },
+        .{ .skinned = true, .uv1 = false, .colour = true },
+        .{ .skinned = true, .uv1 = true, .colour = false },
+        .{ .skinned = true, .uv1 = true, .colour = true },
     }) |variant| {
         for (gpu.scene_modes, 0..) |mode, offset| {
             try testing.expectEqual(

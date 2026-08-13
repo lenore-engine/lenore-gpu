@@ -5,6 +5,16 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const build_options = b.addOptions();
     build_options.addOption(bool, "enable_validation", optimize == .Debug);
+    // Off unless asked for. Vulkan specification,
+    // VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR: what the driver compiled a
+    // pipeline into is kept only for a pipeline created with the flag, and
+    // setting it may cost pipeline creation time. It is an instrument, so a
+    // build asks for it when someone is going to read the answer.
+    build_options.addOption(bool, "capture_shader_statistics", b.option(
+        bool,
+        "shader-stats",
+        "Create pipelines so their compiled statistics can be read back",
+    ) orelse false);
 
     const platform = b.dependency("lenore_platform", .{ .target = target, .optimize = optimize });
     const resource = b.dependency("lenore_resources", .{ .target = target, .optimize = optimize });

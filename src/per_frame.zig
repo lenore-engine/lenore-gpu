@@ -2,6 +2,7 @@ const std = @import("std");
 const vk = @import("vulkan");
 const Context = @import("context.zig").Context;
 const buffer = @import("buffer.zig");
+const descriptors = @import("descriptors.zig");
 const memory = @import("memory/allocator.zig");
 
 pub const InitError = error{
@@ -173,6 +174,21 @@ pub fn PerFrame(comptime T: type) type {
         pub fn descriptor(self: *const Self) vk.DescriptorBufferInfo {
             return .{
                 .buffer = self.storage.handle,
+                .offset = 0,
+                .range = @intCast(self.count * @sizeOf(T)),
+            };
+        }
+
+        // The same window, in the form `Sets.writeBuffers` takes. It exists
+        // because a ring is the one binding that is not a whole buffer, and a
+        // caller working that out for itself would be reproducing the sentence
+        // above about the payload and the stride.
+        //
+        // Borrows this ring: the result is valid for the call it is passed to
+        // and not past it.
+        pub fn source(self: *const Self) descriptors.BufferSource {
+            return .{
+                .buffer = &self.storage,
                 .offset = 0,
                 .range = @intCast(self.count * @sizeOf(T)),
             };

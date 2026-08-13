@@ -39,24 +39,25 @@ const entries = [_]Entry{
         // BRDF.
         .binding = .{
             .slot = 0,
+            .name = "camera",
             .kind = .uniform_buffer_dynamic,
             .stages = .{ .vertex_bit = true, .fragment_bit = true },
         },
         .ring = .camera,
     },
     .{
-        .binding = .{ .slot = 1, .kind = .storage_buffer_dynamic, .stages = .{ .vertex_bit = true } },
+        .binding = .{ .slot = 1, .name = "instances", .kind = .storage_buffer_dynamic, .stages = .{ .vertex_bit = true } },
         .ring = .instances,
     },
     .{
-        .binding = .{ .slot = 2, .kind = .uniform_buffer_dynamic, .stages = .{ .fragment_bit = true } },
+        .binding = .{ .slot = 2, .name = "lights", .kind = .uniform_buffer_dynamic, .stages = .{ .fragment_bit = true } },
         .ring = .lights,
     },
     .{
         // A storage buffer rather than a uniform one: 16384 bytes is all
         // `maxUniformBufferRange` guarantees (vk.xml), which is 256 matrices for
         // a whole scene, and the joint array is per scene and not per skeleton.
-        .binding = .{ .slot = 3, .kind = .storage_buffer_dynamic, .stages = .{ .vertex_bit = true } },
+        .binding = .{ .slot = 3, .name = "joints", .kind = .storage_buffer_dynamic, .stages = .{ .vertex_bit = true } },
         .ring = .joints,
     },
     .{
@@ -67,6 +68,7 @@ const entries = [_]Entry{
         // because the point it needs is the shaded one, not a vertex.
         .binding = .{
             .slot = 4,
+            .name = "sun_shadow",
             .kind = .uniform_buffer_dynamic,
             .stages = .{ .vertex_bit = true, .fragment_bit = true },
         },

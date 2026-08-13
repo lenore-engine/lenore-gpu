@@ -109,8 +109,8 @@ pub const Target = struct {
 // serves both pipelines, and the pipeline that does not sample it is the one
 // that expresses bloom being off.
 pub const bindings = [_]descriptors.Binding{
-    .{ .slot = 0, .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
-    .{ .slot = 1, .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
+    .{ .slot = 0, .name = "hdr", .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
+    .{ .slot = 1, .name = "bloom", .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
 };
 
 pub const Sets = descriptors.Sets(&bindings);

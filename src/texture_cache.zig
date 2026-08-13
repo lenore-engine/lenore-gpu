@@ -6,8 +6,11 @@ const image_module = @import("image.zig");
 const ktx2 = @import("ktx2.zig");
 const memory = @import("memory/allocator.zig");
 const ref_cache = @import("ref_cache.zig");
+const retirement = @import("retirement.zig");
 const sampler_module = @import("sampler.zig");
 const transfer_module = @import("transfer.zig");
+
+const log = std.log.scoped(.vulkan);
 
 const Allocator = std.mem.Allocator;
 const Image = image_module.Image;
@@ -172,6 +175,9 @@ pub const AcquireError = error{
     KeyConflict,
     KindMismatch,
     NotKtx2,
+    // The faces handed in do not describe six squares of the declared extent at
+    // the declared format's texel size.
+    CubeBytesMismatch,
 } || Rgba8Error || ktx2.ParseError || InitError || ref_cache.InsertError;
 
 // The container's notion of what the file is, and the image type that has to be
@@ -199,6 +205,9 @@ pub const TextureCache = struct {
     samplers: SamplerCache,
     images: ref_cache.RefCache(Image),
     fallbacks: [fallback_count]Image,
+    // Borrowed, not owned: the frame ring it is keyed to belongs to whoever
+    // drives the frame loop, and so does the queue.
+    retirement: *retirement.ResourceRetirement,
 
     // Records the fallback uploads into the caller's transfer rather than
     // submitting them. Nothing here is usable until that transfer has finished,
@@ -208,6 +217,7 @@ pub const TextureCache = struct {
         memory_allocator: *memory.MemoryAllocator,
         host_allocator: Allocator,
         transfer: *Transfer,
+        image_retirement: *retirement.ResourceRetirement,
     ) InitError!TextureCache {
         var cache: TextureCache = .{
             .context = context,
@@ -216,6 +226,7 @@ pub const TextureCache = struct {
             .samplers = .init(context),
             .images = .empty,
             .fallbacks = undefined,
+            .retirement = image_retirement,
         };
 
         var created: usize = 0;
@@ -317,6 +328,52 @@ pub const TextureCache = struct {
     // The image has one mip. Vulkan clamps sampling to the view's level count,
     // so this is complete without pretending that mip generation and its colour
     // filtering policy have been decided here.
+    // A cube of one level, from faces the caller already holds.
+    //
+    // Separate from `acquireKtx2` because the source is not a file: a caller that
+    // has resampled a level has bytes and an extent and nothing else, and going
+    // back through a container would mean writing one to read it again.
+    //
+    // The faces are six squares, contiguous, in the order a cube level stores
+    // them. `texel_bytes` is the format's, and it is a parameter rather than a
+    // table lookup so that this call cannot silently disagree with what the
+    // caller packed.
+    pub fn acquireCube(
+        self: *TextureCache,
+        key: []const u8,
+        faces: []const u8,
+        extent: u32,
+        texel_bytes: u32,
+        format: vk.Format,
+        sampler_config: SamplerConfig,
+        transfer: *Transfer,
+    ) AcquireError!Bound {
+        const face_texels = @as(usize, extent) * extent;
+        if (extent == 0 or faces.len != ktx2.cube_faces * face_texels * texel_bytes)
+            return error.CubeBytesMismatch;
+
+        const resolved = try self.sampler(sampler_config);
+        if (try self.acquireExisting(key, .{
+            .format = format,
+            .shape = .cube,
+            .width = extent,
+            .height = extent,
+            .mip_levels = 1,
+        }, resolved)) |existing| return existing;
+
+        const uploaded = try uploadCube(
+            self.context,
+            self.memory_allocator,
+            transfer,
+            faces,
+            extent,
+            texel_bytes,
+            format,
+        );
+        const stored = try self.images.insert(self.host_allocator, key, uploaded);
+        return .of(stored, resolved);
+    }
+
     pub fn acquireRgba8(
         self: *TextureCache,
         key: []const u8,
@@ -376,14 +433,31 @@ pub const TextureCache = struct {
         {
             // `acquire` already took a reference. Undo it before reporting that
             // the caller reused one identity for different image content.
-            self.images.release(self.host_allocator, key);
+            //
+            // The undo cannot be what drops the last reference, since the entry
+            // was present before this call, so nothing normally comes back. It
+            // is destroyed rather than discarded because discarding it would
+            // leak an image on the strength of that argument alone.
+            if (self.images.release(self.host_allocator, key)) |returned| {
+                var image = returned;
+                image.deinit();
+            }
             return error.KeyConflict;
         }
         return .of(existing, resolved_sampler);
     }
 
+    // Vulkan specification, vkDestroyImage and vkDestroyImageView: submitted work
+    // using either must have completed. The image therefore goes to the frame
+    // ring rather than to the device here, and the caller is free to release a
+    // texture at any point in a frame without knowing what is in flight.
+    //
+    // Infallible on purpose: this is reached from teardown paths that cannot
+    // report anything. What a queue that will not take the image falls back to
+    // is stated once, at `retirement.retireOrDestroy`.
     pub fn release(self: *TextureCache, key: []const u8) void {
-        self.images.release(self.host_allocator, key);
+        const returned = self.images.release(self.host_allocator, key) orelse return;
+        retirement.retireOrDestroy(self.retirement, self.host_allocator, .{ .image = returned });
     }
 
     pub fn pin(self: *TextureCache, key: []const u8) void {
@@ -519,6 +593,51 @@ fn uploadKtx2(
 }
 
 // One face of one mip level, as the copy below needs to see it.
+// The same shape as `uploadKtx2` with the container's answers supplied by the
+// caller: one level, six faces, no block compression, so a row of texel blocks
+// is a row of texels and every face is tightly packed.
+fn uploadCube(
+    context: *const Context,
+    memory_allocator: *memory.MemoryAllocator,
+    transfer: *Transfer,
+    faces: []const u8,
+    extent: u32,
+    texel_bytes: u32,
+    format: vk.Format,
+) InitError!Image {
+    var image = try Image.init(context, memory_allocator, .{
+        .width = extent,
+        .height = extent,
+        .format = format,
+        .mip_levels = 1,
+        .usage = .{ .transfer_dst_bit = true, .sampled_bit = true },
+        .shape = .cube,
+    });
+    errdefer rollback(&image, transfer);
+
+    image.recordLayoutTransition(transfer.commandBuffer(), .to_transfer_destination);
+    const face_bytes = @as(usize, extent) * extent * texel_bytes;
+    for (0..ktx2.cube_faces) |face| {
+        try uploadFace(
+            &image,
+            transfer,
+            faces[face * face_bytes ..][0..face_bytes],
+            .{
+                .mip_level = 0,
+                .layer = @intCast(face),
+                .height = extent,
+                .block_height = 1,
+                .row_bytes = @as(u64, extent) * texel_bytes,
+                // Nothing was placed by a container, so the only alignment a
+                // staged piece has to keep is the one its own texels need.
+                .alignment = texel_bytes,
+            },
+        );
+    }
+    recordShaderRead(&image, transfer);
+    return image;
+}
+
 const FaceGeometry = struct {
     mip_level: u32,
     layer: u32,

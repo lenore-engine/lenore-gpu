@@ -46,6 +46,56 @@ pub const OneShotPool = struct {
     }
 };
 
+// An execution and memory dependency between two scopes, as
+// synchronization2 states one: what happened before, and what may observe it.
+//
+// The four masks are named rather than collapsed into cases. Every dependency
+// this module and its consumers record is different from every other one:
+// compute writes read back through the vertex attribute fetch, compute writes
+// read in a vertex shader, a transfer fill read by a compute dispatch, one
+// dispatch's output read by a copy, another dispatch and a fragment shader at
+// once. A set of named cases with one caller each is a rename, not an
+// abstraction, and the mask a caller has to get right stays the same either way.
+pub const Dependency = struct {
+    src_stage: vk.PipelineStageFlags2,
+    src_access: vk.AccessFlags2,
+    dst_stage: vk.PipelineStageFlags2,
+    dst_access: vk.AccessFlags2,
+};
+
+// The barrier a dependency is, without recording it. Separated from the call so
+// that the mapping is reachable from a test: a source scope written into a
+// destination member orders the opposite of what the caller asked for, and
+// nothing reports it. The picture is merely wrong, one frame late.
+pub fn memoryBarrier(dependency: Dependency) vk.MemoryBarrier2 {
+    return .{
+        .src_stage_mask = dependency.src_stage,
+        .src_access_mask = dependency.src_access,
+        .dst_stage_mask = dependency.dst_stage,
+        .dst_access_mask = dependency.dst_access,
+    };
+}
+
+// One global memory barrier, which is what a dependency over buffer contents
+// wants. A buffer barrier would additionally have to name a range, and for a
+// device-local resource that buys no filtering the driver acts on; the same
+// reasoning is written out at `morph.barrier`.
+//
+// Image contents are not this function's business: they need a layout
+// transition per image, which is what the `beginBarriers` and `endBarriers`
+// pairs in `pass`, `post` and `shadow` are.
+pub fn recordMemoryBarrier(
+    context: *const Context,
+    command_buffer: vk.CommandBuffer,
+    dependency: Dependency,
+) void {
+    const barriers = [_]vk.MemoryBarrier2{memoryBarrier(dependency)};
+    context.device.cmdPipelineBarrier2(command_buffer, &.{
+        .memory_barrier_count = barriers.len,
+        .p_memory_barriers = &barriers,
+    });
+}
+
 pub fn beginOneShot(
     context: *const Context,
     pool: vk.CommandPool,

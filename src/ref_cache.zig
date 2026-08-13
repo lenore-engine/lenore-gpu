@@ -22,9 +22,12 @@ pub const DeinitStatus = enum {
 // OwningStorage in storage.zig, which gives handles to uniquely owned resources
 // with no sharing at all.
 //
-// T must expose pub fn deinit(*T) void, the same shape OwningStorage requires:
-// the cache owns every value's destruction. Keys are owned too, duplicated on
-// insert and freed with the entry.
+// T must expose pub fn deinit(*T) void, the same shape OwningStorage requires.
+// The cache destroys what it still holds at teardown; a value whose last
+// reference goes is handed back to the caller instead, because when a device
+// resource may be destroyed is a question this container cannot answer and the
+// caller can. Keys are owned either way, duplicated on insert and freed with the
+// entry.
 pub fn RefCache(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -98,24 +101,35 @@ pub fn RefCache(comptime T: type) type {
             return &entry.value_ptr.value;
         }
 
-        // Drops one reference, destroying the value and freeing its key when the
-        // last reference goes and the value is not pinned. An unknown key is a
-        // no-op: a neutral fallback that never entered the cache is released
-        // like anything else.
-        pub fn release(self: *Self, allocator: Allocator, key: []const u8) void {
-            const entry = self.map.getEntry(key) orelse return;
+        // Drops one reference. Returns the value, moved out and no longer known
+        // to the cache, when the last reference goes and it is not pinned, and
+        // null in every other case: still referenced, pinned, or an unknown key.
+        // An unknown key is a no-op because a neutral fallback that never
+        // entered the cache is released like anything else.
+        //
+        // The value comes back rather than being destroyed here so that a
+        // caller holding a GPU resource can retire it against the frame ring
+        // instead. Destroying it inline would be correct only with the device
+        // idle, and this container is in no position to know that.
+        //
+        // Ignoring the result leaks whatever it holds, which is why it is a
+        // value and not an out parameter: Zig refuses a call statement that
+        // discards one, so every call site has to say what it does with it.
+        pub fn release(self: *Self, allocator: Allocator, key: []const u8) ?T {
+            const entry = self.map.getEntry(key) orelse return null;
             // Only a pinned entry can sit at zero references. Releasing one
             // again would wrap the counter and strand the value forever, so the
             // extra release is dropped instead.
-            if (entry.value_ptr.references == 0) return;
+            if (entry.value_ptr.references == 0) return null;
 
             entry.value_ptr.references -= 1;
-            if (entry.value_ptr.references > 0 or entry.value_ptr.pinned) return;
+            if (entry.value_ptr.references > 0 or entry.value_ptr.pinned) return null;
 
-            entry.value_ptr.value.deinit();
+            const value = entry.value_ptr.value;
             const owned_key = entry.key_ptr.*;
             self.map.removeByPtr(entry.key_ptr);
             allocator.free(owned_key);
+            return value;
         }
 
         // Marks a present value resident: it survives its reference count

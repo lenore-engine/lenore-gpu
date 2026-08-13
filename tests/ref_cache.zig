@@ -34,14 +34,21 @@ test "a value lives until its last reference is released" {
     try testing.expectEqual(inserted, shared);
     try testing.expectEqual(@as(u32, 2), cache.references("mesh"));
 
-    cache.release(testing.allocator, "mesh");
+    // Still referenced, so nothing comes back and nothing is destroyed.
+    try testing.expect(cache.release(testing.allocator, "mesh") == null);
     try testing.expectEqual(@as(u32, 0), destroyed);
     try testing.expect(cache.contains("mesh"));
 
-    cache.release(testing.allocator, "mesh");
-    try testing.expectEqual(@as(u32, 1), destroyed);
+    // The last reference hands the value out instead of destroying it: the
+    // cache has forgotten it, and whoever asked now owns it.
+    var last = cache.release(testing.allocator, "mesh").?;
+    try testing.expectEqual(@as(u32, 1), last.tag);
+    try testing.expectEqual(@as(u32, 0), destroyed);
     try testing.expect(!cache.contains("mesh"));
     try testing.expectEqual(@as(u32, 0), cache.count());
+
+    last.deinit();
+    try testing.expectEqual(@as(u32, 1), destroyed);
 
     try testing.expectEqual(gpu.RefCacheDeinitStatus.ok, cache.deinit(testing.allocator));
 }
@@ -88,7 +95,8 @@ test "a pinned value survives zero references and absorbs extra releases" {
 
     _ = try cache.insert(testing.allocator, "atlas", .{ .tag = 1, .destroyed = &destroyed });
     cache.pin("atlas");
-    cache.release(testing.allocator, "atlas");
+    // Pinned, so the value stays with the cache and nothing comes back.
+    try testing.expect(cache.release(testing.allocator, "atlas") == null);
 
     try testing.expectEqual(@as(u32, 0), destroyed);
     try testing.expect(cache.contains("atlas"));
@@ -96,7 +104,7 @@ test "a pinned value survives zero references and absorbs extra releases" {
 
     // A release past zero must not wrap the counter, which would strand the
     // value at a huge count and destroy it never.
-    cache.release(testing.allocator, "atlas");
+    try testing.expect(cache.release(testing.allocator, "atlas") == null);
     try testing.expectEqual(@as(u32, 0), cache.references("atlas"));
     try testing.expect(cache.contains("atlas"));
 
@@ -119,7 +127,7 @@ test "an unknown key is inert" {
     var cache: Cache = .empty;
 
     cache.pin("absent");
-    cache.release(testing.allocator, "absent");
+    try testing.expect(cache.release(testing.allocator, "absent") == null);
     try testing.expect(cache.acquire("absent") == null);
     try testing.expectEqual(@as(u32, 0), cache.references("absent"));
     try testing.expect(!cache.contains("absent"));

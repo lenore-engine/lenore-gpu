@@ -219,7 +219,7 @@ pub fn texelSize(extent: vk.Extent2D) [2]f32 {
 // set per step: the source changes every draw while nothing else in the layout
 // does.
 pub const bindings = [_]descriptors.Binding{
-    .{ .slot = 0, .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
+    .{ .slot = 0, .name = "source", .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
 };
 
 pub const Sets = descriptors.Sets(&bindings);

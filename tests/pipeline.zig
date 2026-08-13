@@ -107,7 +107,7 @@ test "positive-determinant glTF faces are counter-clockwise" {
 test "scene culling is dynamic and fullscreen culling is fixed off" {
     try testing.expectEqualSlices(
         vk.DynamicState,
-        &[_]vk.DynamicState{ .viewport, .scissor, .cull_mode },
+        &[_]vk.DynamicState{ .viewport, .scissor, .cull_mode, .front_face },
         gpu.Pipeline.dynamicStates(.dynamic),
     );
     try testing.expectEqualSlices(
@@ -165,4 +165,21 @@ test "blending is the only thing the blend state changes between modes" {
     try testing.expectEqual(vk.BlendFactor.src_alpha, blended.src_color_blend_factor);
     try testing.expectEqual(vk.BlendFactor.one_minus_src_alpha, blended.dst_color_blend_factor);
     try testing.expectEqual(solid.color_write_mask, blended.color_write_mask);
+}
+
+test "a described name stops at the padding the specification defines" {
+    // VkPipelineExecutableStatisticKHR carries its name as a fixed array padded
+    // with zeroes, not as a slice, so a reader that takes the whole array gets
+    // the padding with it.
+    var field: [8]u8 = @splat(0);
+    @memcpy(field[0..4], "VGPR");
+    try std.testing.expectEqualStrings("VGPR", gpu.pipelineDescribedName(&field));
+
+    // No padding at all: the name fills the array and there is nothing to trim.
+    const full = "abcdefgh".*;
+    try std.testing.expectEqualStrings("abcdefgh", gpu.pipelineDescribedName(&full));
+
+    // Empty is a name of no characters rather than the whole array.
+    const empty: [8]u8 = @splat(0);
+    try std.testing.expectEqualStrings("", gpu.pipelineDescribedName(&empty));
 }

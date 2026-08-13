@@ -14,6 +14,17 @@ const gpu = @import("lenore-gpu");
 // Anything here that gains a test which actually calls it should lose its line.
 
 test "the device-facing surface is compiled" {
+    _ = &gpu.GpuTimer.init;
+    _ = &gpu.GpuTimer.deinit;
+    _ = &gpu.GpuTimer.reset;
+    _ = &gpu.GpuTimer.write;
+    _ = &gpu.GpuTimer.read;
+
+    // Both need a device and a pipeline created with the capture flag, so
+    // nothing here can call them.
+    _ = &gpu.pipelineExecutables;
+    _ = &gpu.pipelineStatistics;
+
     _ = &gpu.Context.init;
     _ = &gpu.Context.deinit;
     _ = &gpu.Context.deviceName;
@@ -73,6 +84,24 @@ test "the device-facing surface is compiled" {
     _ = &gpu.TextureCache.init;
     _ = &gpu.TextureCache.deinit;
     _ = &gpu.TextureCache.count;
+    // Releasing routes an image into the frame ring and falls back to a drain,
+    // both of which are device calls. Nothing else in this module's own suite
+    // compiles either path.
+    _ = &gpu.TextureCache.release;
+    _ = &gpu.TextureCache.pin;
+
+    // `Retirement` itself is tested against a value that needs no device, so
+    // what is left here is the concrete union: every variant destroys through a
+    // device, and the dispatch is compiled nowhere else in this suite. A variant
+    // added without a `deinit` fails at this line.
+    _ = &gpu.RetiredResource.deinit;
+    _ = &gpu.ResourceRetirement.init;
+    _ = &gpu.ResourceRetirement.deinit;
+    _ = &gpu.ResourceRetirement.beginFrame;
+    _ = &gpu.ResourceRetirement.retire;
+    // The degradation the two release paths share. Its fallback drains a device,
+    // so nothing host-side reaches it.
+    _ = &gpu.retireOrDestroy;
 
     _ = &gpu.SamplerCache.init;
     _ = &gpu.SamplerCache.deinit;
@@ -204,4 +233,28 @@ fn reachAddMesh(batch: *gpu.UploadBatch, upload: gpu.MeshUpload(u32)) !gpu.MeshH
 
 fn reachAddTexture(batch: *gpu.UploadBatch, request: gpu.TextureRequest) !gpu.BoundTexture {
     return batch.addTexture(.base_colour, request);
+}
+
+// The pipeline table. Every method creates or destroys device objects, and the
+// examples that use it are built from the umbrella rather than from here.
+test "the shader effect table is compiled" {
+    const Table = gpu.ShaderEffect(.{
+        .modules = .{"only"},
+        .layouts = .{"only"},
+        .pipelines = .{
+            .step = gpu.ShaderEffectSpec{ .module = "only", .layout = "only", .stage = .{
+                .compute = "computeMain",
+            } },
+            .present = gpu.ShaderEffectSpec{ .module = "only", .layout = "only", .stage = .{ .graphics = .{
+                .vertex = "vertexMain",
+                .fragment = "fragmentMain",
+                .mode = .background,
+                .culling = .{ .fixed = .{} },
+            } } },
+        },
+    });
+    _ = &Table.init;
+    _ = &Table.deinit;
+    _ = &Table.get;
+    _ = &Table.layoutFor;
 }

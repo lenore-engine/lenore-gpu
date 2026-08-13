@@ -56,11 +56,11 @@ const SceneSets = descriptors.Sets(&scene_bindings);
 // type's field order, which is also the order `material_storage.TextureSlot`
 // indexes the packed transform array by.
 pub const material_bindings = [_]descriptors.Binding{
-    .{ .slot = 0, .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
-    .{ .slot = 1, .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
-    .{ .slot = 2, .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
-    .{ .slot = 3, .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
-    .{ .slot = 4, .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
+    .{ .slot = 0, .name = "base_colour", .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
+    .{ .slot = 1, .name = "metallic_roughness", .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
+    .{ .slot = 2, .name = "normal", .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
+    .{ .slot = 3, .name = "emissive", .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
+    .{ .slot = 4, .name = "occlusion", .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
 };
 
 comptime {
@@ -353,13 +353,14 @@ pub fn planRecording(state: RecordState, request: RecordRequest) RecordError!Rec
 pub const SceneVariant = struct {
     skinned: bool,
     uv1: bool,
+    colour: bool,
 
     // The vertex input a pipeline of this variant declares. Read by both the
     // input and the entry point at creation, so the two cannot name different
     // sets of bindings: a shader reading location 7 with no binding 3 behind it
     // is not a pipeline that can be created.
     pub fn streams(self: SceneVariant) res.VertexStreams {
-        return .{ .skinned = self.skinned, .uv1 = self.uv1 };
+        return .{ .skinned = self.skinned, .uv1 = self.uv1, .colour = self.colour };
     }
 };
 
@@ -373,12 +374,8 @@ pub const SceneVariant = struct {
 // pipeline for a skinned mesh is a vertex input that declares no binding 1
 // while the shader reads none either, so it draws the bind pose and reports
 // nothing.
-//
-// The colour stream is not an axis. No main-pass shader may read binding 2, so
-// a mesh carrying it draws through the same pipeline as one that does not, and
-// the buffer `Mesh.bind` bound for it goes unread.
 pub fn sceneVariantFor(streams: res.VertexStreams) SceneVariant {
-    return .{ .skinned = streams.skinned, .uv1 = streams.uv1 };
+    return .{ .skinned = streams.skinned, .uv1 = streams.uv1, .colour = streams.colour };
 }
 
 // The scene pipelines, one per vertex variant and blend mode. Both axes change
@@ -394,7 +391,7 @@ pub fn sceneVariantFor(streams: res.VertexStreams) SceneVariant {
 // this axis, so a count taken from the enum would build a row of scene
 // pipelines that nothing can select and that no draw would ever bind.
 pub const scene_modes = [_]pipeline.Mode{ .solid, .blended };
-pub const scene_variants = 4;
+pub const scene_variants = 8;
 pub const scene_pipeline_count = scene_variants * scene_modes.len;
 
 comptime {
@@ -413,7 +410,9 @@ comptime {
 // from the pipelines it feeds, and every draw would then be transformed by the
 // wrong variant's vertex stage while nothing said so.
 pub fn sceneVariantIndex(variant: SceneVariant) usize {
-    return @as(usize, @intFromBool(variant.skinned)) * 2 + @intFromBool(variant.uv1);
+    return @as(usize, @intFromBool(variant.skinned)) * 4 +
+        @as(usize, @intFromBool(variant.uv1)) * 2 +
+        @intFromBool(variant.colour);
 }
 
 // Public so that the one property the creation loop depends on can be checked
@@ -430,25 +429,26 @@ pub fn scenePipelineIndex(variant: SceneVariant, mode: pipeline.Mode) usize {
     return sceneVariantIndex(variant) * scene_modes.len + @intFromEnum(mode);
 }
 
-// What a main-pass shader has to supply for the eight scene pipelines to be
+// What a main-pass shader has to supply for the sixteen scene pipelines to be
 // built from it.
 //
-// The vertex entry points are an array and not four named fields, because the
+// The vertex entry points are an array and not eight named fields, because the
 // axes they run over are the ones `sceneVariantIndex` already computes: the
-// optional skin stream and the second UV set, in that order of significance. A
-// named field per case would be a second account of that pair, and the two
-// would have to be kept in step by reading both.
+// optional skin stream, the second UV set and the vertex colour, in that order
+// of significance. A named field per case would be a second account of that
+// triple, and the two would have to be kept in step by reading both.
 //
-// The colour stream is not an axis. Nothing may read binding 2, so a mesh
-// carrying it is drawn through the same entry point as one that does not.
-//
-// One fragment entry point for all eight. The blend mode is a pipeline state
-// and not a shading difference, and the variants differ in what the vertex
-// stage reads rather than in what the surface does.
+// Two fragment entry points, and the axis is the colour stream alone. A
+// fragment stage's input has to be the vertex stage's output, so a variant
+// carrying COLOR_0 cannot be shaded by an entry point that does not declare it.
+// The blend mode is not an axis here: it is a pipeline state rather than a
+// shading difference.
 pub const SceneShader = struct {
     spirv: []const u32,
     vertex_entry: [scene_variants][*:0]const u8,
     fragment_entry: [*:0]const u8,
+    // For the variants whose vertex stage carries COLOR_0.
+    colour_fragment_entry: [*:0]const u8,
 };
 
 // Every shader the renderer builds a pipeline from. Grouped rather than passed
@@ -470,6 +470,11 @@ pub const RecordBatch = struct {
     mesh: *const mesh_module.Mesh,
     material_index: u32,
     cull_mode: vk.CullModeFlags,
+    // Which winding this batch's rasterizer calls the front. A mirrored draw
+    // arrives with the opposite one, and it is set even where nothing is
+    // culled: `SV_IsFrontFace` comes from the same state, and a double-sided
+    // material reads it to decide which way its normals point.
+    front_face: vk.FrontFace,
     first_instance: u32,
     instance_count: u32,
     // Replaces binding zero, for a draw whose vertices a prepass produced. Null
@@ -701,30 +706,59 @@ pub const Renderer = struct {
 
         for ([_]bool{ false, true }) |skinned| {
             for ([_]bool{ false, true }) |uv1| {
-                const variant: SceneVariant = .{ .skinned = skinned, .uv1 = uv1 };
-                for (scene_modes) |mode| {
-                    // The rollback below walks the built prefix, so the loop has
-                    // to fill the array in index order.
-                    std.debug.assert(scenePipelineIndex(variant, mode) == created);
-                    scene_pipelines[created] = try pipeline.create(context, .{
-                        .mode = mode,
-                        .streams = variant.streams(),
-                        .culling = .dynamic,
-                        .formats = .{ .colour = hdr.format, .depth = depth.format },
-                        .layout = scene_layout,
-                        .stages = .{
-                            .vertex = .{
-                                .module = scene_module,
-                                .entry_point = shaders.scene.vertex_entry[sceneVariantIndex(variant)],
+                for ([_]bool{ false, true }) |colour| {
+                    const variant: SceneVariant = .{
+                        .skinned = skinned,
+                        .uv1 = uv1,
+                        .colour = colour,
+                    };
+                    for (scene_modes) |mode| {
+                        // The rollback below walks the built prefix, so the
+                        // loop has to fill the array in index order.
+                        std.debug.assert(scenePipelineIndex(variant, mode) == created);
+                        scene_pipelines[created] = try pipeline.create(context, .{
+                            .mode = mode,
+                            .streams = variant.streams(),
+                            .culling = .dynamic,
+                            .formats = .{ .colour = hdr.format, .depth = depth.format },
+                            .layout = scene_layout,
+                            .stages = .{
+                                .vertex = .{
+                                    .module = scene_module,
+                                    .entry_point = shaders.scene.vertex_entry[sceneVariantIndex(variant)],
+                                },
+                                // The fragment stage's input is the vertex
+                                // stage's output, so the colour axis selects
+                                // here as well.
+                                .fragment = .{
+                                    .module = scene_module,
+                                    .entry_point = if (colour)
+                                        shaders.scene.colour_fragment_entry
+                                    else
+                                        shaders.scene.fragment_entry,
+                                },
                             },
-                            .fragment = .{
-                                .module = scene_module,
-                                .entry_point = shaders.scene.fragment_entry,
-                            },
-                        },
-                    });
-                    created += 1;
+                        });
+                        created += 1;
+                    }
                 }
+            }
+        }
+
+        // What the driver made of each scene pipeline, when the build asked to
+        // be able to see it. Reported here rather than exposed through an
+        // accessor: the handles belong to this renderer and outliving it is the
+        // one way to read them wrong.
+        if (pipeline.capture_statistics) {
+            if (context.shader_statistics_enabled) {
+                for (scene_pipelines[0..created], 0..) |built, index|
+                    reportShaderStatistics(context, allocator, built, index);
+            } else {
+                log.warn(
+                    "shader statistics were built for but the device has no " ++
+                        "VK_KHR_pipeline_executable_properties",
+                    .{},
+                );
             }
         }
 
@@ -1275,6 +1309,7 @@ pub const Renderer = struct {
             var last_pipeline: ?vk.Pipeline = null;
             var last_material: ?u32 = null;
             var last_cull_mode: ?u32 = null;
+            var last_front_face: ?vk.FrontFace = null;
             var last_mesh: ?*const mesh_module.Mesh = null;
             var last_source: ?mesh_module.VertexSource = null;
 
@@ -1283,7 +1318,20 @@ pub const Renderer = struct {
                     self.recordBackground(command_buffer);
                     // The background's pipeline is what is bound after this, so
                     // the cache no longer describes the command buffer.
+                    //
+                    // Vulkan specification, VUID-vkCmdDrawIndexed-None-07840:
+                    // binding a pipeline that does not declare a dynamic state
+                    // invalidates it, and the background declares only viewport
+                    // and scissor. So the cull mode is gone as well, and a batch
+                    // that happens to want the mode the previous one set would
+                    // otherwise skip `vkCmdSetCullMode` and draw with no mode at
+                    // all. The winding goes with it, for the same reason and by
+                    // the same rule. The descriptor sets and vertex bindings
+                    // survive, because the background is created against this
+                    // pass's own layout and binds neither.
                     last_pipeline = null;
+                    last_cull_mode = null;
+                    last_front_face = null;
                 }
 
                 // Every material the list names is configured: the plan this
@@ -1299,6 +1347,11 @@ pub const Renderer = struct {
                 if (last_cull_mode == null or last_cull_mode.? != cull_mode) {
                     device.cmdSetCullMode(command_buffer, batch.cull_mode);
                     last_cull_mode = cull_mode;
+                }
+
+                if (last_front_face == null or last_front_face.? != batch.front_face) {
+                    device.cmdSetFrontFace(command_buffer, batch.front_face);
+                    last_front_face = batch.front_face;
                 }
 
                 if (last_material == null or last_material.? != batch.material_index) {
@@ -1402,6 +1455,52 @@ pub const Renderer = struct {
         post.end(self.context, command_buffer, target);
     }
 };
+
+// One pipeline's compiled form, written to the log a line at a time.
+//
+// Failures are reported and swallowed. This runs only in a build that asked for
+// it and produces no value the renderer goes on to use, so refusing to create a
+// renderer because a diagnostic could not be gathered would be the instrument
+// breaking the thing it measures.
+fn reportShaderStatistics(
+    context: *const Context,
+    allocator: Allocator,
+    handle: vk.Pipeline,
+    index: usize,
+) void {
+    const found = pipeline.executables(context, allocator, handle) catch |err| {
+        log.warn("scene pipeline {d}: executables unavailable: {t}", .{ index, err });
+        return;
+    };
+    defer allocator.free(found);
+
+    for (found, 0..) |executable, slot| {
+        const stats = pipeline.statistics(context, allocator, handle, @intCast(slot)) catch |err| {
+            log.warn("scene pipeline {d}: statistics unavailable: {t}", .{ index, err });
+            return;
+        };
+        defer allocator.free(stats);
+
+        log.info("scene pipeline {d}, executable {d}: {s}, subgroup {d}", .{
+            index,
+            slot,
+            pipeline.describedName(&executable.name),
+            executable.subgroup_size,
+        });
+        for (stats) |statistic| {
+            const name = pipeline.describedName(&statistic.name);
+            switch (statistic.format) {
+                .bool32_khr => log.info("  {s}: {}", .{ name, statistic.value.b_32 == .true }),
+                .int64_khr => log.info("  {s}: {d}", .{ name, statistic.value.i_64 }),
+                .uint64_khr => log.info("  {s}: {d}", .{ name, statistic.value.u_64 }),
+                .float64_khr => log.info("  {s}: {d}", .{ name, statistic.value.f_64 }),
+                // The enum is open: a driver may report a format this build was
+                // compiled before. Naming it beats printing a wrong number.
+                _ => log.info("  {s}: unrecognised format {d}", .{ name, @intFromEnum(statistic.format) }),
+            }
+        }
+    }
+}
 
 // The post pipelines differ in the fragment entry point and in nothing else, so
 // the rest of the configuration is stated once.

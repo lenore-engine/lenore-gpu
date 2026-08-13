@@ -259,7 +259,7 @@ pub const MaterialStorage = struct {
 // an instance carries selects a material out of this array, so which set is
 // bound is not what chooses one.
 pub const bindings = [_]descriptors.Binding{
-    .{ .slot = 0, .kind = .storage_buffer, .stages = .{ .fragment_bit = true } },
+    .{ .slot = 0, .name = "materials", .kind = .storage_buffer, .stages = .{ .fragment_bit = true } },
 };
 
 // Points the set at a material buffer. Cold: composition owns the buffer and
