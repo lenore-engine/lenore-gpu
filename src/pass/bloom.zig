@@ -1,12 +1,12 @@
 const std = @import("std");
 const vk = @import("vulkan");
 
-const Context = @import("context.zig").Context;
-const descriptors = @import("descriptors.zig");
-const image = @import("image.zig");
-const memory = @import("memory/allocator.zig");
-const pass = @import("pass.zig");
-const pipeline = @import("pipeline.zig");
+const Context = @import("../device/context.zig").Context;
+const descriptors = @import("../binding/descriptors.zig");
+const image = @import("../object/image.zig");
+const memory = @import("../memory/allocator.zig");
+const pass = @import("scene.zig");
+const pipeline = @import("../binding/pipeline.zig");
 
 const Allocator = std.mem.Allocator;
 

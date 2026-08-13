@@ -2,8 +2,8 @@ const std = @import("std");
 const build_options = @import("build_options");
 const vk = @import("vulkan");
 const res = @import("lenore-resources");
-const Context = @import("context.zig").Context;
-const vertex = @import("mesh/vertex.zig");
+const Context = @import("../device/context.zig").Context;
+const vertex = @import("../object/vertex.zig");
 
 const Allocator = std.mem.Allocator;
 const VertexStreams = res.VertexStreams;

@@ -1,8 +1,8 @@
 const std = @import("std");
 const vk = @import("vulkan");
-const Context = @import("context.zig").Context;
-const image = @import("image.zig");
-const memory = @import("memory/allocator.zig");
+const Context = @import("../device/context.zig").Context;
+const image = @import("../object/image.zig");
+const memory = @import("../memory/allocator.zig");
 
 pub const FormatError = error{
     NoSupportedDepthFormat,

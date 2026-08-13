@@ -1,7 +1,7 @@
 const std = @import("std");
 const vk = @import("vulkan");
 const res = @import("lenore-resources");
-const Context = @import("context.zig").Context;
+const Context = @import("../device/context.zig").Context;
 
 const Allocator = std.mem.Allocator;
 

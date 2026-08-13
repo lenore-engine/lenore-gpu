@@ -1,7 +1,7 @@
 const std = @import("std");
 
-const Buffer = @import("buffer.zig").Buffer;
-const Image = @import("image.zig").Image;
+const Buffer = @import("../object/buffer.zig").Buffer;
+const Image = @import("../object/image.zig").Image;
 
 const log = std.log.scoped(.vulkan);
 

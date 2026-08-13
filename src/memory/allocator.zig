@@ -1,6 +1,6 @@
 const std = @import("std");
 const vk = @import("vulkan");
-const Context = @import("../context.zig").Context;
+const Context = @import("../device/context.zig").Context;
 const Suballocator = @import("memory-suballocator").Suballocator;
 
 const Allocator = std.mem.Allocator;

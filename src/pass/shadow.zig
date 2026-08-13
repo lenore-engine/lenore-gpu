@@ -1,12 +1,12 @@
 const std = @import("std");
 const vk = @import("vulkan");
 const attachment = @import("attachment.zig");
-const Context = @import("context.zig").Context;
-const descriptors = @import("descriptors.zig");
-const image = @import("image.zig");
-const memory = @import("memory/allocator.zig");
-const pass = @import("pass.zig");
-const pipeline = @import("pipeline.zig");
+const Context = @import("../device/context.zig").Context;
+const descriptors = @import("../binding/descriptors.zig");
+const image = @import("../object/image.zig");
+const memory = @import("../memory/allocator.zig");
+const pass = @import("scene.zig");
+const pipeline = @import("../binding/pipeline.zig");
 const res = @import("lenore-resources");
 
 const Allocator = std.mem.Allocator;
@@ -21,7 +21,7 @@ const AlphaMode = res.MaterialInfo.Rendering.AlphaMode;
 // with. It does not own the loop that walks the casters: that reads the same
 // batch list the main pass draws from, and splitting the two loops across two
 // files would put one list's ordering rules in two places. The relationship is
-// `pass.zig`'s to `renderer.zig` and not `morph.zig`'s, which has a registration
+// `scene.zig`'s to `renderer.zig` and not `morph.zig`'s, which has a registration
 // list of its own to walk.
 //
 // The map is a whole scene's, not a frame's. One image serves every frame in

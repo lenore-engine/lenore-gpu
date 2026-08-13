@@ -1,23 +1,23 @@
 const std = @import("std");
 const vk = @import("vulkan");
-const attachment = @import("attachment.zig");
-const bloom = @import("bloom.zig");
-const Context = @import("context.zig").Context;
-const descriptors = @import("descriptors.zig");
-const environment = @import("environment.zig");
-const frame_set = @import("frame_set.zig");
-const image = @import("image.zig");
-const material_storage = @import("material_storage.zig");
+const attachment = @import("pass/attachment.zig");
+const bloom = @import("pass/bloom.zig");
+const Context = @import("device/context.zig").Context;
+const descriptors = @import("binding/descriptors.zig");
+const environment = @import("object/environment.zig");
+const frame_set = @import("binding/frame_set.zig");
+const image = @import("object/image.zig");
+const materials_module = @import("binding/materials.zig");
 const memory = @import("memory/allocator.zig");
-const mesh_module = @import("mesh/resource.zig");
-const pass = @import("pass.zig");
-const pipeline = @import("pipeline.zig");
-const post = @import("post.zig");
+const mesh_module = @import("object/mesh.zig");
+const pass = @import("pass/scene.zig");
+const pipeline = @import("binding/pipeline.zig");
+const post = @import("pass/post.zig");
 const res = @import("lenore-resources");
-const resource_storage = @import("resource_storage.zig");
-const shadow = @import("shadow.zig");
-const sky = @import("sky.zig");
-const uniforms = @import("uniforms.zig");
+const resource_storage = @import("store/resources.zig");
+const shadow = @import("pass/shadow.zig");
+const sky = @import("pass/sky.zig");
+const uniforms = @import("binding/uniforms.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -47,13 +47,13 @@ pub const shadow_set_index = 3;
 // fragment lights itself from. Neither list belongs in the other's file, and
 // joining them here is what makes a slot claimed twice a compile error rather
 // than a descriptor quietly overwritten at run time.
-pub const scene_bindings = material_storage.bindings ++ environment.bindings;
+pub const scene_bindings = materials_module.bindings ++ environment.bindings;
 
 const SceneSets = descriptors.Sets(&scene_bindings);
 
 // What a material set holds: base colour, metallic-roughness, normal, emissive,
 // then occlusion. One binding per slot of `resource_storage.TextureSet`, in that
-// type's field order, which is also the order `material_storage.TextureSlot`
+// type's field order, which is also the order `materials_module.TextureSlot`
 // indexes the packed transform array by.
 pub const material_bindings = [_]descriptors.Binding{
     .{ .slot = 0, .name = "base_colour", .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
@@ -858,8 +858,8 @@ pub const Renderer = struct {
     // whole allocation, so re-uploading materials into the same buffer does not
     // come back here; handing over a different buffer does, and the caller
     // ensures no submitted frame is reading the old one.
-    pub fn setMaterialBuffer(self: *Renderer, storage: *const material_storage.MaterialStorage) void {
-        material_storage.write(self.context, self.scene.set(0), storage);
+    pub fn setMaterialBuffer(self: *Renderer, storage: *const materials_module.MaterialStorage) void {
+        materials_module.write(self.context, self.scene.set(0), storage);
         self.material_buffer_ready = true;
     }
 

@@ -1,8 +1,8 @@
 const std = @import("std");
 const vk = @import("vulkan");
 
-const Context = @import("context.zig").Context;
-const pipeline = @import("pipeline.zig");
+const Context = @import("../device/context.zig").Context;
+const pipeline = @import("../binding/pipeline.zig");
 
 // The background: three vertices at the far plane, drawn wherever the opaque
 // set left the depth buffer untouched. What they shade is the caller's, and

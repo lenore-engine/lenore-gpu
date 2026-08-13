@@ -1,8 +1,8 @@
 const std = @import("std");
 const vk = @import("vulkan");
 const Buffer = @import("buffer.zig").Buffer;
-const Context = @import("context.zig").Context;
-const memory = @import("memory/allocator.zig");
+const Context = @import("../device/context.zig").Context;
+const memory = @import("../memory/allocator.zig");
 
 // Every image here is single-sampled, optimal-tiling and two-dimensional. That
 // is what the resource path uses and what the allocator's image pool is

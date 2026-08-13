@@ -1,9 +1,9 @@
 const std = @import("std");
 const vk = @import("vulkan");
 
-const Context = @import("context.zig").Context;
-const descriptors = @import("descriptors.zig");
-const pass = @import("pass.zig");
+const Context = @import("../device/context.zig").Context;
+const descriptors = @import("../binding/descriptors.zig");
+const pass = @import("../pass/scene.zig");
 const sampler_module = @import("sampler.zig");
 const texture_cache = @import("texture_cache.zig");
 
@@ -36,7 +36,7 @@ const TextureCache = texture_cache.TextureCache;
 // top is Fdez-Aguera (2019). `shading.zig` holds the host mirror of both.
 
 // The environment's part of the scene set. Slot 0 is the packed material array,
-// which `material_storage.zig` owns; these continue after it, and the renderer
+// which `binding/materials.zig` owns; these continue after it, and the renderer
 // is where the two lists are joined into one layout. Splitting them this way
 // keeps each list next to the code that writes it.
 pub const bindings = [_]descriptors.Binding{

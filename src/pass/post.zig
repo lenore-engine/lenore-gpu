@@ -1,9 +1,9 @@
 const std = @import("std");
 const vk = @import("vulkan");
 const bloom = @import("bloom.zig");
-const Context = @import("context.zig").Context;
-const descriptors = @import("descriptors.zig");
-const pass = @import("pass.zig");
+const Context = @import("../device/context.zig").Context;
+const descriptors = @import("../binding/descriptors.zig");
+const pass = @import("scene.zig");
 
 const Allocator = std.mem.Allocator;
 

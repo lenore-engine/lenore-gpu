@@ -1,7 +1,7 @@
 const std = @import("std");
 const vk = @import("vulkan");
-const Context = @import("context.zig").Context;
-const Buffer = @import("buffer.zig").Buffer;
+const Context = @import("../device/context.zig").Context;
+const Buffer = @import("../object/buffer.zig").Buffer;
 
 const Allocator = std.mem.Allocator;
 

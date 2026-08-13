@@ -1,9 +1,9 @@
 const std = @import("std");
 const vk = @import("vulkan");
-const Context = @import("context.zig").Context;
-const buffer = @import("buffer.zig");
+const Context = @import("../device/context.zig").Context;
+const buffer = @import("../object/buffer.zig");
 const descriptors = @import("descriptors.zig");
-const memory = @import("memory/allocator.zig");
+const memory = @import("../memory/allocator.zig");
 
 pub const InitError = error{
     ZeroFrames,

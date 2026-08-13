@@ -1,9 +1,9 @@
 const std = @import("std");
 const vk = @import("vulkan");
 const zm = @import("zmath");
-const Context = @import("context.zig").Context;
+const Context = @import("../device/context.zig").Context;
 const descriptors = @import("descriptors.zig");
-const memory = @import("memory/allocator.zig");
+const memory = @import("../memory/allocator.zig");
 const per_frame = @import("per_frame.zig");
 const uniforms = @import("uniforms.zig");
 

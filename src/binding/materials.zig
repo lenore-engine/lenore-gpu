@@ -1,10 +1,10 @@
 const std = @import("std");
 const vk = @import("vulkan");
-const buffer_module = @import("buffer.zig");
-const Context = @import("context.zig").Context;
+const buffer_module = @import("../object/buffer.zig");
+const Context = @import("../device/context.zig").Context;
 const descriptors = @import("descriptors.zig");
 const MaterialInfo = @import("lenore-resources").MaterialInfo;
-const memory = @import("memory/allocator.zig");
+const memory = @import("../memory/allocator.zig");
 
 const Buffer = buffer_module.Buffer;
 const UvTransform = MaterialInfo.TextureMaps.UvTransform;

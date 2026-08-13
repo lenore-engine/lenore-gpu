@@ -1,9 +1,9 @@
 const std = @import("std");
 const vk = @import("vulkan");
 
-const commands = @import("commands.zig");
-const Context = @import("context.zig").Context;
-const staging = @import("staging/pool.zig");
+const commands = @import("../device/commands.zig");
+const Context = @import("../device/context.zig").Context;
+const staging = @import("pool.zig");
 
 const StagingPool = staging.StagingPool;
 

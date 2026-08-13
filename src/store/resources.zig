@@ -1,9 +1,9 @@
 const std = @import("std");
 
-const mesh_module = @import("mesh/resource.zig");
+const mesh_module = @import("../object/mesh.zig");
 const pool_module = @import("pool.zig");
-const storage_module = @import("storage.zig");
-const texture_cache = @import("texture_cache.zig");
+const owning = @import("owning.zig");
+const texture_cache = @import("../object/texture_cache.zig");
 
 const Allocator = std.mem.Allocator;
 const Bound = texture_cache.Bound;
@@ -23,7 +23,7 @@ pub const TextureSet = struct {
     occlusion: Bound,
 };
 
-pub const MeshHandle = storage_module.OwningStorage(Mesh).Handle;
+pub const MeshHandle = owning.OwningStorage(Mesh).Handle;
 pub const TextureSetHandle = pool_module.ResourcePool(TextureSet).Handle;
 
 // The scene's resource tables.
@@ -36,7 +36,7 @@ pub const TextureSetHandle = pool_module.ResourcePool(TextureSet).Handle;
 // That asymmetry is why the two use different containers rather than one
 // generic table.
 pub const ResourceStorage = struct {
-    meshes: storage_module.OwningStorage(Mesh),
+    meshes: owning.OwningStorage(Mesh),
     texture_sets: pool_module.ResourcePool(TextureSet),
 
     pub const empty: ResourceStorage = .{ .meshes = .empty, .texture_sets = .empty };

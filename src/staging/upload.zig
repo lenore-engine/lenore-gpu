@@ -1,14 +1,14 @@
 const std = @import("std");
 const vk = @import("vulkan");
 
-const Context = @import("context.zig").Context;
-const memory = @import("memory/allocator.zig");
-const mesh_module = @import("mesh/resource.zig");
-const pool_module = @import("pool.zig");
-const resource_storage = @import("resource_storage.zig");
-const sampler_module = @import("sampler.zig");
-const staging = @import("staging/pool.zig");
-const texture_cache = @import("texture_cache.zig");
+const Context = @import("../device/context.zig").Context;
+const memory = @import("../memory/allocator.zig");
+const mesh_module = @import("../object/mesh.zig");
+const pool_module = @import("../store/pool.zig");
+const resource_storage = @import("../store/resources.zig");
+const sampler_module = @import("../object/sampler.zig");
+const staging = @import("pool.zig");
+const texture_cache = @import("../object/texture_cache.zig");
 const transfer_module = @import("transfer.zig");
 
 const Allocator = std.mem.Allocator;

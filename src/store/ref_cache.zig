@@ -19,7 +19,7 @@ pub const DeinitStatus = enum {
 // stays resident past zero references, for what is preloaded once and kept hot.
 //
 // This is the lifetime layer for shared assets, deliberately separate from
-// OwningStorage in storage.zig, which gives handles to uniquely owned resources
+// OwningStorage in owning.zig, which gives handles to uniquely owned resources
 // with no sharing at all.
 //
 // T must expose pub fn deinit(*T) void, the same shape OwningStorage requires.

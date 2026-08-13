@@ -1,5 +1,5 @@
 const std = @import("std");
-const material_storage = @import("material_storage.zig");
+const materials = @import("binding/materials.zig");
 
 // The host account of what a main-pass fragment stage computes from a material.
 // It calls no Vulkan and holds no device state, so the arithmetic the picture
@@ -11,7 +11,7 @@ const material_storage = @import("material_storage.zig");
 //
 // It stays in this module although nothing in `src/` calls it, and the reason
 // is the record it reads. Every function here interprets a field of
-// `material_storage.MaterialData`, whose packing this module owns and whose
+// `materials.MaterialData`, whose packing this module owns and whose
 // meaning is fixed by the same specification section. Splitting the two would
 // put a layout and its interpretation in different repositories.
 //
@@ -63,13 +63,13 @@ pub const Surface = struct {
     // texture and assigns roughness to green and metalness to blue. An absent
     // texture has value 1.0. The presence mask selects that value explicitly;
     // the fallback image's texel is not part of the material arithmetic.
-    pub fn fromMaterial(material: material_storage.MaterialData, samples: MaterialSamples) Surface {
+    pub fn fromMaterial(material: materials.MaterialData, samples: MaterialSamples) Surface {
         var base: [3]f32 = undefined;
         inline for (0..3) |channel|
             base[channel] = samples.base_colour[channel] * material.base_colour_factor[channel];
 
         const has_metallic_roughness =
-            material.flags[2] & material_storage.texture_present.metallic_roughness != 0;
+            material.flags[2] & materials.texture_present.metallic_roughness != 0;
         const metallic_sample = if (has_metallic_roughness) samples.metallic_roughness[2] else 1.0;
         const roughness_sample = if (has_metallic_roughness) samples.metallic_roughness[1] else 1.0;
 
@@ -132,9 +132,9 @@ pub const Coverage = struct {
 //
 // The mode is the material's first flag lane, packed as the ordinal of
 // `MaterialInfo.Rendering.AlphaMode` and pinned to it by the asserts in
-// material_storage.zig. An unknown value cannot arrive: the lane is written from
+// binding/materials.zig. An unknown value cannot arrive: the lane is written from
 // that enum and nothing else writes the buffer.
-pub fn coverage(material: material_storage.MaterialData, sampled_alpha: f32) Coverage {
+pub fn coverage(material: materials.MaterialData, sampled_alpha: f32) Coverage {
     const alpha = sampled_alpha * material.base_colour_factor[3];
     return switch (material.alphaMode()) {
         .@"opaque" => .{ .alpha = 1, .discarded = false },
@@ -150,8 +150,8 @@ pub fn coverage(material: material_storage.MaterialData, sampled_alpha: f32) Cov
 // is display-encoded by the asset but arrives here after sRGB decoding. glTF 2.0
 // section 3.9.3 makes its linear RGB a multiplier of the emissive factor; an
 // absent texture has value 1.0.
-pub fn emissive(material: material_storage.MaterialData, sampled: [3]f32) [3]f32 {
-    const has_texture = material.flags[2] & material_storage.texture_present.emissive != 0;
+pub fn emissive(material: materials.MaterialData, sampled: [3]f32) [3]f32 {
+    const has_texture = material.flags[2] & materials.texture_present.emissive != 0;
     var out: [3]f32 = undefined;
     inline for (0..3) |channel| {
         const texture_value = if (has_texture) sampled[channel] else 1.0;
@@ -208,12 +208,12 @@ pub const TangentFrame = struct {
 // scales X and Y, then normalizes. Section 3.7.2.1 defines the bitangent as
 // cross(normal, tangent) multiplied by tangent W.
 pub fn normalFromMaterial(
-    material: material_storage.MaterialData,
+    material: materials.MaterialData,
     sampled: [3]f32,
     frame: TangentFrame,
 ) [3]f32 {
     const normal = normalize(frame.normal);
-    if (material.flags[2] & material_storage.texture_present.normal == 0)
+    if (material.flags[2] & materials.texture_present.normal == 0)
         return normal;
 
     const tangent_direction = [3]f32{ frame.tangent[0], frame.tangent[1], frame.tangent[2] };
@@ -399,8 +399,8 @@ pub fn imageBasedLight(surface: Surface, n_dot_v: f32, samples: EnvironmentSampl
 // The absent case is taken from the presence mask rather than from the
 // fallback texel. Both answer 1.0, and the mask is what lets the shader skip
 // the fetch.
-pub fn occlusion(material: material_storage.MaterialData, sampled_red: f32) f32 {
-    if (material.flags[2] & material_storage.texture_present.occlusion == 0) return 1;
+pub fn occlusion(material: materials.MaterialData, sampled_red: f32) f32 {
+    if (material.flags[2] & materials.texture_present.occlusion == 0) return 1;
     const strength = material.emissive_factor[3];
     return 1 + strength * (sampled_red - 1);
 }

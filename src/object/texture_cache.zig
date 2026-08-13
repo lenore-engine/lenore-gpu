@@ -1,14 +1,14 @@
 const std = @import("std");
 const vk = @import("vulkan");
 
-const Context = @import("context.zig").Context;
+const Context = @import("../device/context.zig").Context;
 const image_module = @import("image.zig");
 const ktx2 = @import("ktx2.zig");
-const memory = @import("memory/allocator.zig");
-const ref_cache = @import("ref_cache.zig");
-const retirement = @import("retirement.zig");
+const memory = @import("../memory/allocator.zig");
+const ref_cache = @import("../store/ref_cache.zig");
+const retirement = @import("../store/retirement.zig");
 const sampler_module = @import("sampler.zig");
-const transfer_module = @import("transfer.zig");
+const transfer_module = @import("../staging/transfer.zig");
 
 const log = std.log.scoped(.vulkan);
 

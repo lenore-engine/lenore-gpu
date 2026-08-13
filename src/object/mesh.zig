@@ -2,11 +2,11 @@ const std = @import("std");
 const vk = @import("vulkan");
 
 const res = @import("lenore-resources");
-const buffer_module = @import("../buffer.zig");
-const Context = @import("../context.zig").Context;
+const buffer_module = @import("buffer.zig");
+const Context = @import("../device/context.zig").Context;
 const memory = @import("../memory/allocator.zig");
 const staging = @import("../staging/pool.zig");
-const transfer_module = @import("../transfer.zig");
+const transfer_module = @import("../staging/transfer.zig");
 const vertex_module = @import("vertex.zig");
 
 const Buffer = buffer_module.Buffer;

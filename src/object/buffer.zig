@@ -1,7 +1,7 @@
 const std = @import("std");
 const vk = @import("vulkan");
-const Context = @import("context.zig").Context;
-const memory = @import("memory/allocator.zig");
+const Context = @import("../device/context.zig").Context;
+const memory = @import("../memory/allocator.zig");
 
 // Whole-buffer helpers begin at the first byte of each bound resource.
 const buffer_start: vk.DeviceSize = 0;

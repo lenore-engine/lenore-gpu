@@ -1,8 +1,8 @@
 const std = @import("std");
 const vk = @import("vulkan");
-const buffer_module = @import("../buffer.zig");
+const buffer_module = @import("../object/buffer.zig");
 const placement = @import("staging-placement");
-const Context = @import("../context.zig").Context;
+const Context = @import("../device/context.zig").Context;
 const memory = @import("../memory/allocator.zig");
 
 const Allocator = std.mem.Allocator;

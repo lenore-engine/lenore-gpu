@@ -1,6 +1,6 @@
 const std = @import("std");
 const vk = @import("vulkan");
-const Context = @import("context.zig").Context;
+const Context = @import("../device/context.zig").Context;
 
 // The main pass renders linear radiance into an HDR target that the post pass
 // then samples and tonemaps. The swapchain image is not here: the main pass
