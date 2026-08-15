@@ -214,7 +214,7 @@ pub const ShadowPass = struct {
                     // makes the map the nearest caster rather than the last one
                     // drawn.
                     .mode = .solid,
-                    .streams = .{ .skinned = skinned },
+                    .vertex_input = pipeline.vertexInput(.{ .skinned = skinned }),
                     .culling = culling,
                     .formats = .{ .depth = format },
                     .layout = layout,

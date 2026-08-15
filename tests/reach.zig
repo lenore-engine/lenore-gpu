@@ -118,6 +118,20 @@ test "the device-facing surface is compiled" {
     _ = &gpu.Mesh.bind;
     _ = &gpu.Mesh.draw;
 
+    _ = &gpu.Renderer.beginPost;
+    _ = &gpu.Renderer.endPost;
+
+    _ = &gpu.UiPass.init;
+    _ = &gpu.UiPass.deinit;
+    _ = &gpu.UiPass.storage;
+    _ = &gpu.UiPass.record;
+    _ = &gpu.UiRegistry.init;
+    _ = &gpu.UiRegistry.deinit;
+    _ = &gpu.UiRegistry.add;
+    _ = &gpu.UiRegistry.remove;
+    _ = &gpu.UiRegistry.descriptorSet;
+    _ = &gpu.UiRegistry.count;
+
     _ = &gpu.MorphPass.init;
     _ = &gpu.MorphPass.deinit;
     _ = &gpu.MorphPass.register;

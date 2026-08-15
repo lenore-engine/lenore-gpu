@@ -160,6 +160,13 @@ pub fn PerFrame(comptime T: type) type {
             return self.storage.handle;
         }
 
+        // The buffer itself, for the calls that take one rather than a handle.
+        // A ring whose usage names a transfer source is copied from by
+        // `Image.recordCopyFrom`, and that is what it asks for.
+        pub fn storageBuffer(self: *const Self) *const buffer.Buffer {
+            return &self.storage;
+        }
+
         // What a bound descriptor adds to reach `frame`. A multiple of the
         // device's offset alignment by construction of `stride`.
         pub fn dynamicOffset(self: *const Self, frame: usize) u32 {

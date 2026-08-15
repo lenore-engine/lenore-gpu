@@ -61,6 +61,22 @@ pub fn ResourcePool(comptime T: type) type {
             }
         };
 
+        // Which slot a live handle names, or null if it names none.
+        //
+        // For a system that keeps a fixed array parallel to the slots and wants
+        // to index it by the same number the pool chose. A registry holding one
+        // descriptor set per slot is the case: the set is allocated once and
+        // stays attached to the slot, so the alternative is a second free list
+        // tracking the same reuse this one already tracks.
+        //
+        // Valid only while the handle is live. The number is reused after a
+        // remove, which is what the generation in the handle exists to detect,
+        // so it is resolved through the same liveness check as `get`.
+        pub fn slotIndex(self: *const Self, handle: Handle) ?usize {
+            _ = liveSlot(self.slots.items, handle) orelse return null;
+            return handle.index();
+        }
+
         const Slot = struct {
             value: T,
             generation: Generation,

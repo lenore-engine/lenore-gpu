@@ -514,6 +514,10 @@ fn supportsRequiredFeatures(instance: Instance, physical_device: vk.PhysicalDevi
         core.sample_rate_shading != .true or
         core.texture_compression_bc != .true or
         core.shader_storage_image_extended_formats != .true or
+        // Subpixel text has one coverage per colour channel, and a single
+        // alpha cannot scale the destination by three different amounts. The
+        // second source output carries them, which is what this feature admits.
+        core.dual_src_blend != .true or
         vulkan_13.dynamic_rendering != .true or
         vulkan_13.synchronization_2 != .true or
         // The masked alpha path discards, and Slang lowers `discard` to
@@ -593,6 +597,7 @@ fn createDevice(instance: Instance, candidate: DeviceCandidate) InstanceWrapper.
             .sample_rate_shading = .true,
             .texture_compression_bc = .true,
             .shader_storage_image_extended_formats = .true,
+            .dual_src_blend = .true,
             .pipeline_statistics_query = if (candidate.pipeline_statistics) .true else .false,
         },
     };

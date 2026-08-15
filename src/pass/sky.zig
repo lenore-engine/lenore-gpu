@@ -76,7 +76,7 @@ pub fn config(
 ) pipeline.Config {
     return .{
         .mode = .background,
-        .streams = null,
+        .vertex_input = .none,
         .culling = .{ .fixed = .{} },
         .formats = formats,
         .layout = layout,

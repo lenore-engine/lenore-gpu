@@ -183,3 +183,96 @@ test "a described name stops at the padding the specification defines" {
     const empty: [8]u8 = @splat(0);
     try std.testing.expectEqualStrings("", gpu.pipelineDescribedName(&empty));
 }
+
+test "the overlay composites premultiplied source and keeps the destination's coverage" {
+    const overlay = gpu.pipelineBlendAttachment(.overlay);
+    const blended = gpu.pipelineBlendAttachment(.blended);
+
+    // The source axis. These vertices carry colour already multiplied by their
+    // coverage, so asking the blend unit to multiply again would darken every
+    // translucent pixel by its own alpha.
+    try testing.expectEqual(vk.Bool32.true, overlay.blend_enable);
+    try testing.expectEqual(vk.BlendFactor.one, overlay.src_color_blend_factor);
+    try testing.expectEqual(vk.BlendFactor.src_alpha, blended.src_color_blend_factor);
+
+    // The destination axis, and the whole reason this mode needs a device
+    // feature: subpixel text covers each colour channel by a different amount,
+    // so what the destination is scaled down by is a colour and not an alpha.
+    // The second source output carries it, and for everything that is not text
+    // it holds the alpha in all three channels, which is what makes this the
+    // same arithmetic as `blended` without a second pipeline.
+    try testing.expectEqual(vk.BlendFactor.one_minus_src1_color, overlay.dst_color_blend_factor);
+    try testing.expectEqual(vk.BlendFactor.one_minus_src_alpha, blended.dst_color_blend_factor);
+
+    // And the alpha axis: the modes that write an opaque target replace its
+    // alpha, which drawing on top of one must not do.
+    try testing.expectEqual(vk.BlendFactor.one_minus_src1_alpha, overlay.dst_alpha_blend_factor);
+    try testing.expectEqual(vk.BlendFactor.zero, blended.dst_alpha_blend_factor);
+}
+
+// Both factors have to name the second source or neither does. A mode that
+// scaled the colour by `src1` and the alpha by `src` would composite the
+// channels against one coverage and the alpha against another, which is a
+// picture that is wrong by a fraction of a pixel at every glyph edge and looks
+// almost right.
+test "the overlay reads the second source on both axes" {
+    const overlay = gpu.pipelineBlendAttachment(.overlay);
+    const uses_src1 = [_]vk.BlendFactor{ .one_minus_src1_color, .one_minus_src1_alpha };
+
+    var colour_found = false;
+    var alpha_found = false;
+    for (uses_src1) |factor| {
+        if (overlay.dst_color_blend_factor == factor) colour_found = true;
+        if (overlay.dst_alpha_blend_factor == factor) alpha_found = true;
+    }
+    try testing.expect(colour_found and alpha_found);
+
+    // And no other mode does, because none of them writes a second output.
+    for ([4]gpu.PipelineMode{ .solid, .blended, .background, .additive }) |mode| {
+        const attachment = gpu.pipelineBlendAttachment(mode);
+        for (uses_src1) |factor| {
+            try testing.expect(attachment.dst_color_blend_factor != factor);
+            try testing.expect(attachment.dst_alpha_blend_factor != factor);
+            try testing.expect(attachment.src_color_blend_factor != factor);
+            try testing.expect(attachment.src_alpha_blend_factor != factor);
+        }
+    }
+}
+
+test "the two modes that declare no depth attachment test nothing" {
+    // `create` reaches the depth state only when the rendering declares a depth
+    // attachment. Neither of these does, so what they say about depth has to be
+    // inert rather than merely unused.
+    for ([2]gpu.PipelineMode{ .additive, .overlay }) |mode| {
+        const state = gpu.pipelineDepthStencilState(mode);
+        try testing.expectEqual(vk.Bool32.false, state.depth_test_enable);
+        try testing.expectEqual(vk.Bool32.false, state.depth_write_enable);
+        try testing.expectEqual(vk.CompareOp.always, state.depth_compare_op);
+    }
+}
+
+test "a described vertex input reaches the pipeline unchanged" {
+    // The generalisation the UI pass needs: an input this module did not derive
+    // from a mesh's streams still arrives at creation as it was written.
+    var input: gpu.PipelineVertexInput = .none;
+    input.binding_count = 1;
+    input.bindings[0] = .{ .binding = 0, .stride = 24, .input_rate = .vertex };
+    input.attribute_count = 1;
+    input.attributes[0] = .{ .location = 0, .binding = 0, .format = .r32g32_sfloat, .offset = 0 };
+
+    const config = gpu.PipelineConfig{
+        .mode = .overlay,
+        .vertex_input = input,
+        .culling = .{ .fixed = .{} },
+        .formats = .{ .colour = .b8g8r8a8_srgb },
+        .layout = .null_handle,
+        .stages = .{ .vertex = .{ .module = .null_handle, .entry_point = "vertexMain" } },
+    };
+    try testing.expectEqual(1, config.vertex_input.binding_count);
+    try testing.expectEqual(24, config.vertex_input.bindings[0].stride);
+    try testing.expectEqual(vk.Format.r32g32_sfloat, config.vertex_input.attributes[0].format);
+
+    // Nothing reads a buffer through `none`, which is what a fullscreen stage
+    // declares.
+    try testing.expectEqual(0, gpu.PipelineVertexInput.none.binding_count);
+}

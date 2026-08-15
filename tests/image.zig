@@ -17,6 +17,33 @@ test "a depth view carries the depth aspect and never the colour one" {
     try testing.expect(!colour.depth_bit);
 }
 
+test "re-entering a transfer preserves the image where a fresh upload discards it" {
+    const fragment: vk.PipelineStageFlags2 = .{ .fragment_shader_bit = true };
+    const again = gpu.LayoutTransition.fromShaderRead(fragment);
+    const fresh = gpu.LayoutTransition.to_transfer_destination;
+
+    // The one difference that matters is the source layout. An undefined source
+    // is what lets a driver throw the contents away, so an image written a
+    // region at a time cannot use the fresh form and keep the other regions.
+    try testing.expectEqual(vk.ImageLayout.undefined, fresh.old_layout);
+    try testing.expectEqual(vk.ImageLayout.shader_read_only_optimal, again.old_layout);
+    try testing.expectEqual(vk.ImageLayout.transfer_dst_optimal, again.new_layout);
+
+    // Write-after-read: the sampling has to finish before the copy starts, and
+    // there is no write to make available. An access mask here would name a
+    // read, which no availability operation acts on.
+    try testing.expectEqual(fragment, again.src_stage_mask);
+    try testing.expectEqual(vk.AccessFlags2{}, again.src_access_mask);
+    try testing.expectEqual(vk.PipelineStageFlags2{ .copy_bit = true }, again.dst_stage_mask);
+    try testing.expectEqual(vk.AccessFlags2{ .transfer_write_bit = true }, again.dst_access_mask);
+
+    // And the way back is the existing one, which is a read-after-write and
+    // therefore does carry both masks.
+    const back = gpu.LayoutTransition.toShaderRead(fragment);
+    try testing.expectEqual(again.new_layout, back.old_layout);
+    try testing.expectEqual(vk.AccessFlags2{ .transfer_write_bit = true }, back.src_access_mask);
+}
+
 test "a cube map is six layers, cube-compatible, and viewed as a cube" {
     // The three properties have to agree or the image is unusable: Vulkan
     // refuses a cube view of an image created without the flag, and a view

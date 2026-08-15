@@ -718,7 +718,7 @@ pub const Renderer = struct {
                         std.debug.assert(scenePipelineIndex(variant, mode) == created);
                         scene_pipelines[created] = try pipeline.create(context, .{
                             .mode = mode,
-                            .streams = variant.streams(),
+                            .vertex_input = pipeline.vertexInput(variant.streams()),
                             .culling = .dynamic,
                             .formats = .{ .colour = hdr.format, .depth = depth.format },
                             .layout = scene_layout,
@@ -1417,19 +1417,36 @@ pub const Renderer = struct {
         self.bloom_chains += 1;
     }
 
+    // Opens the rendering that presents, and takes the acquired image from
+    // whatever the presentation engine left it in.
+    //
+    // Split from the draw for the reason the main pass is: what else is
+    // composited onto the presentable image, and in what order, is the caller's
+    // sequence rather than this one's. An overlay drawn in display colour goes
+    // between `recordPost` and `endPost`; there is nowhere else it can go, since
+    // before the tone operator is scene radiance and after `endPost` the image
+    // belongs to presentation.
+    pub fn beginPost(self: *Renderer, command_buffer: vk.CommandBuffer, target: post.Target) void {
+        post.begin(self.context, command_buffer, target);
+    }
+
+    // Closes the rendering and hands the image to the presentation engine.
+    pub fn endPost(self: *Renderer, command_buffer: vk.CommandBuffer, target: post.Target) void {
+        post.end(self.context, command_buffer, target);
+    }
+
     // The pass that presents: the HDR target tone mapped into the image the
-    // swapchain handed over. Last, and the only stage that names that image.
+    // swapchain handed over. Recorded between `beginPost` and `endPost`, and
+    // the only stage that writes every pixel of that image.
     pub fn recordPost(
         self: *Renderer,
         command_buffer: vk.CommandBuffer,
-        target: post.Target,
         frame_plan: RecordPlan,
     ) void {
         const look = frame_plan.look;
         const post_constants = frame_plan.post_constants;
         const device = self.context.device;
 
-        post.begin(self.context, command_buffer, target);
         device.cmdBindPipeline(
             command_buffer,
             .graphics,
@@ -1452,7 +1469,6 @@ pub const Renderer = struct {
             @ptrCast(&post_constants),
         );
         device.cmdDraw(command_buffer, post.vertex_count, 1, 0, 0);
-        post.end(self.context, command_buffer, target);
     }
 };
 
@@ -1513,7 +1529,7 @@ fn postConfig(
 ) pipeline.Config {
     return .{
         .mode = .solid,
-        .streams = null,
+        .vertex_input = .none,
         .culling = .{ .fixed = .{} },
         .formats = .{ .colour = format },
         .layout = layout,

@@ -1,6 +1,5 @@
 const std = @import("std");
 const vk = @import("vulkan");
-const res = @import("lenore-resources");
 const gpu = @import("lenore-gpu");
 
 const testing = std.testing;
@@ -47,7 +46,7 @@ test "the background reads no vertex buffer and no depth bias" {
 
     // Three vertices out of the vertex index. Declaring a binding that nothing
     // binds is a draw-time error and not a creation-time one.
-    try testing.expectEqual(@as(?res.VertexStreams, null), config.streams);
+    try testing.expectEqual(0, config.vertex_input.binding_count);
     try testing.expectEqual(@as(u32, 3), gpu.Sky.vertex_count);
 
     // The bias belongs to the shadow bake. Offsetting a background that is

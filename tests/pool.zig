@@ -150,3 +150,30 @@ test "a failed insert leaves the pool unchanged and remove stays allocation-free
     try testing.expect(failing.has_induced_failure);
     try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
+
+test "a slot index is dense, reused, and refused for a stale handle" {
+    const allocator = testing.allocator;
+    var pool: Pool = .empty;
+    defer pool.deinit(allocator);
+
+    // What a registry keeping one descriptor set per slot depends on: the
+    // indices the pool hands out fill from zero, so an array sized to the live
+    // capacity is always big enough to be indexed by them.
+    const first = try pool.add(allocator, 10);
+    const second = try pool.add(allocator, 20);
+    const third = try pool.add(allocator, 30);
+    try testing.expectEqual(@as(?usize, 0), pool.slotIndex(first));
+    try testing.expectEqual(@as(?usize, 1), pool.slotIndex(second));
+    try testing.expectEqual(@as(?usize, 2), pool.slotIndex(third));
+
+    // A released slot is handed out again, so the parallel array entry is
+    // reused with it rather than leaking.
+    try testing.expectEqual(@as(?u32, 20), pool.remove(second));
+    const replacement = try pool.add(allocator, 40);
+    try testing.expectEqual(@as(?usize, 1), pool.slotIndex(replacement));
+
+    // And the handle that named that slot before no longer resolves, which is
+    // what stops a stale command from reaching a live descriptor set.
+    try testing.expectEqual(@as(?usize, null), pool.slotIndex(second));
+    try testing.expectEqual(@as(?usize, null), pool.slotIndex(.invalid));
+}

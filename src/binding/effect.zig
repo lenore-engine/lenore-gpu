@@ -3,7 +3,6 @@ const vk = @import("vulkan");
 
 const Context = @import("../device/context.zig").Context;
 const pipeline = @import("pipeline.zig");
-const res = @import("lenore-resources");
 
 // One consumer's shader modules, pipeline layouts and pipelines, declared as a
 // table and torn down as a unit.
@@ -38,9 +37,11 @@ pub const Graphics = struct {
     fragment: [*:0]const u8,
     mode: pipeline.Mode,
     culling: pipeline.Culling,
-    // Null for a vertex stage that reads no buffer, which every fullscreen
-    // triangle is. See `pipeline.Config`.
-    streams: ?res.VertexStreams = null,
+    // What the vertex stage reads. The default reads no buffer, which every
+    // fullscreen triangle is. A pipeline drawing a mesh passes
+    // `pipeline.vertexInput(streams)`; one with a vertex of its own describes
+    // it directly. See `pipeline.VertexInput`.
+    vertex_input: pipeline.VertexInput = .none,
     depth_bias: ?pipeline.DepthBias = null,
 };
 
@@ -181,7 +182,7 @@ pub fn ShaderEffect(comptime declaration: anytype) type {
                     }),
                     .graphics => |graphics| try pipeline.create(context, .{
                         .mode = graphics.mode,
-                        .streams = graphics.streams,
+                        .vertex_input = graphics.vertex_input,
                         .culling = graphics.culling,
                         .formats = config.formats,
                         .layout = layout,

@@ -288,7 +288,7 @@ pub fn downConfig(
 ) pipeline.Config {
     return .{
         .mode = .solid,
-        .streams = null,
+        .vertex_input = .none,
         .culling = .{ .fixed = .{} },
         .formats = .{ .colour = format },
         .layout = layout,
@@ -309,7 +309,7 @@ pub fn upConfig(
 ) pipeline.Config {
     return .{
         .mode = .additive,
-        .streams = null,
+        .vertex_input = .none,
         .culling = .{ .fixed = .{} },
         .formats = .{ .colour = format },
         .layout = layout,

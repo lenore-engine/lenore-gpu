@@ -120,6 +120,24 @@ pub const Config = struct {
     usage: vk.ImageUsageFlags,
     kind: Kind = .colour,
     shape: Shape = .texture_2d,
+
+    // How the sampled view presents the stored channels. The default takes each
+    // as it lies, which is what every image whose format matches its use wants.
+    //
+    // It is here rather than at the one call site that needs something else
+    // because the view is created inside `init` and there is no other way to
+    // reach it. `createMipView` keeps the identity mapping whatever this says:
+    // that view serves a pass rendering into one level and a descriptor reading
+    // one level of a chain, and both want the channels as they are stored.
+    components: vk.ComponentMapping = identity_components,
+};
+
+// Named once so the two view creations cannot drift apart.
+const identity_components: vk.ComponentMapping = .{
+    .r = .identity,
+    .g = .identity,
+    .b = .identity,
+    .a = .identity,
 };
 
 // One buffer-to-image copy: a run of rows of one array layer of one mip level.
@@ -187,6 +205,30 @@ pub const LayoutTransition = struct {
             .src_access_mask = .{ .transfer_write_bit = true },
             .dst_stage_mask = stage_mask,
             .dst_access_mask = .{ .shader_sampled_read_bit = true },
+        };
+    }
+
+    // Taking an image that shaders have been reading back for another upload,
+    // keeping what is already in it. `to_transfer_destination` cannot serve
+    // this: its undefined source layout is what makes it free, and it discards
+    // every texel. An image written region by region over many frames needs the
+    // regions that are not being written to survive.
+    //
+    // The source access mask is empty and that is the precise mask rather than
+    // an omission. Vulkan specification, Synchronization and Cache Control,
+    // "Execution and Memory Dependencies": "Write-after-read hazards can be
+    // solved with just an execution dependency". The earlier access is a
+    // sampled read, so there is nothing to make available; what has to hold is
+    // that the read completes before the copy starts, and the stage masks are
+    // what say so.
+    pub fn fromShaderRead(stage_mask: vk.PipelineStageFlags2) LayoutTransition {
+        return .{
+            .old_layout = .shader_read_only_optimal,
+            .new_layout = .transfer_dst_optimal,
+            .src_stage_mask = stage_mask,
+            .src_access_mask = .{},
+            .dst_stage_mask = .{ .copy_bit = true },
+            .dst_access_mask = .{ .transfer_write_bit = true },
         };
     }
 };
@@ -268,7 +310,7 @@ pub const Image = struct {
             .image = handle,
             .view_type = config.shape.viewType(),
             .format = config.format,
-            .components = .{ .r = .identity, .g = .identity, .b = .identity, .a = .identity },
+            .components = config.components,
             .subresource_range = .{
                 .aspect_mask = config.kind.aspect(),
                 .base_mip_level = base_mip_level,
@@ -322,7 +364,7 @@ pub const Image = struct {
             .image = self.handle,
             .view_type = self.shape.viewType(),
             .format = self.format,
-            .components = .{ .r = .identity, .g = .identity, .b = .identity, .a = .identity },
+            .components = identity_components,
             .subresource_range = .{
                 .aspect_mask = self.kind.aspect(),
                 .base_mip_level = level,

@@ -16,6 +16,9 @@ pub const InitError = error{
     InvalidSurfaceDimensions,
     NoAvailablePresentModes,
     NoAvailableSurfaceFormats,
+    // The surface offers no format without a transfer function of its own. See
+    // `display_formats`.
+    NoDisplayEncodedFormat,
     NoSupportedCompositeAlpha,
     UnsupportedSurfaceUsage,
 } || Allocator.Error ||
@@ -235,6 +238,9 @@ pub const Swapchain = struct {
 
     // Records a clear of one swapchain image and leaves it ready to present.
     //
+    // The colour is what the display shows rather than radiance: the format
+    // carries no transfer function, so nothing converts this on the way in.
+    //
     // Three commands, and the two barriers are what make it correct rather than
     // the clear itself. The image has to reach the layout a transfer write
     // requires and then the one presentation requires.
@@ -412,27 +418,46 @@ fn deinitSwapchainImages(
     allocator.free(images);
 }
 
+// The presentable image is display-encoded, and it is the shader that encodes.
+//
+// An `_SRGB` attachment would do the conversion in hardware, and it would also
+// blend in linear light: the specification linearises the destination before
+// blending and re-encodes it afterwards (Vulkan specification, "Blending"). A
+// scene composited that way is right and an overlay composited that way is not.
+// Coverage is a fraction of a pixel covered by ink, not a quantity of light, so
+// a glyph edge at half coverage has to land half way up the display's scale
+// rather than half way up the radiance it stands for.
+//
+// So the format carries no transfer function, the colour space still says the
+// contents are sRGB, and the tone operator writes what the display shows. What
+// this rules out is a host offering neither of these: encoding twice would wash
+// the whole picture out, which is a wrong picture rather than a failure, and
+// that is the trade this refuses to make.
+const display_formats = [_]vk.Format{ .b8g8r8a8_unorm, .r8g8b8a8_unorm };
+
 fn findSurfaceFormat(
     context: *const Context,
     allocator: Allocator,
 ) (Allocator.Error ||
     vk.InstanceWrapper.GetPhysicalDeviceSurfaceFormatsAllocKHRError ||
-    error{NoAvailableSurfaceFormats})!vk.SurfaceFormatKHR {
-    const preferred = vk.SurfaceFormatKHR{
-        .format = .b8g8r8a8_srgb,
-        .color_space = .srgb_nonlinear_khr,
-    };
+    error{ NoAvailableSurfaceFormats, NoDisplayEncodedFormat })!vk.SurfaceFormatKHR {
     const formats = try context.instance.getPhysicalDeviceSurfaceFormatsAllocKHR(
         context.physical_device,
         context.surface,
         allocator,
     );
     defer allocator.free(formats);
-
-    for (formats) |format|
-        if (std.meta.eql(format, preferred)) return preferred;
     if (formats.len == 0) return error.NoAvailableSurfaceFormats;
-    return formats[0];
+
+    for (display_formats) |wanted| {
+        const preferred = vk.SurfaceFormatKHR{
+            .format = wanted,
+            .color_space = .srgb_nonlinear_khr,
+        };
+        for (formats) |offered|
+            if (std.meta.eql(offered, preferred)) return preferred;
+    }
+    return error.NoDisplayEncodedFormat;
 }
 
 fn findPresentMode(

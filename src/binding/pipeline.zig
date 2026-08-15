@@ -40,6 +40,22 @@ pub const Mode = enum {
     // where the others answer what a primitive does about depth, this one
     // answers that there is none to do anything about.
     additive,
+
+    // Drawn over a finished picture: premultiplied source over destination,
+    // and no depth either.
+    //
+    // Not `blended`, and the difference is the source factor rather than a
+    // preference. A blended primitive carries straight alpha and the blend unit
+    // multiplies it in; these carry colour already multiplied, which is the
+    // encoding that makes compositing associative, so multiplying again would
+    // darken every translucent pixel by its own coverage.
+    //
+    // The alpha factors are not the `one`/`zero` the modes above use either.
+    // Those overwrite the destination's alpha, which is right for an opaque
+    // target being written once and wrong for something drawn on top: it would
+    // punch the destination's coverage down to the overlay's wherever the
+    // overlay is translucent.
+    overlay,
 };
 
 // glTF's third alpha mode has no pipeline of its own. A masked primitive
@@ -115,11 +131,11 @@ pub const Culling = union(enum) {
 
 pub const Config = struct {
     mode: Mode,
-    // Null for a pipeline whose vertex stage reads no buffer. The fullscreen
-    // triangle is one: its positions come from the vertex index, and declaring
-    // a binding nothing binds is a draw-time error rather than a create-time
-    // one.
-    streams: ?VertexStreams,
+    // What the vertex stage reads. `VertexInput.none` for one that reads no
+    // buffer. Required rather than defaulted: a stage that does read a buffer
+    // and forgets to say so is refused at draw time by the validation layer and
+    // by nothing sooner, which is a long way from the line that caused it.
+    vertex_input: VertexInput,
     culling: Culling,
     formats: Formats,
     layout: vk.PipelineLayout,
@@ -142,16 +158,36 @@ pub const Config = struct {
 // someone is going to read the answer.
 pub const capture_statistics = build_options.capture_shader_statistics;
 
-// The whole set of streams: base, skin, colour and second UV, contributing four
-// attributes, two, one and one.
+// The widest declaration any pipeline in this module makes, which is the mesh's
+// whole set of streams: base, skin, colour and second UV, contributing four
+// attributes, two, one and one. A consumer describing its own vertex stays
+// inside the same bounds.
 pub const max_bindings = 4;
 pub const max_attributes = 8;
 
+// What a pipeline reads per vertex, in the form the driver takes it.
+//
+// A described input rather than a set of mesh streams, because a pipeline's
+// vertex is not always a mesh's. `vertexInput` builds one from the streams a
+// mesh carries, a consumer with its own vertex builds one from its own offsets,
+// and a stage that reads no buffer uses `none`. All three then reach `create`
+// the same way.
 pub const VertexInput = struct {
     bindings: [max_bindings]vk.VertexInputBindingDescription,
     binding_count: u32,
     attributes: [max_attributes]vk.VertexInputAttributeDescription,
     attribute_count: u32,
+
+    // A vertex stage that reads no buffer, which every fullscreen triangle is:
+    // the position comes from the vertex index. Declaring a binding nothing
+    // binds is a draw-time error rather than a create-time one, so this is what
+    // such a pipeline says instead of leaving the field out.
+    pub const none: VertexInput = .{
+        .bindings = undefined,
+        .binding_count = 0,
+        .attributes = undefined,
+        .attribute_count = 0,
+    };
 
     pub fn boundStreams(self: *const VertexInput) []const vk.VertexInputBindingDescription {
         return self.bindings[0..self.binding_count];
@@ -202,17 +238,21 @@ fn addStream(input: *VertexInput, comptime Stream: type) void {
 // which is that same value; a strict comparison would reject all of them and
 // draw nothing at all.
 //
-// The additive mode states no depth behaviour because it has none. `create`
-// hands this structure to the driver only when the rendering info declares a
-// depth attachment, and the bloom chain declares none.
+// The additive and overlay modes state no depth behaviour because they have
+// none. `create` hands this structure to the driver only when the rendering
+// info declares a depth attachment, and neither the bloom chain nor the overlay
+// declares one.
 pub fn depthStencilState(mode: Mode) vk.PipelineDepthStencilStateCreateInfo {
     return .{
-        .depth_test_enable = if (mode == .additive) .false else .true,
+        .depth_test_enable = switch (mode) {
+            .additive, .overlay => .false,
+            .solid, .blended, .background => .true,
+        },
         .depth_write_enable = if (mode == .solid) .true else .false,
         .depth_compare_op = switch (mode) {
             .solid, .blended => .less,
             .background => .less_or_equal,
-            .additive => .always,
+            .additive, .overlay => .always,
         },
         .depth_bounds_test_enable = .false,
         .stencil_test_enable = .false,
@@ -239,20 +279,30 @@ pub fn depthStencilState(mode: Mode) vk.PipelineDepthStencilStateCreateInfo {
 pub fn blendAttachment(mode: Mode) vk.PipelineColorBlendAttachmentState {
     return .{
         .blend_enable = switch (mode) {
-            .blended, .additive => .true,
+            .blended, .additive, .overlay => .true,
             .solid, .background => .false,
         },
         .src_color_blend_factor = switch (mode) {
-            .additive => .one,
+            .additive, .overlay => .one,
             .solid, .blended, .background => .src_alpha,
         },
+        // The overlay scales the destination by the second source output rather
+        // than by the first's alpha, because subpixel text covers each colour
+        // channel by a different amount and one alpha cannot say three things.
+        // The fragment stage writes that output for every draw, and for a solid
+        // fill it is the alpha in all three channels, so the arithmetic is the
+        // same as a single-source blend without a second pipeline to select.
         .dst_color_blend_factor = switch (mode) {
             .additive => .one,
+            .overlay => .one_minus_src1_color,
             .solid, .blended, .background => .one_minus_src_alpha,
         },
         .color_blend_op = .add,
         .src_alpha_blend_factor = .one,
-        .dst_alpha_blend_factor = .zero,
+        .dst_alpha_blend_factor = switch (mode) {
+            .overlay => .one_minus_src1_alpha,
+            .solid, .blended, .background, .additive => .zero,
+        },
         .alpha_blend_op = .add,
         .color_write_mask = .{ .r_bit = true, .g_bit = true, .b_bit = true, .a_bit = true },
     };
@@ -349,12 +399,7 @@ pub fn create(context: *const Context, config: Config) CreateError!vk.Pipeline {
         stage_count = 2;
     }
 
-    const input = if (config.streams) |streams| vertexInput(streams) else VertexInput{
-        .bindings = undefined,
-        .binding_count = 0,
-        .attributes = undefined,
-        .attribute_count = 0,
-    };
+    const input = config.vertex_input;
     const vertex_input_state = vk.PipelineVertexInputStateCreateInfo{
         .vertex_binding_description_count = input.binding_count,
         .p_vertex_binding_descriptions = &input.bindings,

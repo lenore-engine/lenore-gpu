@@ -215,8 +215,8 @@ test "the two directions differ in the fragment stage and in nothing else" {
 
     // Neither reads a vertex buffer, and neither culls: a covering triangle has
     // no back to face away.
-    try testing.expectEqual(@as(?@TypeOf(down.streams.?), null), down.streams);
-    try testing.expectEqual(@as(?@TypeOf(up.streams.?), null), up.streams);
+    try testing.expectEqual(0, down.vertex_input.binding_count);
+    try testing.expectEqual(0, up.vertex_input.binding_count);
     try testing.expectEqual(vk.CullModeFlags{}, down.culling.fixed);
     try testing.expectEqual(vk.CullModeFlags{}, up.culling.fixed);
 
