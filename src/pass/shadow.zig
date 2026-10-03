@@ -92,6 +92,14 @@ pub fn casterVariant(alpha: AlphaMode, skinned: bool) ?Variant {
     };
 }
 
+// The attributes a caster's vertex stage reads, and no others: position and UV
+// at locations 0 and 1, joints and weights at 4 and 5 when skinned. The normal
+// and the tangent share binding 0 with them and stay undeclared, because a depth
+// map records where a surface is and nothing about how it faces.
+pub fn vertexInput(skinned: bool) pipeline.VertexInput {
+    return pipeline.vertexInput(.{ .skinned = skinned }).reading(&.{ 0, 1, 4, 5 });
+}
+
 // The slope-scaled depth bias the casters are rasterized with.
 //
 // Two, and derived rather than tuned. Vulkan scales this factor by the polygon's
@@ -214,7 +222,7 @@ pub const ShadowPass = struct {
                     // makes the map the nearest caster rather than the last one
                     // drawn.
                     .mode = .solid,
-                    .vertex_input = pipeline.vertexInput(.{ .skinned = skinned }),
+                    .vertex_input = vertexInput(skinned),
                     .culling = culling,
                     .formats = .{ .depth = format },
                     .layout = layout,

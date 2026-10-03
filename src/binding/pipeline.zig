@@ -208,6 +208,22 @@ pub const VertexInput = struct {
     pub fn declaredAttributes(self: *const VertexInput) []const vk.VertexInputAttributeDescription {
         return self.attributes[0..self.attribute_count];
     }
+
+    // The same streams with only the attributes at `locations`, for a stage
+    // that reads part of a vertex. The bindings stay whole, because a stride is
+    // the mesh's whatever a stage reads of it. A location this input does not
+    // declare is skipped, so one list serves the variants with and without an
+    // optional stream.
+    pub fn reading(self: VertexInput, locations: []const u32) VertexInput {
+        var input = self;
+        input.attribute_count = 0;
+        for (self.declaredAttributes()) |attribute| {
+            if (std.mem.indexOfScalar(u32, locations, attribute.location) == null) continue;
+            input.attributes[input.attribute_count] = attribute;
+            input.attribute_count += 1;
+        }
+        return input;
+    }
 };
 
 // The bindings and attributes for exactly the streams a mesh carries. The

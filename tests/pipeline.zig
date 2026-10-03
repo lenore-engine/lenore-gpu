@@ -273,6 +273,36 @@ test "the two modes that declare no depth attachment test nothing" {
     }
 }
 
+test "a stage reading part of a vertex keeps the streams whole" {
+    const every = gpu.pipelineVertexInput(.{ .skinned = true });
+    const part = every.reading(&.{ 0, 1, 4, 5 });
+
+    // The bindings are the mesh's, stride included: a stage that declared a
+    // shorter stride would step through the vertices it skipped.
+    try testing.expectEqualSlices(
+        vk.VertexInputBindingDescription,
+        every.boundStreams(),
+        part.boundStreams(),
+    );
+
+    // The kept attributes are the declared ones, offsets and formats as they
+    // were, in the order the input had them.
+    const kept = part.declaredAttributes();
+    try testing.expectEqual(@as(usize, 4), kept.len);
+    for (kept, [_]u32{ 0, 1, 4, 5 }) |attribute, location| {
+        try testing.expectEqual(location, attribute.location);
+        for (every.declaredAttributes()) |original| {
+            if (original.location == location) try testing.expectEqual(original, attribute);
+        }
+    }
+
+    // A location the input does not declare is skipped rather than invented, so
+    // the unskinned variant reads the same list as two attributes.
+    const unskinned = gpu.pipelineVertexInput(.{}).reading(&.{ 0, 1, 4, 5 });
+    try testing.expectEqual(@as(u32, 1), unskinned.binding_count);
+    try testing.expectEqual(@as(u32, 2), unskinned.attribute_count);
+}
+
 test "a described vertex input reaches the pipeline unchanged" {
     // The generalisation the UI pass needs: an input this module did not derive
     // from a mesh's streams still arrives at creation as it was written.
