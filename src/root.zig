@@ -313,6 +313,7 @@ pub const ShaderEffect = effect.ShaderEffect;
 pub const ShaderEffectSpec = effect.Spec;
 pub const ShaderEffectStage = effect.Stage;
 pub const ShaderEffectGraphics = effect.Graphics;
+pub const spirvWords = pipeline.spirvWords;
 pub const PipelineConfig = pipeline.Config;
 pub const PipelineVertexInput = pipeline.VertexInput;
 pub const PipelineLayoutConfig = pipeline.LayoutConfig;

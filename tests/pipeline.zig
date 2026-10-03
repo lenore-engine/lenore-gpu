@@ -16,6 +16,15 @@ const all_streams = [_]res.VertexStreams{
     .{ .skinned = true, .colour = true, .uv1 = true },
 };
 
+// The SPIR-V magic number, little-endian, followed by a version word: the bytes
+// come back as the words they spell on this host, and the count is the words'.
+test "an embedded module reads back as its words" {
+    const words = gpu.spirvWords(&.{ 0x03, 0x02, 0x23, 0x07, 0x00, 0x00, 0x01, 0x00 });
+    try testing.expectEqual(@as(usize, 2), words.len);
+    try testing.expectEqual(@as(u32, 0x07230203), words[0]);
+    try testing.expectEqual(@as(u32, 0x00010000), words[1]);
+}
+
 test "a mesh with no optional stream still binds its positions" {
     const input = gpu.pipelineVertexInput(.{});
 

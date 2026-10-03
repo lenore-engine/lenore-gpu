@@ -322,6 +322,21 @@ pub fn blendAttachment(mode: Mode) vk.PipelineColorBlendAttachmentState {
     };
 }
 
+// An embedded SPIR-V file as the words `createModule` takes:
+// `spirvWords(@embedFile("name"))`.
+//
+// `@embedFile` yields bytes with no alignment of their own, so they are copied
+// into an aligned constant and the reinterpretation is valid rather than merely
+// likely. A length that is not a whole number of words is refused at compile
+// time: dividing would drop the partial word and hand the driver a module
+// shorter than the file, which reads as a corrupt shader rather than as a
+// truncated build output.
+pub fn spirvWords(comptime bytes: []const u8) []const u32 {
+    if (bytes.len % @sizeOf(u32) != 0) @compileError("SPIR-V is a whole number of four-byte words");
+    const aligned: [bytes.len]u8 align(@alignOf(u32)) = bytes[0..bytes.len].*;
+    return @as([*]const u32, @ptrCast(&aligned))[0 .. bytes.len / @sizeOf(u32)];
+}
+
 pub fn createModule(context: *const Context, spirv: []const u32) CreateError!vk.ShaderModule {
     // Vulkan specification, VkShaderModuleCreateInfo: the code is a multiple of
     // four bytes and four-byte aligned. Taking words rather than bytes makes
