@@ -133,7 +133,7 @@ pub const Fallback = enum {
     }
 };
 
-const fallback_count = @typeInfo(Fallback).@"enum".fields.len;
+const fallback_count = @typeInfo(Fallback).@"enum".field_names.len;
 
 // What a descriptor needs to sample one texture: a view and a sampler, resolved
 // separately because an image is deduplicated by content while a sampler is
@@ -268,7 +268,7 @@ pub const TextureCache = struct {
         errdefer for (cache.fallbacks[0..created]) |*owned| rollback(owned, transfer);
 
         for (std.enums.values(Fallback)) |kind| {
-            cache.fallbacks[@intFromEnum(kind)] = try uploadSingleTexel(
+            cache.fallbacks[@backingInt(kind)] = try uploadSingleTexel(
                 context,
                 memory_allocator,
                 transfer,
@@ -297,7 +297,7 @@ pub const TextureCache = struct {
         kind: Fallback,
         config: SamplerConfig,
     ) sampler_module.GetError!Bound {
-        return .of(&self.fallbacks[@intFromEnum(kind)], try self.sampler(config));
+        return .of(&self.fallbacks[@backingInt(kind)], try self.sampler(config));
     }
 
     pub fn sampler(self: *TextureCache, config: SamplerConfig) sampler_module.GetError!vk.Sampler {

@@ -17,8 +17,8 @@ const frame_types = [_]type{
 };
 
 fn holdsHostAllocator(comptime T: type) bool {
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        if (field.type == std.mem.Allocator) return true;
+    inline for (@typeInfo(T).@"struct".field_types) |field_type| {
+        if (field_type == std.mem.Allocator) return true;
     }
     return false;
 }

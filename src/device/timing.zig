@@ -33,7 +33,7 @@ pub const Pass = enum {
     bloom,
     post,
 
-    pub const count = @typeInfo(Pass).@"enum".fields.len;
+    pub const count = @typeInfo(Pass).@"enum".field_names.len;
 };
 
 pub const Edge = enum { begin, end };
@@ -48,15 +48,15 @@ pub const slots_per_frame = Pass.count * 2;
 pub fn slot(frame_index: usize, pass: Pass, edge: Edge) u32 {
     // Widened before the arithmetic. Multiplying in the enum's tag width would
     // otherwise overflow before the value reaches the return type.
-    const ordinal: usize = @intFromEnum(pass);
-    const within = ordinal * 2 + @intFromEnum(edge);
+    const ordinal: usize = @backingInt(pass);
+    const within = ordinal * 2 + @backingInt(edge);
     return @intCast(frame_index * slots_per_frame + within);
 }
 
 // Where a frame's run of slots starts, which the reset and the read address it
 // by. The first pass's, so a pass added ahead of the others moves it with them.
 fn firstSlot(frame_index: usize) u32 {
-    return slot(frame_index, @enumFromInt(0), .begin);
+    return slot(frame_index, @fromBackingInt(@intCast(0)), .begin);
 }
 
 // Nanoseconds between two timestamps of the same pool.
@@ -93,7 +93,7 @@ pub const Frame = struct {
     pass_ns: [Pass.count]u64 = @splat(0),
 
     pub fn get(self: Frame, pass: Pass) u64 {
-        return self.pass_ns[@intFromEnum(pass)];
+        return self.pass_ns[@backingInt(pass)];
     }
 
     pub fn total(self: Frame) u64 {

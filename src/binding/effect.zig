@@ -82,7 +82,7 @@ pub fn ShaderEffect(comptime declaration: anytype) type {
     const module_names = declaration.modules;
     const layout_names = declaration.layouts;
     const Pipelines = @TypeOf(declaration.pipelines);
-    const pipeline_fields = @typeInfo(Pipelines).@"struct".fields;
+    const pipeline_fields = @typeInfo(Pipelines).@"struct".field_names;
 
     comptime {
         if (pipeline_fields.len == 0) @compileError("an effect with no pipelines builds nothing");
@@ -100,12 +100,12 @@ pub fn ShaderEffect(comptime declaration: anytype) type {
                     @compileError("two layouts share the name " ++ name);
             }
         }
-        for (pipeline_fields) |field| {
-            const spec: Spec = @field(declaration.pipelines, field.name);
+        for (pipeline_fields) |field_name| {
+            const spec: Spec = @field(declaration.pipelines, field_name);
             if (indexOfName(module_names, spec.module) == null)
-                @compileError(field.name ++ " names no declared module: " ++ spec.module);
+                @compileError(field_name ++ " names no declared module: " ++ spec.module);
             if (indexOfName(layout_names, spec.layout) == null)
-                @compileError(field.name ++ " names no declared layout: " ++ spec.layout);
+                @compileError(field_name ++ " names no declared layout: " ++ spec.layout);
         }
     }
 
@@ -123,7 +123,7 @@ pub fn ShaderEffect(comptime declaration: anytype) type {
         pipelines: [pipeline_fields.len]vk.Pipeline,
 
         pub fn get(self: *const Self, comptime name: Name) vk.Pipeline {
-            return self.pipelines[@intFromEnum(name)];
+            return self.pipelines[@backingInt(name)];
         }
 
         // The layout a pipeline was built with, which is what a push constant
@@ -170,8 +170,8 @@ pub fn ShaderEffect(comptime declaration: anytype) type {
             var pipelines_built: usize = 0;
             errdefer for (self.pipelines[0..pipelines_built]) |handle|
                 context.device.destroyPipeline(handle, null);
-            inline for (pipeline_fields, 0..) |field, index| {
-                const spec: Spec = @field(declaration.pipelines, field.name);
+            inline for (pipeline_fields, 0..) |field_name, index| {
+                const spec: Spec = @field(declaration.pipelines, field_name);
                 const module = self.modules[comptime indexOfName(module_names, spec.module).?];
                 const layout = self.layouts[comptime indexOfName(layout_names, spec.layout).?];
 

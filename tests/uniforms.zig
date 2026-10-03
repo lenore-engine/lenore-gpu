@@ -125,10 +125,10 @@ test "filling the block states how much of it is live and leaves the rest alone"
 test "the block's kind values are the ones the shader branches on" {
     // The shader compares against literal 0 to 3, which is what a uint tag
     // reduces to. Reordering the enum here would re-aim every light.
-    try testing.expectEqual(@as(u32, 0), @intFromEnum(gpu.LightUniform.Kind.directional));
-    try testing.expectEqual(@as(u32, 1), @intFromEnum(gpu.LightUniform.Kind.point));
-    try testing.expectEqual(@as(u32, 2), @intFromEnum(gpu.LightUniform.Kind.spot));
-    try testing.expectEqual(@as(u32, 3), @intFromEnum(gpu.LightUniform.Kind.rect));
+    try testing.expectEqual(@as(u32, 0), @backingInt(gpu.LightUniform.Kind.directional));
+    try testing.expectEqual(@as(u32, 1), @backingInt(gpu.LightUniform.Kind.point));
+    try testing.expectEqual(@as(u32, 2), @backingInt(gpu.LightUniform.Kind.spot));
+    try testing.expectEqual(@as(u32, 3), @backingInt(gpu.LightUniform.Kind.rect));
 }
 
 test "the flip negates the whole second column, not one entry" {
@@ -189,7 +189,7 @@ test "the camera flip turns the ray basis over with the matrix" {
     // basis that was not flipped draws the environment upside down behind a
     // scene that was, and both halves are one call for that reason.
     const camera: gpu.CameraUniform = .{
-        .view_projection = zm.perspectiveFovRh(std.math.pi / 4.0, 1.7778, 0.1, 100),
+        .view_projection = gpu.mat4(zm.perspectiveFovRh(std.math.pi / 4.0, 1.7778, 0.1, 100)),
         .position = .{ 1, 2, 3, 0 },
         .ray_right = .{ 0.5, 0, 0, 0 },
         .ray_up = .{ 0, 0.3, 0, 0 },
@@ -224,7 +224,7 @@ test "the ray a device coordinate names survives the flip" {
     const view = zm.lookToRh(zm.f32x4(0, 0, 0, 1), zm.f32x4(0, 0, -1, 0), zm.f32x4(0, 1, 0, 0));
     const half_height = @tan(std.math.pi / 8.0);
     const camera: gpu.CameraUniform = .{
-        .view_projection = zm.mul(view, zm.perspectiveFovRh(std.math.pi / 4.0, 1, 0.1, 100)),
+        .view_projection = gpu.mat4(zm.mul(view, zm.perspectiveFovRh(std.math.pi / 4.0, 1, 0.1, 100))),
         .position = .{ 0, 0, 0, 0 },
         .ray_right = .{ half_height, 0, 0, 0 },
         .ray_up = .{ 0, half_height, 0, 0 },
@@ -240,7 +240,8 @@ test "the ray a device coordinate names survives the flip" {
             flipped.block.ray_up[axis] * device[1];
     }
 
-    const clip = zm.mul(point, flipped.block.view_projection);
+    const vp = flipped.block.view_projection;
+    const clip = zm.mul(point, zm.Mat{ vp[0], vp[1], vp[2], vp[3] });
     try testing.expectApproxEqAbs(device[0], clip[0] / clip[3], 1e-5);
     try testing.expectApproxEqAbs(device[1], clip[1] / clip[3], 1e-5);
 }

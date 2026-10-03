@@ -8,10 +8,10 @@ const pass = gpu.MainPass;
 // Handles are only compared here, never dereferenced, so distinct synthetic
 // ones are enough to tell the two attachments apart.
 const target: gpu.MainPassTarget = .{
-    .hdr_image = @enumFromInt(1),
-    .hdr_view = @enumFromInt(2),
-    .depth_image = @enumFromInt(3),
-    .depth_view = @enumFromInt(4),
+    .hdr_image = @fromBackingInt(@intCast(1)),
+    .hdr_view = @fromBackingInt(@intCast(2)),
+    .depth_image = @fromBackingInt(@intCast(3)),
+    .depth_view = @fromBackingInt(@intCast(4)),
     .extent = .{ .width = 1280, .height = 720 },
 };
 

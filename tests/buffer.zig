@@ -7,10 +7,10 @@ const testing = std.testing;
 // Handles are opaque to these checks: they are only compared, never
 // dereferenced, so synthetic ones are enough to exercise every decision the
 // policy makes.
-const device: vk.Device = @enumFromInt(1);
-const other_device: vk.Device = @enumFromInt(2);
-const source_handle: vk.Buffer = @enumFromInt(10);
-const destination_handle: vk.Buffer = @enumFromInt(11);
+const device: vk.Device = @fromBackingInt(@intCast(1));
+const other_device: vk.Device = @fromBackingInt(@intCast(2));
+const source_handle: vk.Buffer = @fromBackingInt(@intCast(10));
+const destination_handle: vk.Buffer = @fromBackingInt(@intCast(11));
 
 const max_buffer_size: vk.DeviceSize = 4096;
 

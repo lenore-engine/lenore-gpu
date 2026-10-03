@@ -49,15 +49,15 @@ pub fn ResourcePool(comptime T: type) type {
             _,
 
             fn index(self: Handle) Index {
-                return @truncate(@intFromEnum(self));
+                return @truncate(@backingInt(self));
             }
 
             fn generation(self: Handle) Generation {
-                return @intCast(@intFromEnum(self) >> @bitSizeOf(Index));
+                return @intCast(@backingInt(self) >> @bitSizeOf(Index));
             }
 
             fn pack(idx: Index, gen: Generation) Handle {
-                return @enumFromInt((@as(u64, gen) << @bitSizeOf(Index)) | @as(u64, idx));
+                return @fromBackingInt(@intCast((@as(u64, gen) << @bitSizeOf(Index)) | @as(u64, idx)));
             }
         };
 

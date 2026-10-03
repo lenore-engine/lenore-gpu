@@ -364,8 +364,8 @@ const Built = struct {
             );
             return;
         }
-        inline for (@typeInfo(Built).@"struct".fields) |field| {
-            if (@field(self, field.name)) |*owned| owned.deinit();
+        inline for (@typeInfo(Built).@"struct".field_names) |field_name| {
+            if (@field(self, field_name)) |*owned| owned.deinit();
         }
     }
 };

@@ -11,8 +11,8 @@ fn expectColour(expected: [3]f32, actual: [3]f32) !void {
 }
 
 const target: gpu.PostTarget = .{
-    .image = @enumFromInt(7),
-    .view = @enumFromInt(8),
+    .image = @fromBackingInt(@intCast(7)),
+    .view = @fromBackingInt(@intCast(8)),
     .extent = .{ .width = 800, .height = 600 },
 };
 
@@ -67,10 +67,10 @@ test "the pass samples what the main pass left behind" {
     try testing.expect(gpu.PostBindings[0].stages.fragment_bit);
 
     const main_end = gpu.MainPass.endBarriers(.{
-        .hdr_image = @enumFromInt(1),
-        .hdr_view = @enumFromInt(2),
-        .depth_image = @enumFromInt(3),
-        .depth_view = @enumFromInt(4),
+        .hdr_image = @fromBackingInt(@intCast(1)),
+        .hdr_view = @fromBackingInt(@intCast(2)),
+        .depth_image = @fromBackingInt(@intCast(3)),
+        .depth_view = @fromBackingInt(@intCast(4)),
         .extent = target.extent,
     });
     try testing.expectEqual(vk.ImageLayout.shader_read_only_optimal, main_end[0].new_layout);

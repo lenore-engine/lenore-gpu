@@ -133,7 +133,7 @@ pub const UpdateError = error{
 // through it. A separate name from `zm.Mat` because this is a GPU layout:
 // widening it is a change to the shader, and widening `zm.Mat` is not.
 pub const Instance = extern struct {
-    model: zm.Mat align(16),
+    model: uniforms.Mat4 align(16),
 
     // Where this instance's joint matrices begin in the frame's joint array.
     // Read only by the skinned pipeline variant, which is the only one that
@@ -156,11 +156,11 @@ pub const Instance = extern struct {
 // requires the fourth row of every inverse bind matrix to be [0,0,0,1], and a
 // pose composes TRS, so a joint matrix is affine and the packed form would be
 // correct. It is not taken because in the row-vector convention the unused lane
-// is the fourth of each row rather than a contiguous tail: packing turns one
-// `memcpy` of a pose into a per-joint gather, and at the joint counts a single
-// character carries that trades a measurable cost for a saving nothing has
-// missed.
-pub const Joint = zm.Mat;
+// is the fourth of each row rather than a contiguous tail: packing turns a copy
+// of whole rows into a gather of three lanes from each, and at the joint counts
+// a single character carries that trades a measurable cost for a saving nothing
+// has missed.
+pub const Joint = uniforms.Mat4;
 
 // How much of each ring one frame's slot holds.
 pub const Capacity = struct {
@@ -269,7 +269,7 @@ pub const FrameSet = struct {
                 sets.set(0),
                 entry.binding.slot,
                 entry.binding.kind,
-                &infos[@intFromEnum(entry.ring)],
+                &infos[@backingInt(entry.ring)],
             );
         }
         context.device.updateDescriptorSets(&writes, null);

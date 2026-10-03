@@ -83,7 +83,7 @@ test "the two backgrounds are the clear colour and the environment" {
     // The absent environment is not a third state. Its cube is black, every
     // term reading it is linear in that sample, and a black background is the
     // picture a scene with no environment has.
-    try testing.expectEqual(@as(usize, 2), @typeInfo(gpu.Background).@"enum".fields.len);
+    try testing.expectEqual(@as(usize, 2), @typeInfo(gpu.Background).@"enum".field_names.len);
     _ = gpu.Background.clear;
     _ = gpu.Background.environment;
 }

@@ -32,7 +32,7 @@ test "the zero handle never resolves" {
     try testing.expect(pool.getMut(.invalid) == null);
     try testing.expectEqual(@as(?u32, null), pool.remove(.invalid));
 
-    const zeroed: Handle = @enumFromInt(0);
+    const zeroed: Handle = @fromBackingInt(@intCast(0));
     try testing.expectEqual(Handle.invalid, zeroed);
 }
 

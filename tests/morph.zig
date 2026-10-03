@@ -153,7 +153,7 @@ test "a batch with no prepass output fetches the mesh's own vertices" {
     // draw, which is slower and still correct; the reverse silently draws one
     // registration's shape for another's.
     var mesh: gpu.Mesh = undefined;
-    mesh.vertex_buffer.handle = @enumFromInt(0xf00d);
+    mesh.vertex_buffer.handle = @fromBackingInt(@intCast(0xf00d));
 
     const own = gpu.batchVertexSource(.{
         .mesh = &mesh,
@@ -173,9 +173,9 @@ test "a batch with no prepass output fetches the mesh's own vertices" {
         .front_face = .counter_clockwise,
         .first_instance = 0,
         .instance_count = 1,
-        .vertex_source = .{ .handle = @enumFromInt(0xbeef), .offset = 48 },
+        .vertex_source = .{ .handle = @fromBackingInt(@intCast(0xbeef)), .offset = 48 },
     });
-    try testing.expectEqual(@as(vk.Buffer, @enumFromInt(0xbeef)), substituted.handle);
+    try testing.expectEqual(@as(vk.Buffer, @fromBackingInt(@intCast(0xbeef))), substituted.handle);
     try testing.expectEqual(@as(u64, 48), substituted.offset);
 }
 

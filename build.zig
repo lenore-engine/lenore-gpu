@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const build_options = b.addOptions();
-    build_options.addOption(bool, "enable_validation", optimize == .Debug);
+    build_options.addOption(bool, "enable_validation", optimize == .debug);
     // Off unless asked for. Vulkan specification,
     // VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR: what the driver compiled a
     // pipeline into is kept only for a pipeline created with the flag, and
@@ -72,12 +72,21 @@ pub fn build(b: *std.Build) void {
 
 fn zigFilesIn(b: *std.Build, dir_path: []const u8) [][]const u8 {
     var names: std.ArrayList([]const u8) = .empty;
+    // The listing is configuration, and the build system reuses a configuration
+    // while the inputs it recorded are unchanged. Declaring the directory as one
+    // makes a file added or removed a cache miss rather than a stale list. A
+    // directory that does not exist is recorded through its parent, whose
+    // entries are what say so (std.Build.dependOnDirectoryContents).
     const io = b.graph.io;
-    var dir = b.build_root.handle.openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return names.items,
+    var dir = b.root.openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => {
+            b.dependOnDirectoryContents(b.path(std.fs.path.dirname(dir_path) orelse "."));
+            return names.items;
+        },
         else => std.debug.panic("cannot open {s}/: {t}", .{ dir_path, err }),
     };
     defer dir.close(io);
+    b.dependOnDirectoryContents(b.path(dir_path));
 
     var iterator = dir.iterate();
     while (iterator.next(io) catch @panic("cannot list the directory")) |entry| {

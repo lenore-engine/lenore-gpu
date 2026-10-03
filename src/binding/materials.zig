@@ -88,7 +88,7 @@ pub const MaterialData = extern struct {
     metallic_roughness_cutoff: [4]f32 align(16),
     // Alpha mode, double sided, the texture-presence mask, unlit.
     flags: [4]u32 align(16),
-    tex: [@typeInfo(TextureSlot).@"enum".fields.len]TexTransform align(16),
+    tex: [@typeInfo(TextureSlot).@"enum".field_names.len]TexTransform align(16),
 
     comptime {
         // Measured by the compiler, not derived by hand. They pin this side of a
@@ -106,21 +106,21 @@ pub const MaterialData = extern struct {
 
         // The alpha mode is packed as its ordinal, so the shader's constants are
         // these values. Renaming or reordering the enum changes the wire format.
-        std.debug.assert(@intFromEnum(MaterialInfo.Rendering.AlphaMode.@"opaque") == 0);
-        std.debug.assert(@intFromEnum(MaterialInfo.Rendering.AlphaMode.mask) == 1);
-        std.debug.assert(@intFromEnum(MaterialInfo.Rendering.AlphaMode.blend) == 2);
+        std.debug.assert(@backingInt(MaterialInfo.Rendering.AlphaMode.@"opaque") == 0);
+        std.debug.assert(@backingInt(MaterialInfo.Rendering.AlphaMode.mask) == 1);
+        std.debug.assert(@backingInt(MaterialInfo.Rendering.AlphaMode.blend) == 2);
 
         // The packed slot array is indexed by TextureSlot, so its order and the
         // order the fields are written in fromInfo must agree.
-        std.debug.assert(@intFromEnum(TextureSlot.base_colour) == 0);
-        std.debug.assert(@intFromEnum(TextureSlot.occlusion) == 4);
+        std.debug.assert(@backingInt(TextureSlot.base_colour) == 0);
+        std.debug.assert(@backingInt(TextureSlot.occlusion) == 4);
     }
 
     // The first flag lane, back as the enum it was packed from. The asserts
     // above pin the three ordinals, and `fromInfo` is the only writer of the
     // lane, so every value in a buffer this module filled names a member.
     pub fn alphaMode(self: MaterialData) MaterialInfo.Rendering.AlphaMode {
-        return @enumFromInt(self.flags[0]);
+        return @fromBackingInt(@intCast(self.flags[0]));
     }
 
     // Whether the fragment path samples this slot, which is also what decides
@@ -162,7 +162,7 @@ pub const MaterialData = extern struct {
                 info.factors.normal_scale,
             },
             .flags = .{
-                @intFromEnum(info.rendering.alpha_mode),
+                @backingInt(info.rendering.alpha_mode),
                 @intFromBool(info.rendering.double_sided),
                 mask,
                 @intFromBool(info.rendering.unlit),

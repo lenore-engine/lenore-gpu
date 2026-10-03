@@ -14,12 +14,27 @@ const zm = @import("zmath");
 // every one is written into a `PerFrame` ring whose stride the device's offset
 // alignment decides.
 
+// A matrix as the device reads it: four rows of four floats, the order zmath
+// keeps a `Mat` in, so nothing transposes.
+//
+// An array rather than `zm.Mat`, because the device reads these bytes and Zig
+// defines no memory layout for `@Vector`: an extern struct may not hold one,
+// and comptime refuses to read one through a float pointer. Arrays of `f32`
+// have the layout the shader's mirror is held against.
+pub const Mat4 = [4][4]f32;
+
+// By value: each row coerces from a vector to an array, which copies the four
+// lanes and reinterprets no memory.
+pub fn mat4(m: zm.Mat) Mat4 {
+    return .{ m[0], m[1], m[2], m[3] };
+}
+
 // The camera every pass reads: the main pass to transform by, the background
 // to cast rays along.
 pub const Camera = extern struct {
     // Row vectors, so a position multiplies from the left. zmath stores a `Mat`
     // as four rows and the shader reads it the same way; nothing transposes.
-    view_projection: zm.Mat align(16),
+    view_projection: Mat4 align(16),
 
     // xyz is the eye in world space, and w is the frame's clock in seconds.
     //
@@ -243,7 +258,7 @@ pub const SunShadow = extern struct {
     // rasterizes through this matrix and the lookup turns its own product with
     // it into texture coordinates, so a flip on one side has to be matched on
     // the other; leaving it out of both is what makes the two cancel.
-    view_projection: zm.Mat align(16),
+    view_projection: Mat4 align(16),
 
     // How much of the sun's direct term a shadowed surface loses, in [0, 1],
     // which `SunShadowSettings.clampedStrength` is what holds it to. Zero is the
@@ -272,7 +287,7 @@ pub const SunShadow = extern struct {
     // strength, on either side: the lookup returns before transforming anything,
     // and a bake is not recorded at all.
     pub const off: SunShadow = .{
-        .view_projection = zm.identity(),
+        .view_projection = mat4(zm.identity()),
         .strength = 0,
         .normal_offset = 0,
         .light = 0,
@@ -292,7 +307,7 @@ pub const SunShadow = extern struct {
 // projection's `[1][1]` alone is the same thing only while the rest of that
 // column is zero, which is true of a bare perspective matrix and not of the
 // product with a view.
-pub fn vulkanClip(view_projection: zm.Mat) zm.Mat {
+pub fn vulkanClip(view_projection: anytype) @TypeOf(view_projection) {
     var flipped = view_projection;
     inline for (0..4) |row| flipped[row][1] = -flipped[row][1];
     return flipped;

@@ -21,8 +21,8 @@ fn vertex(fields: anytype) Vertex3D {
         .uv = .{ 0, 0 },
         .tangent = .{ 1, 0, 0, 1 },
     };
-    inline for (@typeInfo(@TypeOf(fields)).@"struct".fields) |field| {
-        @field(out, field.name) = @field(fields, field.name);
+    inline for (@typeInfo(@TypeOf(fields)).@"struct".field_names) |field_name| {
+        @field(out, field_name) = @field(fields, field_name);
     }
     return out;
 }

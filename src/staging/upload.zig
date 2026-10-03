@@ -112,12 +112,12 @@ comptime {
     // The request, the bound set and the slot list describe the same five slots
     // under the same names. A slot added to one and not the others would
     // otherwise be silently dropped at upload.
-    const slots = @typeInfo(MaterialSlot).@"enum".fields;
-    std.debug.assert(slots.len == @typeInfo(TextureSetRequest).@"struct".fields.len);
-    std.debug.assert(slots.len == @typeInfo(TextureSet).@"struct".fields.len);
-    for (slots) |slot| {
-        std.debug.assert(@hasField(TextureSetRequest, slot.name));
-        std.debug.assert(@hasField(TextureSet, slot.name));
+    const slots = @typeInfo(MaterialSlot).@"enum".field_names;
+    std.debug.assert(slots.len == @typeInfo(TextureSetRequest).@"struct".field_names.len);
+    std.debug.assert(slots.len == @typeInfo(TextureSet).@"struct".field_names.len);
+    for (slots) |slot_name| {
+        std.debug.assert(@hasField(TextureSetRequest, slot_name));
+        std.debug.assert(@hasField(TextureSet, slot_name));
     }
 }
 
@@ -135,7 +135,7 @@ fn interpretedKey(
     std.mem.writeInt(
         u32,
         key[source_key.len..][0..@sizeOf(u32)],
-        @intCast(@intFromEnum(format)),
+        @intCast(@backingInt(format)),
         .little,
     );
     return key;
@@ -343,15 +343,15 @@ pub const Batch = struct {
         try self.texture_sets.ensureUnusedCapacity(self.allocator, 1);
         try self.texture_keys.ensureUnusedCapacity(
             self.allocator,
-            @typeInfo(MaterialSlot).@"enum".fields.len,
+            @typeInfo(MaterialSlot).@"enum".field_names.len,
         );
 
         var set: TextureSet = undefined;
-        inline for (@typeInfo(MaterialSlot).@"enum".fields) |field| {
-            const slot = @field(MaterialSlot, field.name);
-            @field(set, field.name) = try self.resolveSlot(
+        inline for (@typeInfo(MaterialSlot).@"enum".field_names) |field_name| {
+            const slot = @field(MaterialSlot, field_name);
+            @field(set, field_name) = try self.resolveSlot(
                 slot,
-                @field(request, field.name),
+                @field(request, field_name),
             );
         }
 

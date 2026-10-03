@@ -81,11 +81,11 @@ test "a frame with no pass recorded totals zero and names every pass" {
 
 test "a frame's total is the sum of its passes" {
     var frame: gpu.GpuTimings = .{};
-    frame.pass_ns[@intFromEnum(gpu.GpuPass.shadow)] = 400_000;
-    frame.pass_ns[@intFromEnum(gpu.GpuPass.depth)] = 500_000;
-    frame.pass_ns[@intFromEnum(gpu.GpuPass.main)] = 2_000_000;
-    frame.pass_ns[@intFromEnum(gpu.GpuPass.bloom)] = 300_000;
-    frame.pass_ns[@intFromEnum(gpu.GpuPass.post)] = 100_000;
+    frame.pass_ns[@backingInt(gpu.GpuPass.shadow)] = 400_000;
+    frame.pass_ns[@backingInt(gpu.GpuPass.depth)] = 500_000;
+    frame.pass_ns[@backingInt(gpu.GpuPass.main)] = 2_000_000;
+    frame.pass_ns[@backingInt(gpu.GpuPass.bloom)] = 300_000;
+    frame.pass_ns[@backingInt(gpu.GpuPass.post)] = 100_000;
     try testing.expectEqual(@as(u64, 3_300_000), frame.total());
     try testing.expectEqual(@as(u64, 2_000_000), frame.get(.main));
 }

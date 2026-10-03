@@ -90,7 +90,7 @@ test "the group's own methods are reached by the compiler" {
 // real one carries.
 fn handled(id: u64) gpu.Buffer {
     var buffer: gpu.Buffer = undefined;
-    buffer.handle = @enumFromInt(id);
+    buffer.handle = @fromBackingInt(@intCast(id));
     return buffer;
 }
 
@@ -134,8 +134,8 @@ test "a buffer write is keyed by binding name, not by position" {
         try testing.expectEqual(vk.DescriptorSet.null_handle, write.dst_set);
     }
 
-    try testing.expectEqual(@as(vk.Buffer, @enumFromInt(0x11)), infos[0].buffer);
-    try testing.expectEqual(@as(vk.Buffer, @enumFromInt(0x44)), infos[3].buffer);
+    try testing.expectEqual(@as(vk.Buffer, @fromBackingInt(@intCast(0x11))), infos[0].buffer);
+    try testing.expectEqual(@as(vk.Buffer, @fromBackingInt(@intCast(0x44))), infos[3].buffer);
 
     // An absent range is the rest of the buffer, and an offset given without one
     // does not silently become a length.
@@ -184,10 +184,10 @@ test "mixed buffer and acceleration writes select their own bindings" {
 
     try testing.expectEqual(@as(usize, 1), buffer_writes.len);
     try testing.expectEqual(@as(u32, 0), buffer_writes[0].dst_binding);
-    try testing.expectEqual(@as(vk.Buffer, @enumFromInt(0x55)), buffer_infos[0].buffer);
+    try testing.expectEqual(@as(vk.Buffer, @fromBackingInt(@intCast(0x55))), buffer_infos[0].buffer);
 
     var structure: gpu.AccelerationStructure = undefined;
-    structure.handle = @enumFromInt(0x66);
+    structure.handle = @fromBackingInt(@intCast(0x66));
     const source = gpu.DescriptorAccelerationSource.one(&structure);
     var acceleration_infos: [1]vk.WriteDescriptorSetAccelerationStructureKHR = undefined;
     const acceleration_writes = try Group.accelerationWrites(
@@ -225,13 +225,13 @@ test "an image write carries the layout the caller states" {
     const Source = gpu.DescriptorImageSource;
     const writes = Group.imageWrites(.null_handle, &infos, .{
         .first = Source{
-            .view = @enumFromInt(0xa1),
-            .sampler = @enumFromInt(0xb1),
+            .view = @fromBackingInt(@intCast(0xa1)),
+            .sampler = @fromBackingInt(@intCast(0xb1)),
             .layout = .shader_read_only_optimal,
         },
         .second = Source{
-            .view = @enumFromInt(0xa2),
-            .sampler = @enumFromInt(0xb2),
+            .view = @fromBackingInt(@intCast(0xa2)),
+            .sampler = @fromBackingInt(@intCast(0xb2)),
             .layout = .general,
         },
     });
@@ -242,8 +242,8 @@ test "an image write carries the layout the caller states" {
     try testing.expectEqual(vk.ImageLayout.shader_read_only_optimal, infos[0].image_layout);
     try testing.expectEqual(vk.ImageLayout.general, infos[1].image_layout);
 
-    try testing.expectEqual(@as(vk.ImageView, @enumFromInt(0xa1)), infos[0].image_view);
-    try testing.expectEqual(@as(vk.Sampler, @enumFromInt(0xb2)), infos[1].sampler);
+    try testing.expectEqual(@as(vk.ImageView, @fromBackingInt(@intCast(0xa1))), infos[0].image_view);
+    try testing.expectEqual(@as(vk.Sampler, @fromBackingInt(@intCast(0xb2))), infos[1].sampler);
 
     for (sampled_set, writes, &infos) |binding, write, *info| {
         try testing.expectEqual(binding.slot, write.dst_binding);

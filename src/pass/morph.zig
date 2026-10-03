@@ -151,13 +151,11 @@ pub const Capacity = struct {
 // down instead leaves the tail of every mesh whose count is not a multiple of the
 // group size at its bind shape, which looks like a partly animated mesh.
 //
-// std.math.divCeil returns DivisionByZero for a zero denominator and Overflow
-// only for a signed minInt over minus one. Read in the installed std source of
-// both 0.16 and 0.17-dev, whose implementations differ and whose error set does
-// not: with an unsigned numerator and the nonzero comptime denominator the assert
-// below pins, neither is reachable.
+// `@divCeil` leaves its caller two guarantees, a nonzero denominator and no
+// signed minimum over minus one (langref, @divCeil). The type is unsigned, and
+// the denominator is the comptime constant the assert below pins above zero.
 pub fn groupsFor(vertex_count: u32) u32 {
-    return std.math.divCeil(u32, vertex_count, group_size) catch unreachable;
+    return @divCeil(vertex_count, group_size);
 }
 
 comptime {

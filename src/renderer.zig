@@ -91,7 +91,7 @@ comptime {
     // without a binding here writes fewer descriptors than the shader samples,
     // and the set layout would still be created without complaint.
     std.debug.assert(
-        material_bindings.len == @typeInfo(resource_storage.TextureSet).@"struct".fields.len,
+        material_bindings.len == @typeInfo(resource_storage.TextureSet).@"struct".field_names.len,
     );
 }
 
@@ -430,7 +430,7 @@ comptime {
     // first members, in the enum's own order. Reordering `pipeline.Mode` without
     // this would keep every index in range and hand half the draws the other
     // mode's pipeline.
-    for (scene_modes, 0..) |mode, index| std.debug.assert(@intFromEnum(mode) == index);
+    for (scene_modes, 0..) |mode, index| std.debug.assert(@backingInt(mode) == index);
 }
 
 // Where a variant sits on the vertex axis alone, which is the order a supplied
@@ -455,15 +455,15 @@ pub fn scenePipelineIndex(variant: SceneVariant, mode: pipeline.Mode) usize {
     // Justified by construction rather than by the check: every mode reaching
     // here comes from `modeFor`, which maps the three glTF alpha modes onto the
     // two above and cannot name the background.
-    std.debug.assert(@intFromEnum(mode) < scene_modes.len);
+    std.debug.assert(@backingInt(mode) < scene_modes.len);
 
-    return sceneVariantIndex(variant) * scene_modes.len + @intFromEnum(mode);
+    return sceneVariantIndex(variant) * scene_modes.len + @backingInt(mode);
 }
 
 // The material still says `solid`: it is the class used by validation and by
 // the table index. Only the pipeline's depth state changes after a prepass.
 pub fn scenePipelineMode(mode: pipeline.Mode) pipeline.Mode {
-    std.debug.assert(@intFromEnum(mode) < scene_modes.len);
+    std.debug.assert(@backingInt(mode) < scene_modes.len);
     return if (mode == .solid) .pretested else mode;
 }
 
@@ -1901,7 +1901,7 @@ fn reportShaderStatistics(
                 .float64_khr => log.info("  {s}: {d}", .{ name, statistic.value.f_64 }),
                 // The enum is open: a driver may report a format this build was
                 // compiled before. Naming it beats printing a wrong number.
-                _ => log.info("  {s}: unrecognised format {d}", .{ name, @intFromEnum(statistic.format) }),
+                _ => log.info("  {s}: unrecognised format {d}", .{ name, @backingInt(statistic.format) }),
             }
         }
     }

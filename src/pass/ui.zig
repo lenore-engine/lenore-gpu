@@ -236,11 +236,11 @@ pub const Registry = struct {
     // representation and not a lookup. They are distinct types so that a draw
     // list, which resolves nothing, cannot be handed a pool handle by accident.
     fn handleOf(handle: Pool.Handle) res.ImageHandle {
-        return @enumFromInt(@intFromEnum(handle));
+        return @fromBackingInt(@intCast(@backingInt(handle)));
     }
 
     fn poolHandleOf(handle: res.ImageHandle) Pool.Handle {
-        return @enumFromInt(@intFromEnum(handle));
+        return @fromBackingInt(@intCast(@backingInt(handle)));
     }
 };
 

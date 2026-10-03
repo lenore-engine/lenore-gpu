@@ -418,7 +418,7 @@ pub fn Sets(comptime bindings: []const Binding) type {
             comptime wanted: Family,
             given: anytype,
         ) [bindingCount(wanted)]Source {
-            const fields = @typeInfo(@TypeOf(given)).@"struct".fields;
+            const fields = @typeInfo(@TypeOf(given)).@"struct".field_names;
             const expected = comptime bindingCount(wanted);
             comptime if (fields.len != expected) @compileError(std.fmt.comptimePrint(
                 "this layout has {d} {s} bindings and the source list has {d}",
@@ -426,10 +426,10 @@ pub fn Sets(comptime bindings: []const Binding) type {
             ));
 
             var resolved: [expected]Source = undefined;
-            inline for (fields) |field| {
-                const source = @field(given, field.name);
+            inline for (fields) |field_name| {
+                const source = @field(given, field_name);
                 const Given = @TypeOf(source);
-                const slot = &resolved[comptime slotOf(wanted, field.name)];
+                const slot = &resolved[comptime slotOf(wanted, field_name)];
 
                 if (comptime Given == Source) {
                     slot.* = source;

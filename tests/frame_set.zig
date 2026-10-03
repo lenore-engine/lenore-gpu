@@ -11,7 +11,7 @@ const testing = std.testing;
 // It goes through the flip like any other camera, because that is the only way
 // to obtain what a frame's camera field holds.
 const any_camera: gpu.FramebufferCamera = gpu.vulkanClipCamera(.{
-    .view_projection = zm.identity(),
+    .view_projection = gpu.mat4(zm.identity()),
     .position = .{ 0, 0, 0, 1 },
     .ray_right = .{ 1, 0, 0, 0 },
     .ray_up = .{ 0, 1, 0, 0 },
@@ -42,16 +42,14 @@ test "an instance carries model, joint and material indices at the shader's stri
     try testing.expectEqual(@as(usize, 64), @offsetOf(gpu.Instance, "joint_base"));
     try testing.expectEqual(@as(usize, 68), @offsetOf(gpu.Instance, "material_index"));
 
-    const default_material: gpu.Instance = .{ .model = zm.identity(), .joint_base = 0 };
+    const default_material: gpu.Instance = .{ .model = gpu.mat4(zm.identity()), .joint_base = 0 };
     try testing.expectEqual(@as(u32, 0), default_material.material_index);
 }
 
 test "a joint matrix is the matrix the shader reads and nothing more" {
-    // `StructuredBuffer<float4x4>` has a sixty-four byte stride with no padding.
-    // A pose is copied into the ring whole, so this is also what makes that copy
-    // a `memcpy` rather than a gather.
+    // `StructuredBuffer<float4x4>` has a sixty-four byte stride with no padding,
+    // so the ring's element is exactly that and its stride is the shader's.
     try testing.expectEqual(@as(usize, 64), @sizeOf(gpu.Joint));
-    try testing.expectEqual(@as(usize, 16), @alignOf(gpu.Joint));
 }
 
 test "the frame bindings are distinct slots in one set" {
@@ -91,9 +89,9 @@ test "the rings that a scene sizes are storage buffers, not uniform ones" {
 }
 
 test "a frame that fits is accepted at every bound and one past any of them is not" {
-    const models = [_]gpu.Instance{.{ .model = zm.identity(), .joint_base = 0 }} ** 4;
-    const joints = [_]gpu.Joint{zm.identity()} ** 6;
-    var lights = [_]gpu.LightUniform{gpu.LightUniform.directional(.{ 1, 1, 1 }, 1, .{ 0, -1, 0 })} ** (gpu.max_lights + 1);
+    const models: [4]gpu.Instance = @splat(.{ .model = gpu.mat4(zm.identity()), .joint_base = 0 });
+    const joints: [6]gpu.Joint = @splat(gpu.mat4(zm.identity()));
+    var lights: [gpu.max_lights + 1]gpu.LightUniform = @splat(gpu.LightUniform.directional(.{ 1, 1, 1 }, 1, .{ 0, -1, 0 }));
 
     // Exactly full on every axis. The bound is the last index that fits, so a
     // check written with the wrong comparison rejects this and nothing else.
@@ -132,7 +130,7 @@ test "a frame with no skinned instance carries no joints" {
     // capacity of zero accepts an empty joint slice.
     try gpu.validateFrameContents(.{ .instances = 1, .joints = 0 }, .{
         .camera = any_camera,
-        .models = &.{.{ .model = zm.identity(), .joint_base = 0 }},
+        .models = &.{.{ .model = gpu.mat4(zm.identity()), .joint_base = 0 }},
         .joints = &.{},
         .lights = &.{},
     });

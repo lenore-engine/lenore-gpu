@@ -385,7 +385,7 @@ fn formatFromCode(code: u32) ?Supported {
         }
     }
     for (supported_formats) |candidate| {
-        if (code == @intFromEnum(candidate.format)) return candidate;
+        if (code == @backingInt(candidate.format)) return candidate;
     }
     return null;
 }

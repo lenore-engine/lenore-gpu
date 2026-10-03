@@ -58,13 +58,13 @@ test "sampler: each filter and address mode reaches its own Vulkan value" {
 
 test "sampler: anisotropy is the device limit or nothing" {
     const on = gpu.samplerCreateInfo(.{ .anisotropic = true }, device_anisotropy);
-    try testing.expectEqual(vk.TRUE, @intFromEnum(on.anisotropy_enable));
+    try testing.expectEqual(vk.TRUE, @backingInt(on.anisotropy_enable));
     try testing.expectEqual(device_anisotropy, on.max_anisotropy);
 
     // One rather than the limit: with anisotropy off the value asks for nothing,
     // and writing the device's number there would read as a request.
     const off = gpu.samplerCreateInfo(.{ .anisotropic = false }, device_anisotropy);
-    try testing.expectEqual(vk.FALSE, @intFromEnum(off.anisotropy_enable));
+    try testing.expectEqual(vk.FALSE, @backingInt(off.anisotropy_enable));
     try testing.expectEqual(@as(f32, 1.0), off.max_anisotropy);
 }
 

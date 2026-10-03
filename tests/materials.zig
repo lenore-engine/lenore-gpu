@@ -95,7 +95,7 @@ test "an absent texture transform packs as the identity" {
         .rendering = .{},
     };
     const packed_data = MaterialData.fromInfo(&info);
-    const base = packed_data.tex[@intFromEnum(TextureSlot.base_colour)];
+    const base = packed_data.tex[@backingInt(TextureSlot.base_colour)];
 
     try testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 1.0 }, base.rs);
     try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, base.params);
@@ -121,7 +121,7 @@ test "a quarter turn rotates the way the extension's prose describes" {
         .rotation = std.math.pi / 2.0,
         .scale = .{ 2.0, 3.0 },
     };
-    const transform = MaterialData.fromInfo(&info).tex[@intFromEnum(TextureSlot.normal)];
+    const transform = MaterialData.fromInfo(&info).tex[@backingInt(TextureSlot.normal)];
 
     // A quarter turn has cos zero and sin one, so the diagonal vanishes and the
     // two off-diagonal lanes carry the scales with opposite signs. Which lane is
@@ -152,7 +152,7 @@ test "a rotation puts each scale on the lane the extension gives it" {
         .rotation = angle,
         .scale = .{ 2.0, 3.0 },
     };
-    const transform = MaterialData.fromInfo(&info).tex[@intFromEnum(TextureSlot.base_colour)];
+    const transform = MaterialData.fromInfo(&info).tex[@backingInt(TextureSlot.base_colour)];
 
     const cosine = @cos(@as(f32, angle));
     const sine = @sin(@as(f32, angle));

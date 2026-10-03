@@ -124,14 +124,14 @@ test "one resident image binds under two samplers without a second reference" {
     // Asymmetric on purpose: equal extents would pass a bind that swapped them,
     // and a mip count of one would pass a bind that dropped it.
     const resident: gpu.ResidentTexture = .{
-        .view = @enumFromInt(0x1234),
+        .view = @fromBackingInt(@intCast(0x1234)),
         .width = 640,
         .height = 480,
         .mip_levels = 3,
     };
 
-    const linear = resident.bind(@enumFromInt(0xa1));
-    const nearest = resident.bind(@enumFromInt(0xb2));
+    const linear = resident.bind(@fromBackingInt(@intCast(0xa1)));
+    const nearest = resident.bind(@fromBackingInt(@intCast(0xb2)));
 
     // What the two bindings share is the image, and it is the image that a
     // reference is held for. Samplers come from their own cache.
