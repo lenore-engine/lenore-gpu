@@ -17,9 +17,19 @@ const Context = @import("context.zig").Context;
 // The passes a frame is divided into. The names are the recorder's, and a pass
 // that records nothing this frame reports zero rather than going missing: a
 // reader comparing two frames wants the same rows in both.
+//
+// `compute` and `after_main` hold the work recorded before any rendering and
+// after the main pass closes: the engine's morph prepass and the application's
+// dispatches in the first, the application's depth readers in the second.
+// Named by where they sit in the frame rather than by what they hold, which
+// the application decides.
 pub const Pass = enum {
+    compute,
     shadow,
+    depth,
     main,
+    after_main,
+    meter,
     bloom,
     post,
 
@@ -36,11 +46,17 @@ pub const slots_per_frame = Pass.count * 2;
 // reads another pass's timestamp, and the result is a plausible number rather
 // than an error. Nothing in it needs a device.
 pub fn slot(frame_index: usize, pass: Pass, edge: Edge) u32 {
-    // Widened before the arithmetic. The tag of a four-member enum is two bits
-    // wide, and doubling it in that width overflows at the third pass.
+    // Widened before the arithmetic. Multiplying in the enum's tag width would
+    // otherwise overflow before the value reaches the return type.
     const ordinal: usize = @intFromEnum(pass);
     const within = ordinal * 2 + @intFromEnum(edge);
     return @intCast(frame_index * slots_per_frame + within);
+}
+
+// Where a frame's run of slots starts, which the reset and the read address it
+// by. The first pass's, so a pass added ahead of the others moves it with them.
+fn firstSlot(frame_index: usize) u32 {
+    return slot(frame_index, @enumFromInt(0), .begin);
 }
 
 // Nanoseconds between two timestamps of the same pool.
@@ -142,7 +158,7 @@ pub const GpuTimer = struct {
         context.device.cmdResetQueryPool(
             command_buffer,
             self.pool,
-            slot(frame_index, .shadow, .begin),
+            firstSlot(frame_index),
             slots_per_frame,
         );
     }
@@ -185,7 +201,7 @@ pub const GpuTimer = struct {
         var ticks: [slots_per_frame]u64 = @splat(0);
         const result = context.device.getQueryPoolResults(
             self.pool,
-            slot(frame_index, .shadow, .begin),
+            firstSlot(frame_index),
             slots_per_frame,
             @sizeOf(@TypeOf(ticks)),
             &ticks,

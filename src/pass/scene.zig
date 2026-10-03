@@ -36,13 +36,14 @@ const depth_range = vk.ImageSubresourceRange{
 
 // Both attachments are shared by every frame in flight rather than being one
 // per frame, so each frame's writes have to be ordered after the previous
-// frame's use of the same image. That is what these carry; the layouts are
-// incidental, because `undefined` as the old layout discards contents that the
-// clear is about to replace anyway.
+// frame's use of the same image. These run before the depth prepass; the layouts
+// are incidental, because `undefined` discards contents both attachments are
+// about to replace.
 //
 // The HDR target is a write-after-read: the previous frame's post pass sampled
-// it. Depth is a write-after-write against the previous frame's depth writes,
-// and nothing samples it, so no shader stage appears in the source scope.
+// it. Depth is both: a write-after-write against the previous frame's depth
+// writes, and a write-after-read against what read it after the previous main
+// pass: the application's compute and the post pass's fragment shader.
 pub fn beginBarriers(target: Target) [2]vk.ImageMemoryBarrier2 {
     return .{
         .{
@@ -58,7 +59,12 @@ pub fn beginBarriers(target: Target) [2]vk.ImageMemoryBarrier2 {
             .subresource_range = colour_range,
         },
         .{
-            .src_stage_mask = .{ .early_fragment_tests_bit = true, .late_fragment_tests_bit = true },
+            .src_stage_mask = .{
+                .early_fragment_tests_bit = true,
+                .late_fragment_tests_bit = true,
+                .compute_shader_bit = true,
+                .fragment_shader_bit = true,
+            },
             .src_access_mask = .{ .depth_stencil_attachment_write_bit = true },
             .dst_stage_mask = .{ .early_fragment_tests_bit = true, .late_fragment_tests_bit = true },
             .dst_access_mask = .{
@@ -75,26 +81,65 @@ pub fn beginBarriers(target: Target) [2]vk.ImageMemoryBarrier2 {
     };
 }
 
-// The layout `end` leaves the HDR target in, and therefore the layout anything
-// sampling it afterwards has to declare. Named once so the pass and its reader
-// cannot state it differently.
+// The layout `end` leaves the HDR target and depth in, and therefore the layout
+// anything sampling them afterwards has to declare. Named once so the pass and
+// its readers cannot state it differently.
 pub const sampled_layout: vk.ImageLayout = .shader_read_only_optimal;
 
-// Makes the pass's colour writes available to the post pass sampler. Depth is
-// not here because it was never stored.
-pub fn endBarriers(target: Target) [1]vk.ImageMemoryBarrier2 {
+// Makes the prepass writes available to depth tests in the main rendering. The
+// layout does not change, but dynamic rendering provides no dependency between
+// two rendering instances: without this barrier the second may read depth
+// before the first has finished writing it.
+pub fn prepassBarrier(target: Target) [1]vk.ImageMemoryBarrier2 {
     return .{.{
-        .src_stage_mask = .{ .color_attachment_output_bit = true },
-        .src_access_mask = .{ .color_attachment_write_bit = true },
-        .dst_stage_mask = .{ .fragment_shader_bit = true },
-        .dst_access_mask = .{ .shader_read_bit = true },
-        .old_layout = .color_attachment_optimal,
-        .new_layout = sampled_layout,
+        .src_stage_mask = .{ .early_fragment_tests_bit = true, .late_fragment_tests_bit = true },
+        .src_access_mask = .{ .depth_stencil_attachment_write_bit = true },
+        .dst_stage_mask = .{ .early_fragment_tests_bit = true, .late_fragment_tests_bit = true },
+        .dst_access_mask = .{
+            .depth_stencil_attachment_read_bit = true,
+            // Application draws that were not part of the prepass may still
+            // use the solid pipeline and add a nearer value in the main pass.
+            .depth_stencil_attachment_write_bit = true,
+        },
+        .old_layout = .depth_attachment_optimal,
+        .new_layout = .depth_attachment_optimal,
         .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
         .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
-        .image = target.hdr_image,
-        .subresource_range = colour_range,
+        .image = target.depth_image,
+        .subresource_range = depth_range,
     }};
+}
+
+// Makes the main rendering's colour writes available to the post pass sampler,
+// and its depth writes to both readers after the main pass: the application's
+// compute and the post pass.
+pub fn endBarriers(target: Target) [2]vk.ImageMemoryBarrier2 {
+    return .{
+        .{
+            .src_stage_mask = .{ .color_attachment_output_bit = true },
+            .src_access_mask = .{ .color_attachment_write_bit = true },
+            .dst_stage_mask = .{ .fragment_shader_bit = true },
+            .dst_access_mask = .{ .shader_read_bit = true },
+            .old_layout = .color_attachment_optimal,
+            .new_layout = sampled_layout,
+            .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+            .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+            .image = target.hdr_image,
+            .subresource_range = colour_range,
+        },
+        .{
+            .src_stage_mask = .{ .early_fragment_tests_bit = true, .late_fragment_tests_bit = true },
+            .src_access_mask = .{ .depth_stencil_attachment_write_bit = true },
+            .dst_stage_mask = .{ .compute_shader_bit = true, .fragment_shader_bit = true },
+            .dst_access_mask = .{ .shader_sampled_read_bit = true },
+            .old_layout = .depth_attachment_optimal,
+            .new_layout = sampled_layout,
+            .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+            .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+            .image = target.depth_image,
+            .subresource_range = depth_range,
+        },
+    };
 }
 
 pub fn colourAttachment(target: Target, options: Options) vk.RenderingAttachmentInfo {
@@ -109,23 +154,38 @@ pub fn colourAttachment(target: Target, options: Options) vk.RenderingAttachment
     };
 }
 
-// Depth is written and never read back, so it is not stored. That is what lets
-// the image be lazily allocated and stay in tile memory, which is the point on
-// the integrated parts this targets.
+// The prepass clears to the far plane and stores the nearest opaque surface for
+// the main rendering to load. The store is required across the two dynamic
+// rendering instances.
 //
 // The clear is 1.0 because that is the far plane. The camera builds its
 // projection with zmath's `perspectiveFovRh`, whose third column is
 // `far / (near - far)`: a point on the near plane leaves it with depth 0 and one
 // on the far plane with depth 1. zmath keeps the other convention in a separate
 // `perspectiveFovRhGl`, which maps to [-1, 1] instead.
-pub fn depthAttachment(target: Target) vk.RenderingAttachmentInfo {
+pub fn prepassDepthAttachment(target: Target) vk.RenderingAttachmentInfo {
     return .{
         .image_view = target.depth_view,
         .image_layout = .depth_attachment_optimal,
         .resolve_mode = .{},
         .resolve_image_layout = .undefined,
         .load_op = .clear,
-        .store_op = .dont_care,
+        .store_op = .store,
+        .clear_value = .{ .depth_stencil = .{ .depth = 1, .stencil = 0 } },
+    };
+}
+
+// The value the prepass stored is the input to this rendering, and what it
+// leaves is stored for the application to sample after it: application draws
+// may have added nearer surfaces the prepass did not see.
+pub fn mainDepthAttachment(target: Target) vk.RenderingAttachmentInfo {
+    return .{
+        .image_view = target.depth_view,
+        .image_layout = .depth_attachment_optimal,
+        .resolve_mode = .{},
+        .resolve_image_layout = .undefined,
+        .load_op = .load,
+        .store_op = .store,
         .clear_value = .{ .depth_stencil = .{ .depth = 1, .stencil = 0 } },
     };
 }
@@ -151,11 +211,10 @@ pub fn scissor(extent: vk.Extent2D) vk.Rect2D {
 // Vulkan specification, vkCmdBeginRendering: the command buffer is recording
 // outside a render pass instance, and every attachment view names an image in
 // the layout its attachment info declares. The barriers above put them there.
-pub fn begin(
+pub fn beginDepthPrepass(
     context: *const Context,
     command_buffer: vk.CommandBuffer,
     target: Target,
-    options: Options,
 ) void {
     const barriers = beginBarriers(target);
     context.device.cmdPipelineBarrier2(command_buffer, &.{
@@ -168,8 +227,44 @@ pub fn begin(
     context.device.cmdSetViewport(command_buffer, 0, &.{viewport(target.extent)});
     context.device.cmdSetScissor(command_buffer, 0, &.{scissor(target.extent)});
 
+    const depth = prepassDepthAttachment(target);
+    context.device.cmdBeginRendering(command_buffer, &.{
+        .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = target.extent },
+        .layer_count = 1,
+        .view_mask = 0,
+        .color_attachment_count = 0,
+        .p_color_attachments = &no_colour_attachments,
+        .p_depth_attachment = &depth,
+    });
+}
+
+pub fn endDepthPrepass(
+    context: *const Context,
+    command_buffer: vk.CommandBuffer,
+    target: Target,
+) void {
+    context.device.cmdEndRendering(command_buffer);
+
+    const barriers = prepassBarrier(target);
+    context.device.cmdPipelineBarrier2(command_buffer, &.{
+        .image_memory_barrier_count = barriers.len,
+        .p_image_memory_barriers = &barriers,
+    });
+}
+
+pub fn beginMain(
+    context: *const Context,
+    command_buffer: vk.CommandBuffer,
+    target: Target,
+    options: Options,
+) void {
+    // Stated again rather than inherited across rendering instances. Dynamic
+    // state survives today, but each pass owns the state its pipelines require.
+    context.device.cmdSetViewport(command_buffer, 0, &.{viewport(target.extent)});
+    context.device.cmdSetScissor(command_buffer, 0, &.{scissor(target.extent)});
+
     const colour = colourAttachment(target, options);
-    const depth = depthAttachment(target);
+    const depth = mainDepthAttachment(target);
     context.device.cmdBeginRendering(command_buffer, &.{
         .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = target.extent },
         .layer_count = 1,
@@ -180,7 +275,7 @@ pub fn begin(
     });
 }
 
-pub fn end(context: *const Context, command_buffer: vk.CommandBuffer, target: Target) void {
+pub fn endMain(context: *const Context, command_buffer: vk.CommandBuffer, target: Target) void {
     context.device.cmdEndRendering(command_buffer);
 
     const barriers = endBarriers(target);
@@ -189,3 +284,5 @@ pub fn end(context: *const Context, command_buffer: vk.CommandBuffer, target: Ta
         .p_image_memory_barriers = &barriers,
     });
 }
+
+const no_colour_attachments = [_]vk.RenderingAttachmentInfo{};

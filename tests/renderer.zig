@@ -132,6 +132,7 @@ const ready: gpu.RecordState = .{
     .frame_instance_counts = &ready_frames,
     .material_buffer_ready = true,
     .environment_ready = true,
+    .lightmap_ready = true,
     .bloom_levels = 5,
 };
 
@@ -200,6 +201,23 @@ test "a list of one layer puts the background at that layer's edge" {
     try testing.expectEqual(@as(?usize, null), flat.background_slot);
 }
 
+test "a list is refused while the scene set names no lighting cache" {
+    // The same precondition as the environment: every fragment samples it, so
+    // an unwritten descriptor is undefined behaviour and not a dark picture.
+    // A scene that stores no light binds an empty cache rather than none.
+    const solid = [_]gpu.RecordBatch{batch(0)};
+    var unfed = ready;
+    unfed.lightmap_ready = false;
+    try testing.expectError(error.LightmapNotConfigured, gpu.planRecording(unfed, .{
+        .frame_index = 0,
+        .batches = &solid,
+        .visible = solid.len,
+        .background = .clear,
+        .bloom = null,
+        .post = .{},
+    }));
+}
+
 test "an empty list with no background asks nothing of the renderer's state" {
     // A frame that draws neither a batch nor a background reads no material
     // array, no environment and no instance slice, so it plans against a
@@ -210,6 +228,7 @@ test "an empty list with no background asks nothing of the renderer's state" {
         .frame_instance_counts = &.{},
         .material_buffer_ready = false,
         .environment_ready = false,
+        .lightmap_ready = false,
         .bloom_levels = 1,
     };
     const planned = try gpu.planRecording(bare, .{
@@ -445,6 +464,26 @@ test "every variant and mode lands on its own slot in the pipeline table" {
     // ask for: `modeFor` maps every glTF alpha mode onto the two above.
     try testing.expectEqual(@as(usize, 2), gpu.scene_modes.len);
     for (gpu.scene_modes) |mode| try testing.expect(mode != .background);
+}
+
+test "the shaded solid pipeline tests the depth prepass instead of rewriting it" {
+    try testing.expectEqual(gpu.PipelineMode.pretested, gpu.scenePipelineMode(.solid));
+    try testing.expectEqual(gpu.PipelineMode.blended, gpu.scenePipelineMode(.blended));
+}
+
+test "every vertex and mask variant lands on its own depth pipeline" {
+    var filled: [gpu.depth_pipeline_count]bool = @splat(false);
+    for (0..8) |bits| {
+        const streams: res.VertexStreams = @bitCast(@as(u3, @intCast(bits)));
+        const variant = gpu.sceneVariantFor(streams);
+        for ([_]bool{ false, true }) |masked| {
+            const index = gpu.depthPipelineIndex(variant, masked);
+            try testing.expect(index < gpu.depth_pipeline_count);
+            try testing.expect(!filled[index]);
+            filled[index] = true;
+        }
+    }
+    for (filled) |slot| try testing.expect(slot);
 }
 
 test "the four variants take four different slots on the vertex axis" {

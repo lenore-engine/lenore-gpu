@@ -31,6 +31,9 @@ test "the device-facing surface is compiled" {
     _ = &gpu.Context.waitIdle;
     _ = &gpu.validationErrorCount;
 
+    _ = &gpu.Surface.init;
+    _ = &gpu.Surface.deinit;
+
     _ = &gpu.Swapchain.init;
     _ = &gpu.Swapchain.deinit;
     _ = &gpu.Swapchain.recreate;
@@ -52,6 +55,15 @@ test "the device-facing surface is compiled" {
     _ = &gpu.MemoryAllocator.trim;
     _ = &gpu.MemoryAllocator.liveBlockCount;
 
+    _ = &gpu.recordBottomLevelAcceleration;
+    _ = &gpu.recordBottomLevelAccelerationBoxes;
+    _ = &gpu.recordTopLevelAcceleration;
+    _ = &gpu.AccelerationStructure.deinit;
+    _ = &gpu.AccelerationStructure.deviceAddress;
+    _ = &gpu.AccelerationStructure.size;
+    _ = &gpu.PendingAccelerationBuild.finish;
+    _ = &gpu.PendingAccelerationBuild.deinit;
+
     _ = &gpu.Buffer.init;
     _ = &gpu.Buffer.deinit;
     _ = &gpu.Buffer.upload;
@@ -59,6 +71,19 @@ test "the device-facing surface is compiled" {
     _ = &gpu.Buffer.mapped;
     _ = &gpu.Buffer.describe;
     _ = &gpu.Buffer.recordCopyFrom;
+
+    const acceleration_bindings = [_]gpu.DescriptorBinding{
+        .{
+            .slot = 0,
+            .name = "scene",
+            .kind = .acceleration_structure_khr,
+            .stages = .{ .compute_bit = true },
+        },
+    };
+    const AccelerationSets = gpu.DescriptorSets(&acceleration_bindings);
+    _ = &gpu.DescriptorAccelerationSource.one;
+    _ = &AccelerationSets.accelerationWrites;
+    _ = &AccelerationSets.writeAccelerationStructures;
 
     _ = &gpu.Image.init;
     _ = &gpu.Image.deinit;
@@ -153,6 +178,12 @@ test "the device-facing surface is compiled" {
 
     _ = &gpu.Sky.record;
 
+    _ = &gpu.MeterPass.init;
+    _ = &gpu.MeterPass.deinit;
+    _ = &gpu.MeterPass.recreate;
+    _ = &gpu.MeterPass.record;
+    _ = &gpu.MeterPass.read;
+
     _ = &gpu.BloomPass.init;
     _ = &gpu.BloomPass.deinit;
     _ = &gpu.BloomPass.recreate;
@@ -182,6 +213,7 @@ test "the device-facing surface is compiled" {
     _ = &gpu.beginOneShot;
     _ = &gpu.submitOneShotAndWait;
 
+    _ = &gpu.Renderer.bindSceneExtra;
     _ = &gpu.Renderer.init;
     _ = &gpu.Renderer.deinit;
     _ = &gpu.Renderer.resize;
@@ -191,13 +223,19 @@ test "the device-facing surface is compiled" {
     // not through a whole-frame entry point, because there is no longer one:
     // composition sequences them.
     _ = &gpu.Renderer.recordShadowBake;
+    _ = &gpu.Renderer.beginDepthPrepass;
+    _ = &gpu.Renderer.recordDepthPrepass;
+    _ = &gpu.Renderer.endDepthPrepass;
     _ = &gpu.Renderer.beginMain;
     _ = &gpu.Renderer.recordScene;
     _ = &gpu.Renderer.endMain;
     _ = &gpu.Renderer.recordBloom;
+    _ = &gpu.Renderer.recordMeter;
+    _ = &gpu.Renderer.meterCells;
     _ = &gpu.Renderer.recordPost;
     _ = &gpu.Renderer.setMaterialBuffer;
     _ = &gpu.Renderer.setEnvironment;
+    _ = &gpu.Renderer.setLightmap;
     _ = &gpu.Renderer.setMaterialTextures;
     _ = &gpu.Renderer.clearMaterials;
     _ = &gpu.Renderer.shadowBakes;
@@ -216,6 +254,8 @@ test "the device-facing surface is compiled" {
     _ = &gpu.TextureCache.acquireKtx2;
     _ = &gpu.Environment.neutral;
     _ = &gpu.writeEnvironment;
+    _ = &gpu.Lightmap.none;
+    _ = &gpu.Lightmap.scalar;
     _ = &gpu.ResourceStorage.removeMesh;
     _ = &gpu.ResourceStorage.removeTextureSet;
     _ = &gpu.MemoryAllocation.mappedBytes;

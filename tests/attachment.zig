@@ -4,7 +4,10 @@ const gpu = @import("lenore-gpu");
 
 const testing = std.testing;
 
-const depth_feature: vk.FormatFeatureFlags = .{ .depth_stencil_attachment_bit = true };
+const depth_feature: vk.FormatFeatureFlags = .{
+    .depth_stencil_attachment_bit = true,
+    .sampled_image_bit = true,
+};
 const hdr_features: vk.FormatFeatureFlags = .{
     .color_attachment_bit = true,
     .sampled_image_bit = true,
@@ -54,6 +57,21 @@ test "a device carrying no candidate names nothing rather than the last one" {
     );
 }
 
+test "a depth candidate has to carry sampling as well" {
+    // Stored after the main pass for the application to sample, so a format
+    // that is only a depth attachment is skipped.
+    const attach_only: vk.FormatFeatureFlags = .{ .depth_stencil_attachment_bit = true };
+
+    try testing.expectEqual(
+        vk.Format.x8_d24_unorm_pack32,
+        gpu.attachmentFirstSupported(
+            &gpu.Attachment.depth_candidates,
+            &.{ attach_only, depth_feature, depth_feature },
+            gpu.Attachment.depth_usage,
+        ),
+    );
+}
+
 test "an HDR candidate has to carry both of its usages" {
     // Rendered to and then sampled. A format offering only the attachment
     // feature is skipped, which is the case a per-usage check would let past.
@@ -83,11 +101,10 @@ test "the preferred formats are the narrow ones" {
     }
 }
 
-test "depth is never sampled and colour always is" {
-    // The pair the pass depends on: depth without the sampled bit is what lets
-    // the attachment be discarded, and the HDR target without it could not be
-    // tonemapped.
-    try testing.expect(!gpu.Attachment.depth_usage.sampled_bit);
+test "depth and colour are both sampled after the pass that writes them" {
+    // Depth is read by the application once the main pass closes, and the HDR
+    // target without it could not be tonemapped.
+    try testing.expect(gpu.Attachment.depth_usage.sampled_bit);
     try testing.expect(gpu.Attachment.hdr_usage.sampled_bit);
     try testing.expect(gpu.Attachment.hdr_usage.color_attachment_bit);
     try testing.expect(gpu.Attachment.depth_usage.depth_stencil_attachment_bit);

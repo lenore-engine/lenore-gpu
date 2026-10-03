@@ -6,8 +6,8 @@ const memory = @import("../memory/allocator.zig");
 // Whole-buffer helpers begin at the first byte of each bound resource.
 const buffer_start: vk.DeviceSize = 0;
 
-// Context enables no feature-gated buffer usage. Keeping the accepted mask to
-// Vulkan 1.0 core bits prevents extension and reserved bits reaching creation.
+// The feature-gated bits are exactly the three roles the ray-query capability
+// needs. All other extension and reserved bits remain outside this wrapper.
 const supported_usage = vk.BufferUsageFlags{
     .transfer_src_bit = true,
     .transfer_dst_bit = true,
@@ -18,12 +18,22 @@ const supported_usage = vk.BufferUsageFlags{
     .index_buffer_bit = true,
     .vertex_buffer_bit = true,
     .indirect_buffer_bit = true,
+    .shader_device_address_bit = true,
+    .acceleration_structure_build_input_read_only_bit_khr = true,
+    .acceleration_structure_storage_bit_khr = true,
 };
+
+fn usesRayQueryUsage(usage: vk.BufferUsageFlags) bool {
+    return usage.shader_device_address_bit or
+        usage.acceleration_structure_build_input_read_only_bit_khr or
+        usage.acceleration_structure_storage_bit_khr;
+}
 
 pub const InitError = error{
     AllocatorDeviceMismatch,
     EmptyUsage,
     InvalidSize,
+    RayQueryDisabled,
     SizeLimitExceeded,
     UnsupportedUsage,
 } || vk.DeviceWrapper.CreateBufferError || memory.BufferAllocationError;
@@ -69,6 +79,7 @@ pub const CreateRequest = struct {
     size: vk.DeviceSize,
     max_buffer_size: vk.DeviceSize,
     usage: vk.BufferUsageFlags,
+    ray_query_enabled: bool,
 };
 
 // Vulkan specification, VkBufferCreateInfo: a buffer has a non-zero size no
@@ -79,6 +90,8 @@ pub fn validateCreate(request: CreateRequest) InitError!void {
     if (request.device != request.allocator_device) return error.AllocatorDeviceMismatch;
     if (std.meta.eql(request.usage, vk.BufferUsageFlags{})) return error.EmptyUsage;
     if (!supported_usage.contains(request.usage)) return error.UnsupportedUsage;
+    if (usesRayQueryUsage(request.usage) and !request.ray_query_enabled)
+        return error.RayQueryDisabled;
 }
 
 // Vulkan specification, vkCmdCopyBuffer: a non-zero size, both ranges inside
@@ -124,6 +137,7 @@ pub const Buffer = struct {
             .size = size,
             .max_buffer_size = context.max_buffer_size,
             .usage = usage,
+            .ray_query_enabled = context.ray_query_enabled,
         });
 
         const handle = try context.device.createBuffer(&.{
@@ -133,7 +147,7 @@ pub const Buffer = struct {
         }, null);
         errdefer context.device.destroyBuffer(handle, null);
 
-        const allocation = try memory_allocator.allocateBuffer(handle, class);
+        const allocation = try memory_allocator.allocateBuffer(handle, usage, class);
         return .{
             .context = context,
             .memory_allocator = memory_allocator,

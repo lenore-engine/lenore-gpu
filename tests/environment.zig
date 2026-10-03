@@ -11,7 +11,7 @@ test "the environment continues the scene set after the material array" {
     // The joined layout is what the pipeline is built with, so a gap or a
     // collision between the two lists shows up here rather than as a descriptor
     // the shader reads and nobody wrote.
-    try testing.expectEqual(@as(usize, 4), gpu.SceneSetBindings.len);
+    try testing.expectEqual(@as(usize, 6), gpu.SceneSetBindings.len);
     for (gpu.SceneSetBindings, 0..) |binding, index|
         try testing.expectEqual(@as(u32, @intCast(index)), binding.slot);
 
@@ -25,6 +25,17 @@ test "the environment continues the scene set after the material array" {
         try testing.expectEqual(vk.DescriptorType.combined_image_sampler, binding.kind);
         try testing.expectEqual(@as(u32, 1), binding.count);
         // The image-based terms are computed per fragment and nowhere else.
+        try testing.expect(binding.stages.fragment_bit);
+        try testing.expect(!binding.stages.vertex_bit);
+    }
+
+    // The lighting cache continues after the environment, on the same terms: a
+    // fragment reads it and no other stage does.
+    const lightmap_slots = [_]u32{ 4, 5 };
+    try testing.expectEqual(lightmap_slots.len, gpu.lightmap_bindings.len);
+    for (gpu.lightmap_bindings, lightmap_slots) |binding, slot| {
+        try testing.expectEqual(slot, binding.slot);
+        try testing.expectEqual(vk.DescriptorType.combined_image_sampler, binding.kind);
         try testing.expect(binding.stages.fragment_bit);
         try testing.expect(!binding.stages.vertex_bit);
     }

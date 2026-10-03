@@ -10,14 +10,56 @@ const Allocator = std.mem.Allocator;
 // The pass that puts the frame on the screen: one screen-covering triangle that
 // samples the HDR target and writes the presentable image.
 //
-// It owns no depth and clears nothing. Every pixel of the target is written by
-// the triangle, so loading the previous contents would be bandwidth spent on
-// values that are all about to be replaced.
+// It owns no depth attachment and clears nothing. Every pixel of the target is
+// written by the triangle, so loading the previous contents would be bandwidth
+// spent on values that are all about to be replaced. It reads the main pass's
+// depth, which a supplied shader may use for anything that depends on how far
+// a pixel is: fog, outlines, focus.
 
 // Runtime look state is supplied by composition for each recording. The pass
 // does not retain it, so changing a look cannot mutate work already submitted.
 pub const Settings = struct {
     exposure: f32 = 1,
+    application: Application = .none,
+};
+
+// Where the application's part of the push block starts, and how much of it
+// there is.
+//
+// At 16 and not straight after the engine's two floats: a shader declares its
+// part as one struct, and a struct whose first member is a vector is aligned to
+// 16 in the push block. Measured with slangc 2026.19, a nested struct beginning
+// with `float4` after two floats reflects at offset 16.
+//
+// The whole block is 128 bytes, the least `maxPushConstantsSize` any device
+// reports. Vulkan specification, Limit Requirements, Required Limits:
+// 128 for Vulkan core, 256 from Vulkan 1.4.
+pub const application_offset = 16;
+pub const application_size = 128 - application_offset;
+
+// Bytes the engine passes to a supplied shader without reading them. What they
+// mean is the shader's and the application's business, which is why a value
+// of one game's own type travels here instead of a field the engine names.
+pub const Application = struct {
+    bytes: [application_size]u8 align(4) = @splat(0),
+
+    pub const none: Application = .{};
+
+    // Copies an extern struct in. Extern because its layout is then the one
+    // the shader's struct is checked against, field by field; an auto layout
+    // may reorder the fields.
+    pub fn of(value: anytype) Application {
+        const T = @TypeOf(value);
+        comptime {
+            if (@typeInfo(T) != .@"struct" or @typeInfo(T).@"struct".layout != .@"extern")
+                @compileError("the application's post block must be an extern struct");
+            if (@sizeOf(T) > application_size)
+                @compileError("the application's post block is larger than the push range leaves it");
+        }
+        var block: Application = .none;
+        @memcpy(block.bytes[0..@sizeOf(T)], std.mem.asBytes(&value));
+        return block;
+    }
 };
 
 pub const SettingsError = error{InvalidExposure};
@@ -28,6 +70,14 @@ pub const SettingsError = error{InvalidExposure};
 pub const PushConstants = extern struct {
     exposure: f32,
     bloom: f32,
+    // Zero, and read by nothing: the gap up to the application's offset.
+    unused: [2]f32 = @splat(0),
+    application: [application_size]u8,
+
+    comptime {
+        std.debug.assert(@offsetOf(PushConstants, "application") == application_offset);
+        std.debug.assert(@sizeOf(PushConstants) == 128);
+    }
 };
 
 pub const push_constant_range: vk.PushConstantRange = .{
@@ -61,6 +111,7 @@ pub fn pushConstants(settings: Settings, look: ?bloom.Look) SettingsError!PushCo
     return .{
         .exposure = try exposure(settings),
         .bloom = if (look) |resolved| resolved.composite else 0,
+        .application = settings.application.bytes,
     };
 }
 
@@ -103,7 +154,12 @@ pub const Target = struct {
 };
 
 // The whole descriptor interface a post shader may read: the HDR target the
-// main pass wrote, then the bloom chain's finest level.
+// main pass wrote, then the bloom chain's finest level, then the main pass's
+// depth.
+//
+// Depth is a sampled image without a sampler, read by texel. Filtering depth
+// needs a format feature no depth format is required to have, and a blend of
+// two depths across an edge is a distance belonging to neither surface.
 //
 // Slot 1 is written whether or not a recording composites the chain: one set
 // serves both pipelines, and the pipeline that does not sample it is the one
@@ -111,6 +167,7 @@ pub const Target = struct {
 pub const bindings = [_]descriptors.Binding{
     .{ .slot = 0, .name = "hdr", .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
     .{ .slot = 1, .name = "bloom", .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
+    .{ .slot = 2, .name = "depth", .kind = .sampled_image, .stages = .{ .fragment_bit = true } },
 };
 
 pub const Sets = descriptors.Sets(&bindings);
@@ -141,13 +198,17 @@ const colour_range = vk.ImageSubresourceRange{
 // Takes the acquired image from whatever the presentation engine left it in to
 // something that can be rendered to.
 //
-// The source scope is empty. The submission recording this waits on the image's
-// acquire semaphore, and that wait is what orders this write after the previous
-// presentation; naming a stage here as well would claim a second dependency
-// that does not exist. See `Frame.Submission`.
+// The submission recording this waits on the image's acquire semaphore, and
+// that wait is what orders this write after the previous presentation. The
+// wait reaches only the stage it names, colour attachment output in the
+// engine's submission, so the source scope names the same stage: the layout
+// transition then chains after the wait. With an empty source scope nothing
+// orders it after the acquire, which synchronization validation reports as a
+// write-after-read against `vkAcquireNextImageKHR`. No access, because the
+// semaphore already made the image available. See `Frame.Submission`.
 pub fn beginBarriers(target: Target) [1]vk.ImageMemoryBarrier2 {
     return .{.{
-        .src_stage_mask = .{},
+        .src_stage_mask = .{ .color_attachment_output_bit = true },
         .src_access_mask = .{},
         .dst_stage_mask = .{ .color_attachment_output_bit = true },
         .dst_access_mask = .{ .color_attachment_write_bit = true },
@@ -238,13 +299,14 @@ pub fn end(context: *const Context, command_buffer: vk.CommandBuffer, target: Ta
 }
 
 // What the pass samples, written once per HDR target rather than per frame: the
-// target outlives every frame and only a resize replaces it. The chain is
-// rebuilt by the same resize, which is why both arrive together.
+// target outlives every frame and only a resize replaces it. The chain and the
+// depth are rebuilt by the same resize, which is why all three arrive together.
 pub const Source = struct {
     view: vk.ImageView,
     sampler: vk.Sampler,
     bloom_view: vk.ImageView,
     bloom_sampler: vk.Sampler,
+    depth_view: vk.ImageView,
 };
 
 pub fn write(context: *const Context, sets: *const Sets, source: Source) void {
@@ -262,6 +324,14 @@ pub fn write(context: *const Context, sets: *const Sets, source: Source) void {
             .image_view = source.bloom_view,
             // The same layout, and for the same reason: the chain's last barrier
             // leaves its finest level in it.
+            .image_layout = pass.sampled_layout,
+        },
+        .{
+            // Vulkan specification, VkDescriptorImageInfo: the sampler is used
+            // only for sampler and combined image sampler descriptors.
+            .sampler = .null_handle,
+            .image_view = source.depth_view,
+            // The main pass leaves its depth in the same layout as its colour.
             .image_layout = pass.sampled_layout,
         },
     };

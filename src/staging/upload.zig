@@ -24,11 +24,12 @@ const TextureSet = resource_storage.TextureSet;
 const TextureSetHandle = resource_storage.TextureSetHandle;
 
 // The two GPU-ready texture sources. A KTX2 carries its own format and mip
-// chain; decoded RGBA8 carries one tightly packed level and receives the format
-// required by the material slot.
+// chain; raw texels carry one tightly packed level and receive the format the
+// caller names, which is what lets the same door serve a decoded image and a
+// computed one.
 pub const TextureSource = union(enum) {
     ktx2: []const u8,
-    rgba8: texture_cache.Rgba8,
+    raw: texture_cache.Raw,
 };
 
 // One texture a material asks for: the source image identity, its GPU-ready
@@ -90,7 +91,7 @@ pub const MaterialSlot = enum {
                 .base_colour, .emissive => .bc7_srgb_block,
                 .metallic_roughness, .normal, .occlusion => .bc7_unorm_block,
             },
-            .rgba8 => switch (self) {
+            .raw => switch (self) {
                 .base_colour, .emissive => .r8g8b8a8_srgb,
                 .metallic_roughness, .normal, .occlusion => .r8g8b8a8_unorm,
             },
@@ -419,7 +420,7 @@ pub const Batch = struct {
                 wanted.sampler,
                 &self.transfer,
             ),
-            .rgba8 => |source| try self.cache.acquireRgba8(
+            .raw => |source| try self.cache.acquireRaw(
                 key,
                 source,
                 format,

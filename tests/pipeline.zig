@@ -122,19 +122,32 @@ test "scene culling is dynamic and fullscreen culling is fixed off" {
     try testing.expectEqual(@as(u32, 0), fixed_none.cull_mode.toInt());
 }
 
-test "only the opaque pipeline adds to depth, and both read it" {
+test "solid writes depth and pretested shading only accepts its exact value" {
     const solid = gpu.pipelineDepthStencilState(.solid);
+    const pretested = gpu.pipelineDepthStencilState(.pretested);
     const blended = gpu.pipelineDepthStencilState(.blended);
 
     try testing.expectEqual(vk.Bool32.true, solid.depth_test_enable);
+    try testing.expectEqual(vk.Bool32.true, pretested.depth_test_enable);
     try testing.expectEqual(vk.Bool32.true, blended.depth_test_enable);
     try testing.expectEqual(vk.Bool32.true, solid.depth_write_enable);
+    try testing.expectEqual(vk.Bool32.false, pretested.depth_write_enable);
     try testing.expectEqual(vk.Bool32.false, blended.depth_write_enable);
 
-    // Less, not less-or-equal: the near plane is 0 and a fragment at the same
-    // depth as one already drawn does not replace it.
+    // The prepass retains the nearest fragment under `less`; shaded opaque
+    // geometry then runs only where it reproduces that exact depth. Blended
+    // geometry remains an ordinary less-than test against the retained value.
     try testing.expectEqual(vk.CompareOp.less, solid.depth_compare_op);
-    try testing.expectEqual(solid.depth_compare_op, blended.depth_compare_op);
+    try testing.expectEqual(vk.CompareOp.equal, pretested.depth_compare_op);
+    try testing.expectEqual(vk.CompareOp.less, blended.depth_compare_op);
+}
+
+test "pretested opaque shading replaces colour without blending" {
+    const solid = gpu.pipelineBlendAttachment(.solid);
+    const pretested = gpu.pipelineBlendAttachment(.pretested);
+
+    try testing.expectEqual(vk.Bool32.false, pretested.blend_enable);
+    try testing.expectEqual(solid.color_write_mask, pretested.color_write_mask);
 }
 
 test "the background passes at the far plane and leaves no depth behind" {
@@ -228,7 +241,7 @@ test "the overlay reads the second source on both axes" {
     try testing.expect(colour_found and alpha_found);
 
     // And no other mode does, because none of them writes a second output.
-    for ([4]gpu.PipelineMode{ .solid, .blended, .background, .additive }) |mode| {
+    for ([_]gpu.PipelineMode{ .solid, .blended, .pretested, .background, .additive }) |mode| {
         const attachment = gpu.pipelineBlendAttachment(mode);
         for (uses_src1) |factor| {
             try testing.expect(attachment.dst_color_blend_factor != factor);

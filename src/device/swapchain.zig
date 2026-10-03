@@ -2,6 +2,7 @@ const std = @import("std");
 const platform = @import("lenore-platform");
 const vk = @import("vulkan");
 const Context = @import("context.zig").Context;
+const Surface = @import("surface.zig").Surface;
 
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.vulkan);
@@ -54,6 +55,9 @@ pub const Swapchain = struct {
     };
 
     context: *const Context,
+    // Held rather than passed to every recreation: a swapchain is replaced on
+    // resize and the surface under it is the one thing that does not change.
+    surface: Surface,
     allocator: Allocator,
     surface_format: vk.SurfaceFormatKHR,
     // Presentation policy belongs to the application. Retaining it here makes
@@ -66,12 +70,14 @@ pub const Swapchain = struct {
 
     pub fn init(
         context: *const Context,
+        surface: Surface,
         allocator: Allocator,
         requested_extent: platform.Extent2D,
         preference: PresentModePreference,
     ) InitError!Swapchain {
         return initRecycle(
             context,
+            surface,
             allocator,
             requested_extent,
             .null_handle,
@@ -81,6 +87,7 @@ pub const Swapchain = struct {
 
     fn initRecycle(
         context: *const Context,
+        surface: Surface,
         allocator: Allocator,
         requested_extent: platform.Extent2D,
         old_handle: vk.SwapchainKHR,
@@ -88,14 +95,14 @@ pub const Swapchain = struct {
     ) InitError!Swapchain {
         const capabilities = try context.instance.getPhysicalDeviceSurfaceCapabilitiesKHR(
             context.physical_device,
-            context.surface,
+            surface.handle,
         );
         const extent = actualExtent(capabilities, requested_extent);
         if (extent.width == 0 or extent.height == 0)
             return error.InvalidSurfaceDimensions;
 
-        const surface_format = try findSurfaceFormat(context, allocator);
-        const present_mode = try findPresentMode(context, allocator, preference);
+        const surface_format = try findSurfaceFormat(context, surface, allocator);
+        const present_mode = try findPresentMode(context, surface, allocator, preference);
         const composite_alpha = try findCompositeAlpha(capabilities);
         log.info("present mode: {t}", .{present_mode});
 
@@ -116,7 +123,7 @@ pub const Swapchain = struct {
         };
         const concurrent = context.graphics_queue.family != context.present_queue.family;
         const handle = try context.device.createSwapchainKHR(&.{
-            .surface = context.surface,
+            .surface = surface.handle,
             .min_image_count = image_count,
             .image_format = surface_format.format,
             .image_color_space = surface_format.color_space,
@@ -144,6 +151,7 @@ pub const Swapchain = struct {
 
         return .{
             .context = context,
+            .surface = surface,
             .allocator = allocator,
             .surface_format = surface_format,
             .present_preference = preference,
@@ -169,6 +177,7 @@ pub const Swapchain = struct {
     ) InitError!void {
         const replacement = try initRecycle(
             self.context,
+            self.surface,
             self.allocator,
             requested_extent,
             self.handle,
@@ -437,13 +446,14 @@ const display_formats = [_]vk.Format{ .b8g8r8a8_unorm, .r8g8b8a8_unorm };
 
 fn findSurfaceFormat(
     context: *const Context,
+    surface: Surface,
     allocator: Allocator,
 ) (Allocator.Error ||
     vk.InstanceWrapper.GetPhysicalDeviceSurfaceFormatsAllocKHRError ||
     error{ NoAvailableSurfaceFormats, NoDisplayEncodedFormat })!vk.SurfaceFormatKHR {
     const formats = try context.instance.getPhysicalDeviceSurfaceFormatsAllocKHR(
         context.physical_device,
-        context.surface,
+        surface.handle,
         allocator,
     );
     defer allocator.free(formats);
@@ -462,6 +472,7 @@ fn findSurfaceFormat(
 
 fn findPresentMode(
     context: *const Context,
+    surface: Surface,
     allocator: Allocator,
     preference: PresentModePreference,
 ) (Allocator.Error ||
@@ -469,7 +480,7 @@ fn findPresentMode(
     error{NoAvailablePresentModes})!vk.PresentModeKHR {
     const modes = try context.instance.getPhysicalDeviceSurfacePresentModesAllocKHR(
         context.physical_device,
-        context.surface,
+        surface.handle,
         allocator,
     );
     defer allocator.free(modes);

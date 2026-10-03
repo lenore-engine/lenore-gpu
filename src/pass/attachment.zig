@@ -15,14 +15,12 @@ pub const CreateError = FormatError || image.InitError;
 // decides which formats are candidates at all.
 pub const hdr_usage: vk.ImageUsageFlags = .{ .color_attachment_bit = true, .sampled_bit = true };
 
-// Written and never read, so no sampled bit. That is also what allows the
-// attachment to be discarded at the end of the pass.
-pub const depth_usage: vk.ImageUsageFlags = .{ .depth_stencil_attachment_bit = true };
-
-// The sun shadow map, which is the depth image that does not follow the rule
-// above: the bake writes it and the main pass samples it, so it is stored rather
-// than discarded and it carries the sampled bit.
-pub const shadow_usage: vk.ImageUsageFlags = .{
+// Every depth image here is written as an attachment and sampled afterwards.
+// The camera's is written by the depth prepass, loaded by the shaded rendering
+// and stored after it, then bound by the post pass for a supplied shader and
+// readable by an application's work after the main pass. The sun's shadow map
+// is written by the bake and sampled by the main pass.
+pub const depth_usage: vk.ImageUsageFlags = .{
     .depth_stencil_attachment_bit = true,
     .sampled_bit = true,
 };
@@ -113,16 +111,6 @@ pub fn depthFormat(context: *const Context) FormatError!vk.Format {
         error.NoSupportedDepthFormat;
 }
 
-// The same preference order as the camera's depth buffer, against the wider
-// usage. A device offering a format for one and not the other is why this asks
-// again rather than reusing `depthFormat`'s answer.
-pub fn shadowFormat(context: *const Context) FormatError!vk.Format {
-    var features: [depth_candidates.len]vk.FormatFeatureFlags = undefined;
-    deviceFeatures(context, &depth_candidates, &features);
-    return firstSupported(&depth_candidates, &features, shadow_usage) orelse
-        error.NoSupportedDepthFormat;
-}
-
 pub fn hdrFormat(context: *const Context) FormatError!vk.Format {
     var features: [hdr_candidates.len]vk.FormatFeatureFlags = undefined;
     deviceFeatures(context, &hdr_candidates, &features);
@@ -131,8 +119,8 @@ pub fn hdrFormat(context: *const Context) FormatError!vk.Format {
 }
 
 // Both attachments are one per swapchain rather than one per frame in flight,
-// and the barriers at the start of the main pass are what order one frame's use
-// after the previous frame's.
+// and the barriers at the start of the camera depth prepass order one frame's
+// use after the previous frame's.
 pub fn createDepth(
     context: *const Context,
     memory_allocator: *memory.MemoryAllocator,

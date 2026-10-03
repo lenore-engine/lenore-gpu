@@ -29,15 +29,15 @@ test "the acquired image is left ready to present" {
     try testing.expectEqual(vk.ImageLayout.present_src_khr, end[0].new_layout);
 }
 
-test "the semaphores carry the scopes the barriers leave empty" {
-    // The acquire semaphore orders this frame's writes after the previous
-    // presentation, and the signalled semaphore orders presentation after
-    // them. Naming a stage on those sides as well would claim a dependency
-    // that the submission already provides.
+test "the transition chains after the acquire wait, and presentation waits on the signal" {
+    // The acquire semaphore's wait reaches only the stage the submission names,
+    // so the begin barrier's source scope names it too, with no access: the
+    // semaphore made the image available. The signalled semaphore orders
+    // presentation after the pass, so the end barrier's destination is empty.
     const begin = post.beginBarriers(target);
     const end = post.endBarriers(target);
 
-    try testing.expectEqual(vk.PipelineStageFlags2{}, begin[0].src_stage_mask);
+    try testing.expectEqual(vk.PipelineStageFlags2{ .color_attachment_output_bit = true }, begin[0].src_stage_mask);
     try testing.expectEqual(vk.AccessFlags2{}, begin[0].src_access_mask);
     try testing.expectEqual(vk.PipelineStageFlags2{}, end[0].dst_stage_mask);
     try testing.expectEqual(vk.AccessFlags2{}, end[0].dst_access_mask);
@@ -86,11 +86,12 @@ test "the post entry points are reached by the compiler" {
     _ = &post.write;
 }
 
-test "the runtime look fits two fragment push-constant words" {
-    try testing.expectEqual(@as(usize, 8), @sizeOf(post.PushConstants));
+test "the engine's two words lead the push block, and the application's part fills it to 128 bytes" {
+    try testing.expectEqual(@as(usize, 128), @sizeOf(post.PushConstants));
     try testing.expectEqual(@as(usize, 4), @alignOf(post.PushConstants));
     try testing.expectEqual(@as(usize, 0), @offsetOf(post.PushConstants, "exposure"));
     try testing.expectEqual(@as(usize, 4), @offsetOf(post.PushConstants, "bloom"));
+    try testing.expectEqual(@as(usize, 16), @offsetOf(post.PushConstants, "application"));
 
     try testing.expectEqual(@as(u32, 0), post.push_constant_range.offset);
     try testing.expectEqual(@as(u32, @sizeOf(post.PushConstants)), post.push_constant_range.size);
@@ -101,6 +102,20 @@ test "the runtime look fits two fragment push-constant words" {
 
     const constants = try post.pushConstants(.{}, null);
     try testing.expectEqual(@as(f32, 1), constants.exposure);
+    try testing.expectEqual(post.Application.none.bytes, constants.application);
+}
+
+test "an application's block reaches the push constants byte for byte, the rest zero" {
+    const Fog = extern struct {
+        colour: [4]f32,
+        start: f32,
+        end: f32,
+    };
+    const fog: Fog = .{ .colour = .{ 0.2, 0.03, 0.03, 1 }, .start = 10, .end = 96 };
+    const constants = try post.pushConstants(.{ .application = .of(fog) }, null);
+
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&fog), constants.application[0..@sizeOf(Fog)]);
+    for (constants.application[@sizeOf(Fog)..]) |byte| try testing.expectEqual(@as(u8, 0), byte);
 }
 
 test "only finite non-negative exposure reaches command state" {
@@ -129,14 +144,15 @@ test "a recording with no chain composites nothing, and says so with a weight" {
     try testing.expect(with.bloom > 0);
 }
 
-test "the post set names the target and the chain, both in the sampled layout" {
-    try testing.expectEqual(@as(usize, 2), post.bindings.len);
-    try testing.expectEqual(@as(u32, 0), post.bindings[0].slot);
-    try testing.expectEqual(@as(u32, 1), post.bindings[1].slot);
-    for (post.bindings) |binding| {
-        try testing.expectEqual(vk.DescriptorType.combined_image_sampler, binding.kind);
+test "the post set names the target and the chain sampled, then depth read by texel" {
+    try testing.expectEqual(@as(usize, 3), post.bindings.len);
+    for (post.bindings, 0..) |binding, slot| {
+        try testing.expectEqual(@as(u32, @intCast(slot)), binding.slot);
         try testing.expect(binding.stages.fragment_bit);
     }
+    try testing.expectEqual(vk.DescriptorType.combined_image_sampler, post.bindings[0].kind);
+    try testing.expectEqual(vk.DescriptorType.combined_image_sampler, post.bindings[1].kind);
+    try testing.expectEqual(vk.DescriptorType.sampled_image, post.bindings[2].kind);
 }
 
 test "PBR Neutral preserves its near-black and uncompressed branches" {

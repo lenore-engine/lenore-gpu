@@ -8,6 +8,10 @@ test "each pass boundary of each frame gets a slot of its own" {
     // and returns a plausible number rather than an error, so the property to
     // pin is that the map is injective over every frame and boundary.
     const frames = 3;
+    // Taken from the layout rather than written out, so that a pass added to
+    // the enum grows the expectation with it instead of failing here for a
+    // reason that has nothing to do with the property being pinned.
+    const per_frame = gpu.gpu_timestamp_slots_per_frame;
     var seen = std.AutoHashMap(u32, void).init(testing.allocator);
     defer seen.deinit();
 
@@ -15,23 +19,25 @@ test "each pass boundary of each frame gets a slot of its own" {
         for (std.enums.values(gpu.GpuPass)) |pass| {
             for ([_]gpu.GpuTimestampEdge{ .begin, .end }) |edge| {
                 const index = gpu.gpuTimestampSlot(frame, pass, edge);
-                try testing.expect(index < frames * 8);
+                try testing.expect(index < frames * per_frame);
                 try testing.expect(!seen.contains(index));
                 try seen.put(index, {});
             }
         }
     }
-    try testing.expectEqual(@as(usize, frames * 8), seen.count());
+    try testing.expectEqual(@as(usize, frames * per_frame), seen.count());
 }
 
 test "a frame's slots are one contiguous run" {
     // The reset and the read address the run by its first slot and a length, so
     // a layout that interleaved frames would clear another frame's results.
+    const per_frame = gpu.gpu_timestamp_slots_per_frame;
+    const passes = std.enums.values(gpu.GpuPass);
     for (0..3) |frame| {
-        const first = gpu.gpuTimestampSlot(frame, .shadow, .begin);
-        try testing.expectEqual(@as(u32, @intCast(frame * 8)), first);
-        const last = gpu.gpuTimestampSlot(frame, .post, .end);
-        try testing.expectEqual(first + 7, last);
+        const first = gpu.gpuTimestampSlot(frame, passes[0], .begin);
+        try testing.expectEqual(@as(u32, @intCast(frame * per_frame)), first);
+        const last = gpu.gpuTimestampSlot(frame, passes[passes.len - 1], .end);
+        try testing.expectEqual(first + per_frame - 1, last);
     }
 }
 
@@ -76,10 +82,11 @@ test "a frame with no pass recorded totals zero and names every pass" {
 test "a frame's total is the sum of its passes" {
     var frame: gpu.GpuTimings = .{};
     frame.pass_ns[@intFromEnum(gpu.GpuPass.shadow)] = 400_000;
+    frame.pass_ns[@intFromEnum(gpu.GpuPass.depth)] = 500_000;
     frame.pass_ns[@intFromEnum(gpu.GpuPass.main)] = 2_000_000;
     frame.pass_ns[@intFromEnum(gpu.GpuPass.bloom)] = 300_000;
     frame.pass_ns[@intFromEnum(gpu.GpuPass.post)] = 100_000;
-    try testing.expectEqual(@as(u64, 2_800_000), frame.total());
+    try testing.expectEqual(@as(u64, 3_300_000), frame.total());
     try testing.expectEqual(@as(u64, 2_000_000), frame.get(.main));
 }
 

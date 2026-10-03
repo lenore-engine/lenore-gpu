@@ -2,9 +2,11 @@ const std = @import("std");
 const vk = @import("vulkan");
 const attachment = @import("pass/attachment.zig");
 const bloom = @import("pass/bloom.zig");
+const meter = @import("pass/meter.zig");
 const Context = @import("device/context.zig").Context;
 const descriptors = @import("binding/descriptors.zig");
 const environment = @import("object/environment.zig");
+const lightmap_module = @import("object/lightmap.zig");
 const frame_set = @import("binding/frame_set.zig");
 const image = @import("object/image.zig");
 const materials_module = @import("binding/materials.zig");
@@ -42,12 +44,33 @@ pub const material_set_index = 2;
 // it holds is the attachment being written. See `shadow.bindings`.
 pub const shadow_set_index = 3;
 
-// The whole scene set, assembled from the two files that write into it: the
-// packed material array every fragment indexes, then the environment every
-// fragment lights itself from. Neither list belongs in the other's file, and
-// joining them here is what makes a slot claimed twice a compile error rather
-// than a descriptor quietly overwritten at run time.
-pub const scene_bindings = materials_module.bindings ++ environment.bindings;
+// A set this module describes nothing about, for an application whose scene
+// shader needs resources this engine has no vocabulary for.
+//
+// The four sets before it are the engine's: what a frame holds, what a scene
+// holds, what a material holds, and the shadow map. A shader that wants
+// something else has nowhere to put it, and the alternatives are both worse than
+// one opaque set. Widening the scene set means this module learning the
+// application's vocabulary, and every such resource then has a slot here whether
+// the application uses it or not; making the scene set's layout conditional
+// means it is no longer one layout, and the list is comptime precisely so that a
+// slot claimed twice is a compile error.
+//
+// So the layout is the application's, named in the pipeline layout because a
+// shader that declares `space 4` requires it there, and the set is the
+// application's, bound beside the scene set because what is in it changes with a
+// level rather than with a draw. Nothing here reads it, nothing here sizes it,
+// and nothing here can tell what it holds.
+pub const scene_extra_set_index = 4;
+
+// The whole scene set, assembled from the files that write into it: the packed
+// material array every fragment indexes, the environment every fragment lights
+// itself from, and the lighting cache the static ones read their own stored
+// light out of. No list belongs in another's file, and joining them here is what
+// makes a slot claimed twice a compile error rather than a descriptor quietly
+// overwritten at run time.
+pub const scene_bindings = materials_module.bindings ++ environment.bindings ++
+    lightmap_module.bindings;
 
 const SceneSets = descriptors.Sets(&scene_bindings);
 
@@ -142,6 +165,11 @@ pub const RecordError = MaterialError || FrameError || post.SettingsError ||
     // whatever material its batch names, and a descriptor that was never
     // written is not a dark picture but undefined behaviour.
     EnvironmentNotConfigured,
+    // The scene set has no lighting cache behind it, not even an empty one. The
+    // same precondition as the environment and for the same reason: every
+    // fragment samples it, and a descriptor that was never written is not a
+    // dark picture but undefined behaviour.
+    LightmapNotConfigured,
     EmptyBatch,
     InstanceRangeOutOfBounds,
     UnsupportedCullMode,
@@ -250,6 +278,7 @@ pub const RecordState = struct {
     frame_instance_counts: []const usize,
     material_buffer_ready: bool,
     environment_ready: bool,
+    lightmap_ready: bool,
     // The depth the look is resolved against. The composite's weight is the
     // reciprocal of a series whose length is the chain's depth, so a look is
     // only meaningful beside the chain that will carry it.
@@ -303,6 +332,7 @@ pub fn planRecording(state: RecordState, request: RecordRequest) RecordError!Rec
     // nothing on screen and casters behind the camera still needs both.
     if (request.batches.len > 0 or request.background == .environment) {
         if (!state.environment_ready) return error.EnvironmentNotConfigured;
+        if (!state.lightmap_ready) return error.LightmapNotConfigured;
         try validateFrameIndex(state.frame_instance_counts.len, request.frame_index);
     }
 
@@ -378,13 +408,14 @@ pub fn sceneVariantFor(streams: res.VertexStreams) SceneVariant {
     return .{ .skinned = streams.skinned, .uv1 = streams.uv1, .colour = streams.colour };
 }
 
-// The scene pipelines, one per vertex variant and blend mode. Both axes change
-// what a draw does: the variant picks the vertex entry point and its input, and
-// the mode decides whether the draw blends and whether it writes depth.
+// The shaded scene pipelines, one per vertex variant and blend mode. Both axes
+// change what a draw does: the variant picks the vertex entry point and its
+// input, and the mode decides whether the draw blends. Solid pipelines use the
+// pretested depth state; `modeFor` still returns `solid` as the material's draw
+// class, and `scenePipelineMode` performs that one substitution at creation.
 //
-// Eight: four vertex variants against two blend modes. The key is not
-// `streams.index()`, which would put the colour stream on an axis of its own and
-// build pipelines differing in nothing a draw can reach.
+// Sixteen: eight vertex variants against two blend modes. The key is not
+// `streams.index()`, which would account for streams no shader path reads.
 //
 // The modes are named rather than counted off `pipeline.Mode`. That enum also
 // carries the background, which is one pipeline of its own and not a point on
@@ -429,7 +460,23 @@ pub fn scenePipelineIndex(variant: SceneVariant, mode: pipeline.Mode) usize {
     return sceneVariantIndex(variant) * scene_modes.len + @intFromEnum(mode);
 }
 
-// What a main-pass shader has to supply for the sixteen scene pipelines to be
+// The material still says `solid`: it is the class used by validation and by
+// the table index. Only the pipeline's depth state changes after a prepass.
+pub fn scenePipelineMode(mode: pipeline.Mode) pipeline.Mode {
+    std.debug.assert(@intFromEnum(mode) < scene_modes.len);
+    return if (mode == .solid) .pretested else mode;
+}
+
+// Two camera-depth pipelines per vertex variant. Opaque geometry has no
+// fragment stage; MASK runs the cutoff-only entry point whose input matches that
+// variant. The creation loop fills this order and rollback walks its prefix.
+pub const depth_pipeline_count = scene_variants * 2;
+
+pub fn depthPipelineIndex(variant: SceneVariant, masked: bool) usize {
+    return sceneVariantIndex(variant) * 2 + @intFromBool(masked);
+}
+
+// What a main-pass shader has to supply for the shaded and depth pipelines to be
 // built from it.
 //
 // The vertex entry points are an array and not eight named fields, because the
@@ -443,12 +490,34 @@ pub fn scenePipelineIndex(variant: SceneVariant, mode: pipeline.Mode) usize {
 // carrying COLOR_0 cannot be shaded by an entry point that does not declare it.
 // The blend mode is not an axis here: it is a pipeline state rather than a
 // shading difference.
+// The fragment half an application may replace while retaining the renderer's
+// vertex transforms, depth prepass and descriptor contract. Restricting the
+// replacement to these two entries keeps clip-space depth invariant and leaves
+// MASK coverage owned by the prepass.
+pub const SceneShading = struct {
+    spirv: []const u32,
+    fragment_entry: [*:0]const u8,
+    colour_fragment_entry: [*:0]const u8,
+};
+
 pub const SceneShader = struct {
     spirv: []const u32,
     vertex_entry: [scene_variants][*:0]const u8,
     fragment_entry: [*:0]const u8,
     // For the variants whose vertex stage carries COLOR_0.
     colour_fragment_entry: [*:0]const u8,
+    // The same input axis for the cutoff-only camera depth prepass. Opaque
+    // geometry has no fragment stage and names neither.
+    mask_fragment_entry: [*:0]const u8,
+    colour_mask_fragment_entry: [*:0]const u8,
+
+    pub fn shading(self: SceneShader) SceneShading {
+        return .{
+            .spirv = self.spirv,
+            .fragment_entry = self.fragment_entry,
+            .colour_fragment_entry = self.colour_fragment_entry,
+        };
+    }
 };
 
 // Every shader the renderer builds a pipeline from. Grouped rather than passed
@@ -456,10 +525,29 @@ pub const SceneShader = struct {
 // chances to swap two of them, and none of the swaps is a type error.
 pub const Shaders = struct {
     scene: SceneShader,
+    // The layout of the application's own set, at `scene_extra_set_index`, or
+    // null for a scene shader that declares none.
+    //
+    // Here rather than beside the pipeline arguments because it is part of the
+    // interface the scene shader declares: a pipeline layout has to name every
+    // set its shader's `space` decorations use, so this arrives with the module
+    // that uses it. The set itself comes later through `bindSceneExtra`, because
+    // a layout is a description and can be made before a device has anything to
+    // put in it.
+    scene_extra_layout: ?vk.DescriptorSetLayout = null,
+    // Null takes the shaded fragment entries from `scene` as well. A custom
+    // value replaces only their module and names; vertex and MASK entries stay
+    // in `scene`, where the depth-invariance contract is fixed.
+    scene_shading: ?SceneShading = null,
     sky: sky.Shader,
     post: post.Shader,
     bloom: bloom.Shader,
     shadow: shadow.Shader,
+    // Null is a renderer that never measures its own frames, which is what an
+    // application setting its exposure from a constant wants: the pass costs a
+    // pipeline, a descriptor set and a small buffer per frame in flight, and
+    // none of that is worth carrying for a caller that will not read it.
+    meter: ?meter.Shader = null,
 };
 
 // The Vulkan-facing form the umbrella translates a scene batch into. Keeping
@@ -503,11 +591,25 @@ pub const Renderer = struct {
     depth: image.Image,
 
     scene_module: vk.ShaderModule,
+    // Present only when the application supplied shaded fragment entries from
+    // another module. Otherwise scene_module serves both stages.
+    scene_shading_module: ?vk.ShaderModule,
     sky_module: vk.ShaderModule,
     post_module: vk.ShaderModule,
     scene_layout: vk.PipelineLayout,
+    // Whether `scene_layout` names a fifth set, and which set is bound into it.
+    //
+    // The first is fixed when the pipeline layout is made and the second is not:
+    // an application builds its resources after the renderer exists, so the set
+    // arrives through `bindSceneExtra` and may still be absent when a frame is
+    // recorded. A frame recorded without it leaves the set unbound, which the
+    // validation layer reports against the first draw that reads it. Nothing
+    // here can do better: the engine does not know what belongs in it.
+    scene_extra_declared: bool,
+    scene_extra: ?vk.DescriptorSet = null,
     post_layout: vk.PipelineLayout,
     scene_pipelines: [scene_pipeline_count]vk.Pipeline,
+    depth_pipelines: [depth_pipeline_count]vk.Pipeline,
     // Built against `scene_layout`, which is what lets it be drawn between two
     // scene batches without rebinding anything.
     sky_pipeline: vk.Pipeline,
@@ -525,6 +627,7 @@ pub const Renderer = struct {
     scene: SceneSets,
     material_buffer_ready: bool,
     environment_ready: bool,
+    lightmap_ready: bool,
     materials: MaterialSets,
     // Descriptor sets and frame slots are indexed without checks after the
     // recorder validates the whole batch list. Material readiness changes at
@@ -562,6 +665,10 @@ pub const Renderer = struct {
     // and a third of that again for the levels under it, it is a fraction of
     // what the target already costs.
     bloom: bloom.BloomPass,
+    // What the frame carried, measured off the same target the chain reads.
+    // Present only when the shader was supplied. It follows the target for the
+    // reason the chain does: the set it binds names the target's view.
+    meter: ?meter.MeterPass,
     // How many recordings have run the chain. The counterpart of `shadow_bakes`
     // and `background_draws`, and read for the same reason: what a caller asked
     // for and what was recorded are two different things, and this is the one a
@@ -575,6 +682,37 @@ pub const Renderer = struct {
     // between a pass that drew nothing and a post chain that carried nothing,
     // so a caller that wants to tell them apart sets it to something else.
     clear_colour: [4]f32 = .{ 0, 0, 0, 1 },
+
+    // The application's own set for the scene pass, or null to leave it unbound.
+    //
+    // Bound beside the scene set every time that one is, because what is in it
+    // changes with a level and not with a draw. It is the caller's set and the
+    // caller's layout: this module never writes it, never sizes it and cannot
+    // tell what it holds.
+    //
+    // Refused when the pipeline layout does not name a fifth set, because
+    // binding one there is invalid and the layer's report would name a set index
+    // rather than the missing declaration that caused it.
+    // Bound wherever the scene set is, and skipped when the application has
+    // given none. Separate from the two call sites so that the pair cannot drift
+    // apart: a frame that bound one and not the other would read a set left over
+    // from the frame before.
+    fn bindExtra(self: *const Renderer, device: anytype, command_buffer: vk.CommandBuffer) void {
+        const set = self.scene_extra orelse return;
+        device.cmdBindDescriptorSets(
+            command_buffer,
+            .graphics,
+            self.scene_layout,
+            scene_extra_set_index,
+            &.{set},
+            &.{},
+        );
+    }
+
+    pub fn bindSceneExtra(self: *Renderer, set: ?vk.DescriptorSet) error{NoSceneExtraSet}!void {
+        if (set != null and !self.scene_extra_declared) return error.NoSceneExtraSet;
+        self.scene_extra = set;
+    }
 
     pub fn init(
         context: *const Context,
@@ -605,6 +743,15 @@ pub const Renderer = struct {
 
         const scene_module = try pipeline.createModule(context, shaders.scene.spirv);
         errdefer context.device.destroyShaderModule(scene_module, null);
+        const scene_shading = shaders.scene_shading orelse shaders.scene.shading();
+        const scene_shading_module: ?vk.ShaderModule = if (shaders.scene_shading != null)
+            try pipeline.createModule(context, scene_shading.spirv)
+        else
+            null;
+        errdefer if (scene_shading_module) |module|
+            context.device.destroyShaderModule(module, null);
+        const shading_module = scene_shading_module orelse scene_module;
+
         const sky_module = try pipeline.createModule(context, shaders.sky.spirv);
         errdefer context.device.destroyShaderModule(sky_module, null);
         const post_module = try pipeline.createModule(context, shaders.post.spirv);
@@ -655,11 +802,27 @@ pub const Renderer = struct {
         );
         errdefer bloom_pass.deinit();
 
+        // Beside the chain rather than after the pipelines, because it reads the
+        // same target and is undone on the same failure path.
+        var meter_pass: ?meter.MeterPass = if (shaders.meter) |supplied|
+            try meter.MeterPass.init(
+                context,
+                memory_allocator,
+                allocator,
+                frames,
+                hdr.view,
+                supplied,
+            )
+        else
+            null;
+        errdefer if (meter_pass) |*pass_| pass_.deinit();
+
         post.write(context, &post_sets, .{
             .view = hdr.view,
             .sampler = post_sampler,
             .bloom_view = bloom_pass.compositeView(),
             .bloom_sampler = bloom_pass.compositeSampler(),
+            .depth_view = depth.view,
         });
 
         // Before the scene layout, which names the set it owns. The three
@@ -682,12 +845,24 @@ pub const Renderer = struct {
 
         // A pipeline layout names its sets by index, and the shader's `space` is
         // that index, so this array is in the order the constants above give.
-        const scene_layout = try pipeline.createLayout(context, .{ .descriptor_sets = &.{
+        // The fifth is the application's and is named only when it has one: a
+        // layout that declares a set no shader reads is legal and wastes a
+        // descriptor slot, but one that omits a set a shader does read is not.
+        var scene_set_layouts: [scene_extra_set_index + 1]vk.DescriptorSetLayout = .{
             frame.descriptorSetLayout(),
             scene.layout,
             materials.layout,
             shadows.descriptorSetLayout(),
-        } });
+            .null_handle,
+        };
+        var scene_set_count: usize = scene_extra_set_index;
+        if (shaders.scene_extra_layout) |extra| {
+            scene_set_layouts[scene_extra_set_index] = extra;
+            scene_set_count = scene_extra_set_index + 1;
+        }
+        const scene_layout = try pipeline.createLayout(context, .{
+            .descriptor_sets = scene_set_layouts[0..scene_set_count],
+        });
         errdefer context.device.destroyPipelineLayout(scene_layout, null);
         const post_layout = try pipeline.createLayout(context, .{
             .descriptor_sets = &.{post_sets.layout},
@@ -717,7 +892,7 @@ pub const Renderer = struct {
                         // loop has to fill the array in index order.
                         std.debug.assert(scenePipelineIndex(variant, mode) == created);
                         scene_pipelines[created] = try pipeline.create(context, .{
-                            .mode = mode,
+                            .mode = scenePipelineMode(mode),
                             .vertex_input = pipeline.vertexInput(variant.streams()),
                             .culling = .dynamic,
                             .formats = .{ .colour = hdr.format, .depth = depth.format },
@@ -731,11 +906,11 @@ pub const Renderer = struct {
                                 // stage's output, so the colour axis selects
                                 // here as well.
                                 .fragment = .{
-                                    .module = scene_module,
+                                    .module = shading_module,
                                     .entry_point = if (colour)
-                                        shaders.scene.colour_fragment_entry
+                                        scene_shading.colour_fragment_entry
                                     else
-                                        shaders.scene.fragment_entry,
+                                        scene_shading.fragment_entry,
                                 },
                             },
                         });
@@ -745,7 +920,51 @@ pub const Renderer = struct {
             }
         }
 
-        // What the driver made of each scene pipeline, when the build asked to
+        var depth_pipelines: [depth_pipeline_count]vk.Pipeline = undefined;
+        var depth_created: usize = 0;
+        errdefer for (depth_pipelines[0..depth_created]) |built|
+            context.device.destroyPipeline(built, null);
+
+        for ([_]bool{ false, true }) |skinned| {
+            for ([_]bool{ false, true }) |uv1| {
+                for ([_]bool{ false, true }) |colour| {
+                    const variant: SceneVariant = .{
+                        .skinned = skinned,
+                        .uv1 = uv1,
+                        .colour = colour,
+                    };
+                    for ([_]bool{ false, true }) |masked| {
+                        std.debug.assert(depthPipelineIndex(variant, masked) == depth_created);
+                        depth_pipelines[depth_created] = try pipeline.create(context, .{
+                            .mode = .solid,
+                            .vertex_input = pipeline.vertexInput(variant.streams()),
+                            .culling = .dynamic,
+                            .formats = .{ .depth = depth.format },
+                            .layout = scene_layout,
+                            .stages = .{
+                                // The exact entry point the shaded pipeline
+                                // uses. Identical clip-space arithmetic is what
+                                // makes its later `equal` comparison reliable.
+                                .vertex = .{
+                                    .module = scene_module,
+                                    .entry_point = shaders.scene.vertex_entry[sceneVariantIndex(variant)],
+                                },
+                                .fragment = if (masked) .{
+                                    .module = scene_module,
+                                    .entry_point = if (colour)
+                                        shaders.scene.colour_mask_fragment_entry
+                                    else
+                                        shaders.scene.mask_fragment_entry,
+                                } else null,
+                            },
+                        });
+                        depth_created += 1;
+                    }
+                }
+            }
+        }
+
+        // What the driver made of each shaded scene pipeline, when the build asked to
         // be able to see it. Reported here rather than exposed through an
         // accessor: the handles belong to this renderer and outliving it is the
         // one way to read them wrong.
@@ -801,11 +1020,14 @@ pub const Renderer = struct {
             .hdr = hdr,
             .depth = depth,
             .scene_module = scene_module,
+            .scene_shading_module = scene_shading_module,
             .sky_module = sky_module,
             .post_module = post_module,
             .scene_layout = scene_layout,
+            .scene_extra_declared = shaders.scene_extra_layout != null,
             .post_layout = post_layout,
             .scene_pipelines = scene_pipelines,
+            .depth_pipelines = depth_pipelines,
             .sky_pipeline = sky_pipeline,
             .post_pipeline = post_pipeline,
             .post_bloom_pipeline = post_bloom_pipeline,
@@ -813,6 +1035,7 @@ pub const Renderer = struct {
             .scene = scene,
             .material_buffer_ready = false,
             .environment_ready = false,
+            .lightmap_ready = false,
             .materials = materials,
             .material_records = material_records,
             .frame_instance_counts = frame_instance_counts,
@@ -822,6 +1045,7 @@ pub const Renderer = struct {
             .background_draws = 0,
             .bloom = bloom_pass,
             .bloom_chains = 0,
+            .meter = meter_pass,
             .post_sets = post_sets,
             .post_sampler = post_sampler,
         };
@@ -834,10 +1058,12 @@ pub const Renderer = struct {
         device.destroyPipeline(self.post_bloom_pipeline, null);
         device.destroyPipeline(self.post_pipeline, null);
         device.destroyPipeline(self.sky_pipeline, null);
+        for (self.depth_pipelines) |built| device.destroyPipeline(built, null);
         for (self.scene_pipelines) |built| device.destroyPipeline(built, null);
         device.destroyPipelineLayout(self.post_layout, null);
         device.destroyPipelineLayout(self.scene_layout, null);
         self.post_sets.deinit(self.context, self.allocator);
+        if (self.meter) |*measured| measured.deinit();
         self.bloom.deinit();
         self.shadows.deinit();
         self.allocator.free(self.frame_instance_counts);
@@ -847,6 +1073,7 @@ pub const Renderer = struct {
         self.frame.deinit(self.context, self.allocator);
         device.destroyShaderModule(self.post_module, null);
         device.destroyShaderModule(self.sky_module, null);
+        if (self.scene_shading_module) |module| device.destroyShaderModule(module, null);
         device.destroyShaderModule(self.scene_module, null);
         self.depth.deinit();
         self.hdr.deinit();
@@ -873,6 +1100,19 @@ pub const Renderer = struct {
     pub fn setEnvironment(self: *Renderer, source: environment.Environment) void {
         environment.write(self.context, self.scene.set(0), source);
         self.environment_ready = true;
+    }
+
+    // Point the scene set at a lighting cache. Cold, like the environment: it is
+    // scene state, and a pass that keeps writing into the same image does not
+    // come back here.
+    //
+    // There is no default written at init, for the reason the environment has
+    // none: the renderer owns no texture cache and so cannot produce the black
+    // image that stands in for an absent one. Composition does, through
+    // `Lightmap.none`, and recording refuses to proceed until it has.
+    pub fn setLightmap(self: *Renderer, source: lightmap_module.Lightmap) void {
+        lightmap_module.write(self.context, self.scene.set(0), source);
+        self.lightmap_ready = true;
     }
 
     // Forget every material this renderer was told about, so a different scene
@@ -990,7 +1230,13 @@ pub const Renderer = struct {
             .sampler = self.post_sampler,
             .bloom_view = self.bloom.compositeView(),
             .bloom_sampler = self.bloom.compositeSampler(),
+            .depth_view = self.depth.view,
         });
+
+        // After the install and not before it, unlike the chain: this cannot
+        // fail, so there is nothing to keep a candidate for, and pointing it at
+        // the view the renderer is now drawing into is one fewer thing to undo.
+        if (self.meter) |*measured| measured.recreate(self.hdr.view);
     }
 
     // How many frames have re-recorded the map since init. Diagnostic, and the
@@ -1085,6 +1331,14 @@ pub const Renderer = struct {
         mode: pipeline.Mode,
     ) vk.Pipeline {
         return self.scene_pipelines[scenePipelineIndex(sceneVariantFor(streams), mode)];
+    }
+
+    fn depthPipelineFor(
+        self: *const Renderer,
+        streams: res.VertexStreams,
+        masked: bool,
+    ) vk.Pipeline {
+        return self.depth_pipelines[depthPipelineIndex(sceneVariantFor(streams), masked)];
     }
 
     // Every caster in the list, recorded into the open bake.
@@ -1199,6 +1453,7 @@ pub const Renderer = struct {
             .frame_instance_counts = self.frame_instance_counts,
             .material_buffer_ready = self.material_buffer_ready,
             .environment_ready = self.environment_ready,
+            .lightmap_ready = self.lightmap_ready,
             .bloom_levels = self.bloom.levelCount(),
         }, request);
     }
@@ -1245,14 +1500,118 @@ pub const Renderer = struct {
         self.shadow_bakes += 1;
     }
 
-    // Opens the main pass: the barriers that order this frame's writes after the
-    // previous frame's reads, the dynamic viewport and scissor, and the clear.
-    //
-    // Nothing is bound here. What a draw inside the pass reads is the draw's
-    // own business, and a caller recording its own is not made to inherit
-    // bindings it did not ask for.
+    // Opens the camera depth prepass. Its barriers order the shared attachments
+    // after the previous frame and its clear initializes depth to the far plane.
+    pub fn beginDepthPrepass(self: *Renderer, command_buffer: vk.CommandBuffer) void {
+        pass.beginDepthPrepass(self.context, command_buffer, self.mainPassTarget());
+    }
+
+    // Visible opaque geometry into the open depth prepass. The vertex stage is
+    // the exact entry point the shaded pipeline uses, so clip-space arithmetic
+    // is invariant and the later equality test is bit-exact. Opaque materials
+    // have no fragment stage; MASK selects a cutoff-only one and binds the two
+    // descriptor sets it reads. BLEND has no single depth and ends the run.
+    pub fn recordDepthPrepass(
+        self: *const Renderer,
+        command_buffer: vk.CommandBuffer,
+        frame_plan: RecordPlan,
+    ) void {
+        const batches = frame_plan.batches;
+        if (batches.len == 0) return;
+
+        const device = self.context.device;
+        self.frame.bind(
+            self.context,
+            command_buffer,
+            self.scene_layout,
+            frame_plan.frame_index,
+        );
+        device.cmdBindDescriptorSets(
+            command_buffer,
+            .graphics,
+            self.scene_layout,
+            scene_set_index,
+            &.{self.scene.set(0)},
+            &.{},
+        );
+        self.bindExtra(device, command_buffer);
+
+        var last_pipeline: ?vk.Pipeline = null;
+        var last_material: ?u32 = null;
+        var last_cull_mode: ?u32 = null;
+        var last_front_face: ?vk.FrontFace = null;
+        var last_mesh: ?*const mesh_module.Mesh = null;
+        var last_source: ?mesh_module.VertexSource = null;
+
+        for (batches) |batch| {
+            const alpha = self.material_records[batch.material_index].?.alpha;
+            const masked = switch (alpha) {
+                .@"opaque" => false,
+                .mask => true,
+                // Planning established that solids precede the blended run, so
+                // there can be no later depth-writing batch to inspect.
+                .blend => break,
+            };
+
+            const selected_pipeline = self.depthPipelineFor(batch.mesh.streams, masked);
+            if (last_pipeline == null or last_pipeline.? != selected_pipeline) {
+                device.cmdBindPipeline(command_buffer, .graphics, selected_pipeline);
+                last_pipeline = selected_pipeline;
+            }
+
+            const cull_mode = batch.cull_mode.toInt();
+            if (last_cull_mode == null or last_cull_mode.? != cull_mode) {
+                device.cmdSetCullMode(command_buffer, batch.cull_mode);
+                last_cull_mode = cull_mode;
+            }
+            if (last_front_face == null or last_front_face.? != batch.front_face) {
+                device.cmdSetFrontFace(command_buffer, batch.front_face);
+                last_front_face = batch.front_face;
+            }
+
+            if (masked and (last_material == null or last_material.? != batch.material_index)) {
+                device.cmdBindDescriptorSets(
+                    command_buffer,
+                    .graphics,
+                    self.scene_layout,
+                    material_set_index,
+                    &.{self.materials.set(@intCast(batch.material_index))},
+                    &.{},
+                );
+                last_material = batch.material_index;
+            }
+
+            const source = batchVertexSource(batch);
+            if (last_mesh == null or
+                last_mesh.? != batch.mesh or
+                !std.meta.eql(last_source.?, source))
+            {
+                batch.mesh.bind(self.context, command_buffer, source);
+                last_mesh = batch.mesh;
+                last_source = source;
+            }
+
+            drawInstanced(
+                self.context,
+                command_buffer,
+                batch.mesh,
+                batch.instance_count,
+                batch.first_instance,
+            );
+        }
+    }
+
+    // Stores the nearest depth and makes it visible to the main rendering.
+    pub fn endDepthPrepass(self: *Renderer, command_buffer: vk.CommandBuffer) void {
+        pass.endDepthPrepass(self.context, command_buffer, self.mainPassTarget());
+    }
+
+    // Opens the shaded main rendering. Colour is cleared and depth loads what
+    // the prepass stored; opaque scene pipelines compare equal and do not write.
+    // Application pipelines using `solid` may still add geometry the prepass did
+    // not know about with the ordinary less-than test.
     pub fn beginMain(self: *Renderer, command_buffer: vk.CommandBuffer) void {
-        pass.begin(self.context, command_buffer, self.mainPassTarget(), .{
+        pass.beginMain(self.context, command_buffer, self.mainPassTarget(), .{
             .clear_colour = self.clear_colour,
         });
     }
@@ -1291,6 +1650,7 @@ pub const Renderer = struct {
                 &.{self.scene.set(0)},
                 &.{},
             );
+            self.bindExtra(device, command_buffer);
         }
 
         if (batches.len > 0) {
@@ -1395,7 +1755,7 @@ pub const Renderer = struct {
     // Closes the main pass and leaves the target in the layout the chain and the
     // post pass sample it in.
     pub fn endMain(self: *Renderer, command_buffer: vk.CommandBuffer) void {
-        pass.end(self.context, command_buffer, self.mainPassTarget());
+        pass.endMain(self.context, command_buffer, self.mainPassTarget());
     }
 
     // The bloom chain, recorded between `endMain` and `recordPost`: it reads
@@ -1415,6 +1775,35 @@ pub const Renderer = struct {
         const look = frame_plan.look orelse return;
         self.bloom.record(command_buffer, look, frame_plan.post_constants.exposure);
         self.bloom_chains += 1;
+    }
+
+    // What the frame carries, measured off the main pass's own target.
+    //
+    // Recorded between `endMain` and the chain. It has to be after the first,
+    // because the target is only complete once the pass that fills it has
+    // ended, and it is before the second because that is where the frame's
+    // stages are ordered and nothing in the chain changes what this reads.
+    //
+    // A renderer built without a metering shader records nothing, and
+    // `meterCells` then answers null for every frame.
+    pub fn recordMeter(
+        self: *Renderer,
+        command_buffer: vk.CommandBuffer,
+        frame_plan: RecordPlan,
+    ) void {
+        const measured = if (self.meter) |*pass_| pass_ else return;
+        measured.record(command_buffer, frame_plan.frame_index);
+    }
+
+    // What that frame's dispatch measured, or null when this renderer does not
+    // meter or nothing has written that slot yet.
+    //
+    // The caller waits on the slot's fence before reading, exactly as it does
+    // for the device timestamps: this is a value the device produced and the
+    // host reads a ring apart.
+    pub fn meterCells(self: *const Renderer, frame_index: usize) ?meter.Cells {
+        const measured = if (self.meter) |*pass_| pass_ else return null;
+        return measured.read(frame_index);
     }
 
     // Opens the rendering that presents, and takes the acquired image from

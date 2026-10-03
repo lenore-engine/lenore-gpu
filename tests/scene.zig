@@ -28,8 +28,16 @@ test "each barrier names its own image and no other" {
         begin[1].subresource_range.aspect_mask,
     );
 
+    const between = pass.prepassBarrier(target);
+    try testing.expectEqual(target.depth_image, between[0].image);
+
     const end = pass.endBarriers(target);
     try testing.expectEqual(target.hdr_image, end[0].image);
+    try testing.expectEqual(target.depth_image, end[1].image);
+    try testing.expectEqual(
+        vk.ImageAspectFlags{ .depth_bit = true },
+        end[1].subresource_range.aspect_mask,
+    );
 }
 
 test "the layout the pass leaves the target in is the one it was put into" {
@@ -43,39 +51,56 @@ test "the layout the pass leaves the target in is the one it was put into" {
 
     try testing.expectEqual(begin[0].new_layout, end[0].old_layout);
     try testing.expectEqual(vk.ImageLayout.shader_read_only_optimal, end[0].new_layout);
+    try testing.expectEqual(begin[1].new_layout, end[1].old_layout);
+    try testing.expectEqual(pass.sampled_layout, end[1].new_layout);
 }
 
 test "the attachments the pass declares match the layouts the barriers set" {
     const colour = pass.colourAttachment(target, .{});
-    const depth = pass.depthAttachment(target);
+    const prepass_depth = pass.prepassDepthAttachment(target);
+    const main_depth = pass.mainDepthAttachment(target);
     const begin = pass.beginBarriers(target);
 
     try testing.expectEqual(target.hdr_view, colour.image_view);
     try testing.expectEqual(begin[0].new_layout, colour.image_layout);
-    try testing.expectEqual(target.depth_view, depth.image_view);
-    try testing.expectEqual(begin[1].new_layout, depth.image_layout);
+    try testing.expectEqual(target.depth_view, prepass_depth.image_view);
+    try testing.expectEqual(begin[1].new_layout, prepass_depth.image_layout);
+    try testing.expectEqual(prepass_depth.image_layout, main_depth.image_layout);
 }
 
-test "colour is kept and depth is thrown away" {
-    // Depth exists only within the pass, which is what allows the image to be
-    // lazily allocated. Storing it would silently cost memory bandwidth that
-    // nothing reads.
+test "depth is stored between renderings and after shading, for compute to sample" {
     const colour = pass.colourAttachment(target, .{});
-    const depth = pass.depthAttachment(target);
+    const prepass_depth = pass.prepassDepthAttachment(target);
+    const main_depth = pass.mainDepthAttachment(target);
 
     try testing.expectEqual(vk.AttachmentLoadOp.clear, colour.load_op);
     try testing.expectEqual(vk.AttachmentStoreOp.store, colour.store_op);
-    try testing.expectEqual(vk.AttachmentLoadOp.clear, depth.load_op);
-    try testing.expectEqual(vk.AttachmentStoreOp.dont_care, depth.store_op);
+    try testing.expectEqual(vk.AttachmentLoadOp.clear, prepass_depth.load_op);
+    try testing.expectEqual(vk.AttachmentStoreOp.store, prepass_depth.store_op);
+    try testing.expectEqual(vk.AttachmentLoadOp.load, main_depth.load_op);
+    try testing.expectEqual(vk.AttachmentStoreOp.store, main_depth.store_op);
 
-    // Nothing samples depth, so the end of the pass has one barrier and it is
-    // the colour one. A depth barrier here would be ordering a read that does
-    // not happen.
-    try testing.expectEqual(@as(usize, 1), pass.endBarriers(target).len);
+    // The inter-rendering barrier orders the write-to-read handoff without a
+    // layout transition.
+    const between = pass.prepassBarrier(target)[0];
+    try testing.expectEqual(between.old_layout, between.new_layout);
+    try testing.expect(between.src_access_mask.depth_stencil_attachment_write_bit);
+    try testing.expect(between.dst_access_mask.depth_stencil_attachment_read_bit);
+
+    // After the main pass the depth writes reach compute's and the post pass's
+    // sampled reads, and the next frame's first write waits for both.
+    const after = pass.endBarriers(target)[1];
+    try testing.expect(after.src_access_mask.depth_stencil_attachment_write_bit);
+    try testing.expect(after.dst_stage_mask.compute_shader_bit);
+    try testing.expect(after.dst_stage_mask.fragment_shader_bit);
+    try testing.expect(after.dst_access_mask.shader_sampled_read_bit);
+    const next = pass.beginBarriers(target)[1];
+    try testing.expect(next.src_stage_mask.compute_shader_bit);
+    try testing.expect(next.src_stage_mask.fragment_shader_bit);
 }
 
-test "the far plane is what the depth attachment clears to" {
-    const depth = pass.depthAttachment(target);
+test "the far plane is what the depth prepass clears to" {
+    const depth = pass.prepassDepthAttachment(target);
     try testing.expectEqual(@as(f32, 1), depth.clear_value.depth_stencil.depth);
 
     const colour = pass.colourAttachment(target, .{ .clear_colour = .{ 0.1, 0.2, 0.3, 1 } });
@@ -95,6 +120,8 @@ test "the viewport covers the target and leaves depth unscaled" {
 }
 
 test "the pass recording entry points are reached by the compiler" {
-    _ = &pass.begin;
-    _ = &pass.end;
+    _ = &pass.beginDepthPrepass;
+    _ = &pass.endDepthPrepass;
+    _ = &pass.beginMain;
+    _ = &pass.endMain;
 }

@@ -18,28 +18,53 @@ const SamplerCache = sampler_module.SamplerCache;
 const SamplerConfig = @import("lenore-resources").SamplerConfig;
 const Transfer = transfer_module.Transfer;
 
-// Decoded pixels are four bytes a texel, tightly packed.
-const rgba8_texel_bytes: vk.DeviceSize = 4;
-
+// What one texel of an uncompressed format occupies, and null for a format this
+// path does not carry.
+//
+// The list is short deliberately. A format earns a place here when a caller has
+// texels in hand and no container to put them in: the two eight-bit readings a
+// decoded image takes, half-float computed irradiance, and biased-packed
+// directional coefficients.
+// Anything whose block is more than one texel belongs in a KTX2, which reports
+// its own geometry.
+//
 // Vulkan specification, vkCmdCopyBufferToImage: bufferOffset is a multiple of 4
-// and of the texel block size. An RGBA8 texel block is one texel, so its own
-// size satisfies both. A KTX2 file reports its value instead, which differs
-// between a 16-byte compressed block and an 8-byte texel.
-const rgba8_alignment: vk.DeviceSize = rgba8_texel_bytes;
+// and of the texel block size. Every size here is a multiple of four and is its
+// own block, so the texel size satisfies both and serves as the alignment.
+fn texelBytes(format: vk.Format) ?vk.DeviceSize {
+    return switch (format) {
+        .a2b10g10r10_unorm_pack32, .r8g8b8a8_srgb, .r8g8b8a8_unorm => 4,
+        .r16g16b16a16_sfloat => 8,
+        else => null,
+    };
+}
+
+// The fallbacks are all four-byte formats, and a single texel of one.
+const fallback_alignment: vk.DeviceSize = 4;
 
 // Decoded pixels are one texel per block, so a row of them is a row of blocks.
 const uncompressed_block_height: u32 = 1;
 
-// Decoded pixels, independent of the container or decoder that produced them.
-// Rows are tightly packed from the top of the source image, four bytes per
-// texel. The bytes need only outlive acquisition; they are copied into staging.
-pub const Rgba8 = struct {
+// Texels with no container around them, independent of whatever produced them:
+// a decoder, or a pass that computed them. Rows are tightly packed from the top
+// of the image at the size the format gives a texel. The bytes need only outlive
+// acquisition; they are copied into staging.
+//
+// **One level, and that is the design rather than an omission.** This path
+// builds no mip chain and will not: a chain generated here would be filtered by
+// the driver, would know nothing of what the texture means, and could not run on
+// a compressed format at all. Chains are built where the semantic is known and
+// the filter can be chosen, baked into a KTX2, and read back through the reader
+// that insists a two-dimensional one be complete. What arrives here is content
+// that genuinely has one level, and content whose chain has not been baked yet
+// aliases under minification until it is.
+pub const Raw = struct {
     width: u32,
     height: u32,
     bytes: []const u8,
 };
 
-pub const Rgba8Error = error{
+pub const RawError = error{
     InvalidExtent,
     PixelLengthMismatch,
     PixelLengthOverflow,
@@ -62,6 +87,12 @@ pub const Fallback = enum {
     normal,
     // Keeps a disabled sampled-image binding valid without contributing light.
     black,
+    // The directional-diffuse correction when there is no direction cache. Its
+    // coefficients are signed and stored biased, so the zero coefficient is the
+    // mid code 512 in all three channels rather than zero bytes: sampling black
+    // here would decode to the most negative coefficient the range holds and
+    // extinguish the irradiance it multiplies. The two alpha bits are unused.
+    directional,
     // The environment when there is none. Unlike the emissive slot, where an
     // absent texture means white and the presence mask has to say so, an absent
     // environment really is zero radiance from every direction: the image-based
@@ -76,6 +107,9 @@ pub const Fallback = enum {
             .metallic_roughness => .{ 0, 255, 0, 255 },
             .normal => .{ 128, 128, 255, 255 },
             .black, .black_cube => .{ 0, 0, 0, 255 },
+            // Little endian 0x20080200: code 512 in each of the three ten-bit
+            // channels, which is the zero coefficient.
+            .directional => .{ 0x00, 0x02, 0x08, 0x20 },
         };
     }
 
@@ -87,12 +121,13 @@ pub const Fallback = enum {
         return switch (self) {
             .white, .black => .r8g8b8a8_srgb,
             .metallic_roughness, .normal, .black_cube => .r8g8b8a8_unorm,
+            .directional => .a2b10g10r10_unorm_pack32,
         };
     }
 
     pub fn shape(self: Fallback) image_module.Shape {
         return switch (self) {
-            .white, .metallic_roughness, .normal, .black => .texture_2d,
+            .white, .metallic_roughness, .normal, .black, .directional => .texture_2d,
             .black_cube => .cube,
         };
     }
@@ -178,7 +213,7 @@ pub const AcquireError = error{
     // The faces handed in do not describe six squares of the declared extent at
     // the declared format's texel size.
     CubeBytesMismatch,
-} || Rgba8Error || ktx2.ParseError || InitError || ref_cache.InsertError;
+} || RawError || ktx2.ParseError || InitError || ref_cache.InsertError;
 
 // The container's notion of what the file is, and the image type that has to be
 // created for it. They are separate enums because the parser has no Vulkan in
@@ -374,15 +409,15 @@ pub const TextureCache = struct {
         return .of(stored, resolved);
     }
 
-    pub fn acquireRgba8(
+    pub fn acquireRaw(
         self: *TextureCache,
         key: []const u8,
-        source: Rgba8,
+        source: Raw,
         format: vk.Format,
         sampler_config: SamplerConfig,
         transfer: *Transfer,
     ) AcquireError!Bound {
-        try validateRgba8(source, format);
+        try validateRaw(source, format);
 
         const resolved = try self.sampler(sampler_config);
         if (try self.acquireExisting(key, .{
@@ -393,7 +428,7 @@ pub const TextureCache = struct {
             .mip_levels = 1,
         }, resolved)) |existing| return existing;
 
-        const uploaded = try uploadRgba8(
+        const uploaded = try uploadRaw(
             self.context,
             self.memory_allocator,
             transfer,
@@ -406,8 +441,8 @@ pub const TextureCache = struct {
 
     // Host-side validation exposed on the type so container decoders can be
     // tested without constructing a device or a cache.
-    pub fn validateRgba8(source: Rgba8, format: vk.Format) Rgba8Error!void {
-        return validateRgba8Source(source, format);
+    pub fn validateRaw(source: Raw, format: vk.Format) RawError!void {
+        return validateRawSource(source, format);
     }
 
     const ExpectedImage = struct {
@@ -473,15 +508,15 @@ pub const TextureCache = struct {
     }
 };
 
-fn validateRgba8Source(source: Rgba8, format: vk.Format) Rgba8Error!void {
+fn validateRawSource(source: Raw, format: vk.Format) RawError!void {
     if (source.width == 0 or source.height == 0) return error.InvalidExtent;
-    if (format != .r8g8b8a8_srgb and format != .r8g8b8a8_unorm)
-        return error.UnsupportedPixelFormat;
+    const texel = texelBytes(format) orelse return error.UnsupportedPixelFormat;
 
     const width = std.math.cast(usize, source.width) orelse return error.PixelLengthOverflow;
     const height = std.math.cast(usize, source.height) orelse return error.PixelLengthOverflow;
     const pixels = std.math.mul(usize, width, height) catch return error.PixelLengthOverflow;
-    const expected = std.math.mul(usize, pixels, 4) catch return error.PixelLengthOverflow;
+    const expected = std.math.mul(usize, pixels, @as(usize, @intCast(texel))) catch
+        return error.PixelLengthOverflow;
     if (source.bytes.len != expected) return error.PixelLengthMismatch;
 }
 
@@ -513,18 +548,18 @@ fn uploadSingleTexel(
             .height = 1,
             .block_height = uncompressed_block_height,
             .row_bytes = texel.len,
-            .alignment = rgba8_alignment,
+            .alignment = fallback_alignment,
         });
     }
     recordShaderRead(&image, transfer);
     return image;
 }
 
-fn uploadRgba8(
+fn uploadRaw(
     context: *const Context,
     memory_allocator: *memory.MemoryAllocator,
     transfer: *Transfer,
-    source: Rgba8,
+    source: Raw,
     format: vk.Format,
 ) InitError!Image {
     var image = try Image.init(context, memory_allocator, .{
@@ -536,15 +571,16 @@ fn uploadRgba8(
     errdefer rollback(&image, transfer);
 
     image.recordLayoutTransition(transfer.commandBuffer(), .to_transfer_destination);
-    // validateRgba8Source proved the byte count is exactly width by height by
-    // four, so this row divides the face a whole number of times.
+    // `validateRawSource` proved the byte count is exactly width by height by
+    // this size, so the row divides the face a whole number of times.
+    const texel = texelBytes(format).?;
     try uploadFace(&image, transfer, source.bytes, .{
         .mip_level = 0,
         .layer = 0,
         .height = source.height,
         .block_height = uncompressed_block_height,
-        .row_bytes = @as(vk.DeviceSize, source.width) * rgba8_texel_bytes,
-        .alignment = rgba8_alignment,
+        .row_bytes = @as(vk.DeviceSize, source.width) * texel,
+        .alignment = texel,
     });
     recordShaderRead(&image, transfer);
     return image;

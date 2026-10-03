@@ -29,17 +29,64 @@ test "a light kind fills only the lanes it owns" {
     });
     try testing.expectEqual(gpu.LightUniform.Kind.spot, torch.kind);
     try testing.expect(torch.cos_inner > torch.cos_outer);
+    try testing.expectEqual([3]f32{ 0, 0, 0 }, torch.half_edge);
+    try testing.expectEqual(@as(f32, 0), torch.half_extent);
+
+    const panel = gpu.LightUniform.rect(.{ 1, 1, 1 }, 4, .{
+        .centre = .{ 0, 3, 0 },
+        .direction = .{ 0, -1, 0 },
+        .half_edge = .{ 1.5, 0, 0 },
+        .half_extent = 0.75,
+        .range = 12,
+    });
+    try testing.expectEqual(gpu.LightUniform.Kind.rect, panel.kind);
+    try testing.expectEqual(@as(f32, 0), panel.cos_inner);
+    try testing.expectEqual(@as(f32, 0), panel.cos_outer);
+    try testing.expectEqual([3]f32{ 1.5, 0, 0 }, panel.half_edge);
+}
+
+test "a rectangle's second edge follows from its first and the face it emits from" {
+    // The record stores one edge and a length, so the shader reconstructs the
+    // other edge. That reconstruction is the contract, and it is stated here
+    // rather than only in the shader, where nothing on this side could check it.
+    const panel = gpu.LightUniform.rect(.{ 1, 1, 1 }, 1, .{
+        .centre = .{ 0, 3, 0 },
+        .direction = .{ 0, -1, 0 },
+        .half_edge = .{ 1.5, 0, 0 },
+        .half_extent = 0.75,
+        .range = 0,
+    });
+
+    const perpendicular = zm.normalize3(zm.cross3(
+        zm.loadArr3(panel.direction),
+        zm.loadArr3(panel.half_edge),
+    )) * zm.f32x4s(panel.half_extent);
+
+    // A panel in a ceiling, facing down: its edges span the horizontal plane and
+    // neither of them leaves it.
+    try testing.expectApproxEqAbs(@as(f32, 0), perpendicular[1], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.75), @abs(perpendicular[2]), 1e-6);
+
+    // And the two edges are perpendicular, which is what makes the four corners
+    // a rectangle rather than a parallelogram.
+    try testing.expectApproxEqAbs(
+        @as(f32, 0),
+        zm.dot3(zm.loadArr3(panel.half_edge), perpendicular)[0],
+        1e-6,
+    );
 }
 
 test "the light record is laid out as the shader's array steps through it" {
     // Measured against the compiler's reflection in `tests/shader_reflection.zig`; this is
     // the same statement without the shader, so a change to the record fails
     // here even when the shaders are not rebuilt.
-    try testing.expectEqual(@as(usize, 64), @sizeOf(gpu.LightUniform));
+    try testing.expectEqual(@as(usize, 80), @sizeOf(gpu.LightUniform));
     try testing.expectEqual(@as(usize, 16), @alignOf(gpu.LightUniform));
     try testing.expectEqual(@as(usize, 12), @offsetOf(gpu.LightUniform, "kind"));
     try testing.expectEqual(@as(usize, 28), @offsetOf(gpu.LightUniform, "intensity"));
     try testing.expectEqual(@as(usize, 44), @offsetOf(gpu.LightUniform, "range"));
+    try testing.expectEqual(@as(usize, 64), @offsetOf(gpu.LightUniform, "half_edge"));
+    try testing.expectEqual(@as(usize, 76), @offsetOf(gpu.LightUniform, "half_extent"));
 }
 
 test "the lights block begins its array where the shader's does" {
@@ -48,7 +95,7 @@ test "the lights block begins its array where the shader's does" {
     // light's worth of the previous one's tail.
     try testing.expectEqual(@as(usize, 16), @offsetOf(gpu.LightsUniform, "lights"));
     try testing.expectEqual(
-        @as(usize, 16 + gpu.max_lights * 64),
+        @as(usize, 16 + gpu.max_lights * 80),
         @sizeOf(gpu.LightsUniform),
     );
 }
@@ -76,11 +123,12 @@ test "filling the block states how much of it is live and leaves the rest alone"
 }
 
 test "the block's kind values are the ones the shader branches on" {
-    // The shader compares against literal 0, 1 and 2, which is what a uint tag
+    // The shader compares against literal 0 to 3, which is what a uint tag
     // reduces to. Reordering the enum here would re-aim every light.
     try testing.expectEqual(@as(u32, 0), @intFromEnum(gpu.LightUniform.Kind.directional));
     try testing.expectEqual(@as(u32, 1), @intFromEnum(gpu.LightUniform.Kind.point));
     try testing.expectEqual(@as(u32, 2), @intFromEnum(gpu.LightUniform.Kind.spot));
+    try testing.expectEqual(@as(u32, 3), @intFromEnum(gpu.LightUniform.Kind.rect));
 }
 
 test "the flip negates the whole second column, not one entry" {

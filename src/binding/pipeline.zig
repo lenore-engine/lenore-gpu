@@ -14,13 +14,25 @@ pub const CreateError = vk.DeviceWrapper.CreateShaderModuleError ||
     vk.DeviceWrapper.CreateGraphicsPipelinesError ||
     vk.DeviceWrapper.CreateComputePipelinesError;
 
-// How a primitive reaches the colour target. They differ in more than blending:
+// How a primitive reaches its attachments. They differ in more than blending:
 // a blended primitive does not write depth, because it is drawn after the opaque
 // set in an order that is only approximately back to front, and depth writes
 // would let one transparent surface hide another.
 pub const Mode = enum {
+    // Writes the nearest depth while replacing colour when one is present. A
+    // depth-only pipeline uses this same state with no colour attachment.
     solid,
     blended,
+
+    // Shades opaque geometry after a depth prepass. Equality makes the fragment
+    // stage run only for the surface whose depth the prepass retained, and no
+    // write follows because the attachment already holds the final value.
+    //
+    // Not a mode any material maps to. The renderer substitutes it while
+    // building the solid half of the camera's scene pipelines; callers drawing
+    // geometry that was not in that prepass keep `solid` and add their depth in
+    // the main pass.
+    pretested,
 
     // The background, drawn at the far plane between the two sets above. It
     // composites by the depth test alone: nothing blends, and nothing is
@@ -228,15 +240,16 @@ fn addStream(input: *VertexInput, comptime Stream: type) void {
     }
 }
 
-// Every mode drawn into the camera's target tests depth against what the opaque
-// set already wrote. Only the solid one adds to it: a blended surface that wrote
-// depth would hide the blended surfaces behind it, which is the one thing
-// sorting cannot repair.
+// Every mode drawn into the camera's target tests depth. Solid adds the nearest
+// value, either in the prepass or for a draw that was not part of it. Pretested
+// shades only the value the prepass retained and leaves it unchanged. A blended
+// surface tests against that same value but cannot write one of its own: doing
+// so would hide blended surfaces behind it, which sorting cannot repair.
 //
-// The background is the one that has to accept equality. It is drawn at the far
-// plane, and the pixels it belongs in are exactly those still holding the clear,
-// which is that same value; a strict comparison would reject all of them and
-// draw nothing at all.
+// The background also accepts equality, for a different boundary. It is drawn
+// at the far plane, and the pixels it belongs in are exactly those still holding
+// the clear, which is that same value; a strict comparison would reject all of
+// them and draw nothing at all.
 //
 // The additive and overlay modes state no depth behaviour because they have
 // none. `create` hands this structure to the driver only when the rendering
@@ -246,11 +259,12 @@ pub fn depthStencilState(mode: Mode) vk.PipelineDepthStencilStateCreateInfo {
     return .{
         .depth_test_enable = switch (mode) {
             .additive, .overlay => .false,
-            .solid, .blended, .background => .true,
+            .solid, .blended, .pretested, .background => .true,
         },
         .depth_write_enable = if (mode == .solid) .true else .false,
         .depth_compare_op = switch (mode) {
             .solid, .blended => .less,
+            .pretested => .equal,
             .background => .less_or_equal,
             .additive, .overlay => .always,
         },
@@ -280,11 +294,11 @@ pub fn blendAttachment(mode: Mode) vk.PipelineColorBlendAttachmentState {
     return .{
         .blend_enable = switch (mode) {
             .blended, .additive, .overlay => .true,
-            .solid, .background => .false,
+            .solid, .pretested, .background => .false,
         },
         .src_color_blend_factor = switch (mode) {
             .additive, .overlay => .one,
-            .solid, .blended, .background => .src_alpha,
+            .solid, .blended, .pretested, .background => .src_alpha,
         },
         // The overlay scales the destination by the second source output rather
         // than by the first's alpha, because subpixel text covers each colour
@@ -295,13 +309,13 @@ pub fn blendAttachment(mode: Mode) vk.PipelineColorBlendAttachmentState {
         .dst_color_blend_factor = switch (mode) {
             .additive => .one,
             .overlay => .one_minus_src1_color,
-            .solid, .blended, .background => .one_minus_src_alpha,
+            .solid, .blended, .pretested, .background => .one_minus_src_alpha,
         },
         .color_blend_op = .add,
         .src_alpha_blend_factor = .one,
         .dst_alpha_blend_factor = switch (mode) {
             .overlay => .one_minus_src1_alpha,
-            .solid, .blended, .background, .additive => .zero,
+            .solid, .blended, .pretested, .background, .additive => .zero,
         },
         .alpha_blend_op = .add,
         .color_write_mask = .{ .r_bit = true, .g_bit = true, .b_bit = true, .a_bit = true },

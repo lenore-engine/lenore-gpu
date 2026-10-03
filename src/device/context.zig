@@ -19,24 +19,17 @@ const required_device_extensions = [_][*:0]const u8{
     vk.extensions.khr_swapchain.name,
 };
 
-// Every window system the platform can hand back, because the union it returns
-// declares them all and this switch has to be exhaustive on any target.
-const SurfaceError = InstanceWrapper.CreateWaylandSurfaceKHRError ||
-    InstanceWrapper.CreateWin32SurfaceKHRError;
 const LayerQueryError = BaseWrapper.EnumerateInstanceLayerPropertiesAllocError;
 const DeviceQueryError = Allocator.Error ||
     InstanceWrapper.EnumeratePhysicalDevicesAllocError ||
-    InstanceWrapper.EnumerateDeviceExtensionPropertiesAllocError ||
-    InstanceWrapper.GetPhysicalDeviceSurfaceSupportKHRError ||
-    InstanceWrapper.GetPhysicalDeviceSurfaceFormatsKHRError ||
-    InstanceWrapper.GetPhysicalDeviceSurfacePresentModesKHRError;
+    InstanceWrapper.EnumerateDeviceExtensionPropertiesAllocError;
 const DevicePickError = DeviceQueryError || error{NoSuitableDevice};
 
 pub const InitError = error{
     MissingValidationLayer,
     NoSuitableDevice,
 } || Loader.Error || Allocator.Error || BaseWrapper.CreateInstanceError ||
-    LayerQueryError || SurfaceError || DeviceQueryError ||
+    LayerQueryError || DeviceQueryError ||
     InstanceWrapper.CreateDebugUtilsMessengerEXTError || InstanceWrapper.CreateDeviceError;
 
 pub const MemoryTypeError = error{NoSuitableMemoryType};
@@ -78,9 +71,10 @@ pub const QueueSupport = struct {
 // Which families a device is taken with, or null when it offers no usable pair.
 //
 // Split from the query for the reason the other validators in this module are:
-// the rule is a scan over flags, and a device and a surface stand between it and
-// a test. Every path through it has been wrong at some point in some engine: the
-// shared family, the split pair, and the graphics family that cannot dispatch.
+// the rule is a scan over flags, and a device and a compositor stand between it
+// and a test. Every path through it has been wrong at some point in some
+// engine: the shared family, the split pair, and the graphics family that
+// cannot dispatch.
 //
 // One family serving both is preferred, because a shared family needs no
 // ownership transfer between the draw and the present.
@@ -110,6 +104,12 @@ const DeviceExtensions = struct {
     // code size. `pipeline_statistics` below is the unrelated core feature that
     // counts primitives and invocations through a query pool.
     shader_statistics: bool,
+    ray_query: bool,
+};
+
+const FeatureSupport = struct {
+    pipeline_statistics: bool,
+    ray_query: bool,
 };
 
 const DeviceCandidate = struct {
@@ -123,6 +123,14 @@ const DeviceCandidate = struct {
     max_buffer_size: vk.DeviceSize,
 };
 
+// The device and everything chosen with it, which is everything a surface does
+// not decide.
+//
+// No surface is held here, and that is the shape rather than an omission. The
+// device is picked against the display connection alone, so one context serves
+// every window of the process: a bar on each output, a menu, a dialogue. A
+// context that owned a surface would make the first window pick the GPU for
+// the rest of them, and a second window would need a second device.
 pub const Context = struct {
     pub const CommandBuffer = vk.CommandBufferProxy;
 
@@ -131,7 +139,6 @@ pub const Context = struct {
     base_wrapper: BaseWrapper,
     instance: Instance,
     debug_messenger: ?vk.DebugUtilsMessengerEXT,
-    surface: vk.SurfaceKHR,
     physical_device: vk.PhysicalDevice,
     properties: vk.PhysicalDeviceProperties,
     memory_properties: vk.PhysicalDeviceMemoryProperties,
@@ -142,6 +149,7 @@ pub const Context = struct {
     present_queue: Queue,
     pipeline_statistics_enabled: bool,
     memory_budget_enabled: bool,
+    ray_query_enabled: bool,
     // Whether a pipeline can be asked what the driver compiled it into. The
     // answer is only available for a pipeline created with the capture flag,
     // which is what `pipeline.Config.capture_statistics` asks for, so this
@@ -165,7 +173,7 @@ pub const Context = struct {
     pub fn init(
         allocator: Allocator,
         application_name: [:0]const u8,
-        native_handles: platform.NativeHandles,
+        display: platform.NativeDisplay,
     ) InitError!Context {
         var loader = try Loader.open();
         errdefer loader.close();
@@ -173,7 +181,7 @@ pub const Context = struct {
 
         var extension_names: std.ArrayList([*:0]const u8) = .empty;
         defer extension_names.deinit(allocator);
-        try appendSurfaceExtensions(&extension_names, allocator, native_handles);
+        try appendSurfaceExtensions(&extension_names, allocator, display);
         if (build_options.enable_validation)
             try extension_names.append(allocator, vk.extensions.ext_debug_utils.name);
 
@@ -233,10 +241,7 @@ pub const Context = struct {
         errdefer if (debug_messenger) |messenger|
             instance.destroyDebugUtilsMessengerEXT(messenger, null);
 
-        const surface = try createSurface(instance, native_handles);
-        errdefer instance.destroySurfaceKHR(surface, null);
-
-        const candidate = try pickIntegratedDevice(instance, allocator, surface);
+        const candidate = try pickIntegratedDevice(instance, allocator, display);
         const raw_device = try createDevice(instance, candidate);
         const loaded_device_wrapper = DeviceWrapper.load(
             raw_device,
@@ -259,7 +264,6 @@ pub const Context = struct {
             .base_wrapper = base_wrapper,
             .instance = instance,
             .debug_messenger = debug_messenger,
-            .surface = surface,
             .physical_device = candidate.physical_device,
             .properties = candidate.properties,
             .memory_properties = instance.getPhysicalDeviceMemoryProperties(candidate.physical_device),
@@ -270,6 +274,7 @@ pub const Context = struct {
             .present_queue = .init(device, candidate.queues.present_family),
             .pipeline_statistics_enabled = candidate.pipeline_statistics,
             .memory_budget_enabled = candidate.extensions.memory_budget,
+            .ray_query_enabled = candidate.extensions.ray_query,
             .shader_statistics_enabled = candidate.extensions.shader_statistics,
             .timestamp_valid_bits = candidate.timestamp_valid_bits,
         };
@@ -278,7 +283,6 @@ pub const Context = struct {
     pub fn deinit(self: *Context) void {
         self.device.destroyDevice(null);
         self.allocator.destroy(self.device.wrapper);
-        self.instance.destroySurfaceKHR(self.surface, null);
         if (self.debug_messenger) |messenger|
             self.instance.destroyDebugUtilsMessengerEXT(messenger, null);
         self.instance.destroyInstance(null);
@@ -319,32 +323,20 @@ pub const Context = struct {
     }
 };
 
+// The instance extensions a surface will need, enabled before one exists.
+//
+// They are instance-level and cannot be added later, so the window system has
+// to be known at instance creation even though no window is opened here. The
+// display connection names it, which is the other thing it is for.
 fn appendSurfaceExtensions(
     names: *std.ArrayList([*:0]const u8),
     allocator: Allocator,
-    handles: platform.NativeHandles,
+    display: platform.NativeDisplay,
 ) Allocator.Error!void {
     try names.append(allocator, vk.extensions.khr_surface.name);
-    switch (handles) {
+    switch (display) {
         .wayland => try names.append(allocator, vk.extensions.khr_wayland_surface.name),
-        // The extra underscore is not a typo. vulkan-zig generates
-        // VK_KHR_win32_surface under this spelling; the string it carries is
-        // the registry's.
-        .win32 => try names.append(allocator, vk.extensions.khr_win_32_surface.name),
     }
-}
-
-fn createSurface(instance: Instance, handles: platform.NativeHandles) SurfaceError!vk.SurfaceKHR {
-    return switch (handles) {
-        .wayland => |wayland| instance.createWaylandSurfaceKHR(&.{
-            .display = @ptrCast(wayland.display),
-            .surface = @ptrCast(wayland.surface),
-        }, null),
-        .win32 => |win32| instance.createWin32SurfaceKHR(&.{
-            .hinstance = @ptrCast(win32.hinstance),
-            .hwnd = @ptrCast(win32.hwnd),
-        }, null),
-    };
 }
 
 fn hasInstanceLayer(
@@ -362,7 +354,7 @@ fn hasInstanceLayer(
 fn pickIntegratedDevice(
     instance: Instance,
     allocator: Allocator,
-    surface: vk.SurfaceKHR,
+    display: platform.NativeDisplay,
 ) DevicePickError!DeviceCandidate {
     const physical_devices = try instance.enumeratePhysicalDevicesAlloc(allocator);
     defer allocator.free(physical_devices);
@@ -370,7 +362,7 @@ fn pickIntegratedDevice(
     for (physical_devices) |physical_device| {
         const properties = instance.getPhysicalDeviceProperties(physical_device);
         if (properties.device_type != .integrated_gpu) continue;
-        if (try inspectDevice(instance, physical_device, properties, allocator, surface)) |candidate|
+        if (try inspectDevice(instance, physical_device, properties, allocator, display)) |candidate|
             return candidate;
     }
     return error.NoSuitableDevice;
@@ -381,16 +373,20 @@ fn inspectDevice(
     physical_device: vk.PhysicalDevice,
     properties: vk.PhysicalDeviceProperties,
     allocator: Allocator,
-    surface: vk.SurfaceKHR,
+    display: platform.NativeDisplay,
 ) DeviceQueryError!?DeviceCandidate {
-    const extensions = try inspectDeviceExtensions(
+    var extensions = try inspectDeviceExtensions(
         instance,
         physical_device,
         allocator,
     ) orelse return null;
-    if (!try supportsSurface(instance, physical_device, surface)) return null;
-    const pipeline_statistics = supportsRequiredFeatures(instance, physical_device) orelse return null;
-    const queues = try allocateQueues(instance, physical_device, allocator, surface) orelse return null;
+    const feature_support = supportsRequiredFeatures(
+        instance,
+        physical_device,
+        extensions.ray_query,
+    ) orelse return null;
+    extensions.ray_query = feature_support.ray_query;
+    const queues = try allocateQueues(instance, physical_device, allocator, display) orelse return null;
     if (!supportsVertexFormats(instance, physical_device)) return null;
 
     return .{
@@ -399,7 +395,7 @@ fn inspectDevice(
         .queues = queues.allocation,
         .timestamp_valid_bits = queues.timestamp_valid_bits,
         .extensions = extensions,
-        .pipeline_statistics = pipeline_statistics,
+        .pipeline_statistics = feature_support.pipeline_statistics,
         .max_buffer_size = queryMaxBufferSize(instance, physical_device),
     };
 }
@@ -408,8 +404,8 @@ fn allocateQueues(
     instance: Instance,
     physical_device: vk.PhysicalDevice,
     allocator: Allocator,
-    surface: vk.SurfaceKHR,
-) (Allocator.Error || InstanceWrapper.GetPhysicalDeviceSurfaceSupportKHRError)!?ChosenQueues {
+    display: platform.NativeDisplay,
+) Allocator.Error!?ChosenQueues {
     const families = try instance.getPhysicalDeviceQueueFamilyPropertiesAlloc(physical_device, allocator);
     defer allocator.free(families);
 
@@ -420,11 +416,7 @@ fn allocateQueues(
         entry.* = .{
             .graphics = properties.queue_flags.graphics_bit,
             .compute = properties.queue_flags.compute_bit,
-            .present = try instance.getPhysicalDeviceSurfaceSupportKHR(
-                physical_device,
-                @intCast(index),
-                surface,
-            ) == .true,
+            .present = supportsPresentation(instance, physical_device, @intCast(index), display),
             .timestamp_valid_bits = properties.timestamp_valid_bits,
         };
     }
@@ -444,17 +436,32 @@ const ChosenQueues = struct {
     timestamp_valid_bits: u32,
 };
 
-fn supportsSurface(
+// Whether this family can present to the window system, asked without a
+// surface to ask about.
+//
+// The per-platform form of the question. Vulkan specification,
+// vkGetPhysicalDeviceWaylandPresentationSupportKHR: it determines "whether a
+// queue family of a physical device supports presentation to a Wayland
+// compositor", which is the compositor and not one surface on it. That is what
+// makes it answerable here, before any window. It returns no VkResult.
+//
+// It does not replace vkGetPhysicalDeviceSurfaceSupportKHR: a swapchain
+// requires its surface to be supported as determined by that call
+// (VUID-VkSwapchainCreateInfoKHR-surface-01270), which `surface.zig` asks
+// where a surface exists to ask about.
+fn supportsPresentation(
     instance: Instance,
     physical_device: vk.PhysicalDevice,
-    surface: vk.SurfaceKHR,
-) (InstanceWrapper.GetPhysicalDeviceSurfaceFormatsKHRError ||
-    InstanceWrapper.GetPhysicalDeviceSurfacePresentModesKHRError)!bool {
-    var format_count: u32 = 0;
-    _ = try instance.getPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &format_count, null);
-    var present_mode_count: u32 = 0;
-    _ = try instance.getPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &present_mode_count, null);
-    return format_count > 0 and present_mode_count > 0;
+    family: u32,
+    display: platform.NativeDisplay,
+) bool {
+    return switch (display) {
+        .wayland => |wayland| instance.getPhysicalDeviceWaylandPresentationSupportKHR(
+            physical_device,
+            family,
+            @ptrCast(wayland.display),
+        ) == .true,
+    };
 }
 
 fn inspectDeviceExtensions(
@@ -481,6 +488,16 @@ fn inspectDeviceExtensions(
             available,
             vk.extensions.khr_pipeline_executable_properties.name,
         ),
+        .ray_query = hasDeviceExtension(
+            available,
+            vk.extensions.khr_acceleration_structure.name,
+        ) and hasDeviceExtension(
+            available,
+            vk.extensions.khr_deferred_host_operations.name,
+        ) and hasDeviceExtension(
+            available,
+            vk.extensions.khr_ray_query.name,
+        ),
     };
 }
 
@@ -497,12 +514,23 @@ fn hasDeviceExtension(
     return false;
 }
 
-fn supportsRequiredFeatures(instance: Instance, physical_device: vk.PhysicalDevice) ?bool {
+fn supportsRequiredFeatures(
+    instance: Instance,
+    physical_device: vk.PhysicalDevice,
+    ray_query_extensions: bool,
+) ?FeatureSupport {
     const properties = instance.getPhysicalDeviceProperties(physical_device);
     if (properties.api_version < @as(u32, @bitCast(vk.API_VERSION_1_3))) return null;
 
+    var ray_query = vk.PhysicalDeviceRayQueryFeaturesKHR{};
+    var acceleration_structure = vk.PhysicalDeviceAccelerationStructureFeaturesKHR{};
     var vulkan_13 = vk.PhysicalDeviceVulkan13Features{};
-    var vulkan_11 = vk.PhysicalDeviceVulkan11Features{ .p_next = @ptrCast(&vulkan_13) };
+    var vulkan_12 = vk.PhysicalDeviceVulkan12Features{ .p_next = @ptrCast(&vulkan_13) };
+    var vulkan_11 = vk.PhysicalDeviceVulkan11Features{ .p_next = @ptrCast(&vulkan_12) };
+    if (ray_query_extensions) {
+        vulkan_13.p_next = @ptrCast(&acceleration_structure);
+        acceleration_structure.p_next = @ptrCast(&ray_query);
+    }
     var features = vk.PhysicalDeviceFeatures2{
         .p_next = @ptrCast(&vulkan_11),
         .features = .{},
@@ -518,6 +546,10 @@ fn supportsRequiredFeatures(instance: Instance, physical_device: vk.PhysicalDevi
         // alpha cannot scale the destination by three different amounts. The
         // second source output carries them, which is what this feature admits.
         core.dual_src_blend != .true or
+        // A consumer that culls on its own records many draws of one pipeline
+        // as one indirect call. Without this feature its draw count must be
+        // 0 or 1 (Vulkan specification, VUID-vkCmdDrawIndirect-drawCount-02718).
+        core.multi_draw_indirect != .true or
         vulkan_13.dynamic_rendering != .true or
         vulkan_13.synchronization_2 != .true or
         // The masked alpha path discards, and Slang lowers `discard` to
@@ -533,7 +565,13 @@ fn supportsRequiredFeatures(instance: Instance, physical_device: vk.PhysicalDevi
     {
         return null;
     }
-    return core.pipeline_statistics_query == .true;
+    return .{
+        .pipeline_statistics = core.pipeline_statistics_query == .true,
+        .ray_query = ray_query_extensions and
+            vulkan_12.buffer_device_address == .true and
+            acceleration_structure.acceleration_structure == .true and
+            ray_query.ray_query == .true,
+    };
 }
 
 fn queryMaxBufferSize(
@@ -586,8 +624,13 @@ fn createDevice(instance: Instance, candidate: DeviceCandidate) InstanceWrapper.
         .synchronization_2 = .true,
         .shader_demote_to_helper_invocation = .true,
     };
-    var vulkan_11 = vk.PhysicalDeviceVulkan11Features{
+    // Buffer device addresses only when ray query, which needs them, is enabled.
+    var vulkan_12 = vk.PhysicalDeviceVulkan12Features{
         .p_next = @ptrCast(&vulkan_13),
+        .buffer_device_address = if (candidate.extensions.ray_query) .true else .false,
+    };
+    var vulkan_11 = vk.PhysicalDeviceVulkan11Features{
+        .p_next = @ptrCast(&vulkan_12),
         .shader_draw_parameters = .true,
     };
     const features = vk.PhysicalDeviceFeatures2{
@@ -598,11 +641,15 @@ fn createDevice(instance: Instance, candidate: DeviceCandidate) InstanceWrapper.
             .texture_compression_bc = .true,
             .shader_storage_image_extended_formats = .true,
             .dual_src_blend = .true,
+            .multi_draw_indirect = .true,
             .pipeline_statistics_query = if (candidate.pipeline_statistics) .true else .false,
         },
     };
     var extension_names = [_][*:0]const u8{
         vk.extensions.khr_swapchain.name,
+        undefined,
+        undefined,
+        undefined,
         undefined,
         undefined,
     };
@@ -616,19 +663,37 @@ fn createDevice(instance: Instance, candidate: DeviceCandidate) InstanceWrapper.
             vk.extensions.khr_pipeline_executable_properties.name;
         extension_count += 1;
     }
+    if (candidate.extensions.ray_query) {
+        extension_names[extension_count] = vk.extensions.khr_acceleration_structure.name;
+        extension_count += 1;
+        extension_names[extension_count] = vk.extensions.khr_deferred_host_operations.name;
+        extension_count += 1;
+        extension_names[extension_count] = vk.extensions.khr_ray_query.name;
+        extension_count += 1;
+    }
 
-    // Appended to the tail of the chain rather than to its head: the head is
-    // where the 1.1 and 1.3 feature structures already are, and taking their
-    // place would ask for neither.
-    //
-    // Chained only when the extension is enabled beside it. A feature structure
-    // for an extension the device was not given is not a request the driver has
-    // to understand.
+    // Optional feature structures follow the core-version chain so enabling one
+    // cannot displace a required core feature structure. Each extension feature
+    // structure is present only when its extension is enabled beside it.
     var executable_properties = vk.PhysicalDevicePipelineExecutablePropertiesFeaturesKHR{
         .pipeline_executable_info = .true,
     };
-    if (candidate.extensions.shader_statistics)
-        vulkan_13.p_next = @ptrCast(&executable_properties);
+    var ray_query = vk.PhysicalDeviceRayQueryFeaturesKHR{
+        .ray_query = .true,
+    };
+    var acceleration_structure = vk.PhysicalDeviceAccelerationStructureFeaturesKHR{
+        .acceleration_structure = .true,
+    };
+    if (candidate.extensions.ray_query) {
+        vulkan_13.p_next = @ptrCast(&acceleration_structure);
+        acceleration_structure.p_next = @ptrCast(&ray_query);
+    }
+    if (candidate.extensions.shader_statistics) {
+        if (candidate.extensions.ray_query)
+            ray_query.p_next = @ptrCast(&executable_properties)
+        else
+            vulkan_13.p_next = @ptrCast(&executable_properties);
+    }
 
     return instance.createDevice(candidate.physical_device, &.{
         .p_next = @ptrCast(&features),

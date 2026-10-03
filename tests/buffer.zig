@@ -21,6 +21,7 @@ const valid_request: gpu.BufferCreateRequest = .{
     .size = 256,
     .max_buffer_size = max_buffer_size,
     .usage = .{ .transfer_dst_bit = true },
+    .ray_query_enabled = false,
 };
 
 fn source(size: vk.DeviceSize, usage: vk.BufferUsageFlags) gpu.BufferDescriptor {
@@ -58,11 +59,25 @@ test "creation refuses usage this module does not support" {
     none.usage = .{};
     try testing.expectError(error.EmptyUsage, gpu.validateBufferCreate(none));
 
-    // Buffer device address is a feature the context does not enable, and the
-    // allocator has no blocks created for it.
-    var addressed = valid_request;
-    addressed.usage = .{ .transfer_dst_bit = true, .shader_device_address_bit = true };
-    try testing.expectError(error.UnsupportedUsage, gpu.validateBufferCreate(addressed));
+    var unsupported = valid_request;
+    unsupported.usage = .{ .conditional_rendering_bit_ext = true };
+    try testing.expectError(error.UnsupportedUsage, gpu.validateBufferCreate(unsupported));
+}
+
+test "ray query buffer usages require negotiated support" {
+    const usages = [_]vk.BufferUsageFlags{
+        .{ .shader_device_address_bit = true },
+        .{ .acceleration_structure_build_input_read_only_bit_khr = true },
+        .{ .acceleration_structure_storage_bit_khr = true },
+    };
+    for (usages) |usage| {
+        var request = valid_request;
+        request.usage = usage;
+        try testing.expectError(error.RayQueryDisabled, gpu.validateBufferCreate(request));
+
+        request.ray_query_enabled = true;
+        try gpu.validateBufferCreate(request);
+    }
 }
 
 test "creation refuses an allocator belonging to another device" {

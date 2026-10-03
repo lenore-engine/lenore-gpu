@@ -32,7 +32,8 @@ pub const AllocationError = error{
 } || Allocator.Error ||
     vk.DeviceWrapper.AllocateMemoryError ||
     vk.DeviceWrapper.MapMemoryError;
-pub const BufferAllocationError = AllocationError || vk.DeviceWrapper.BindBufferMemoryError;
+pub const BufferAllocationError = error{BufferDeviceAddressDisabled} ||
+    AllocationError || vk.DeviceWrapper.BindBufferMemoryError;
 pub const ImageAllocationError = AllocationError || vk.DeviceWrapper.BindImageMemoryError;
 pub const FreeError = error{InvalidAllocation};
 
@@ -81,6 +82,7 @@ const Block = struct {
     size: vk.DeviceSize,
     memory_type_index: u32,
     pool: Pool,
+    device_address: bool,
     mapped: ?[*]u8,
     suballocator: Suballocator,
     release_when_empty: bool,
@@ -108,6 +110,7 @@ const Request = struct {
     pool: Pool,
     requirements: vk.MemoryRequirements,
     dedicated: DedicatedResource,
+    device_address: bool,
 };
 
 pub const MemoryAllocator = struct {
@@ -161,14 +164,20 @@ pub const MemoryAllocator = struct {
         return status;
     }
 
-    // This ordinary-buffer path excludes sparse buffers and buffers created with
-    // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT. The Context does not enable the
-    // bufferDeviceAddress feature; adding it also requires allocation-flag pools.
+    // Vulkan specification, Memory Allocation: the device-address allocation
+    // flag belongs to the memory block, not its suballocation, so addressable and
+    // ordinary buffers use distinct blocks. The buffer usage bit is the source of
+    // truth; caller intent cannot put an addressable buffer in ordinary memory.
     pub fn allocateBuffer(
         self: *MemoryAllocator,
         buffer: vk.Buffer,
+        usage: vk.BufferUsageFlags,
         class: BufferClass,
     ) BufferAllocationError!Allocation {
+        const device_address = usage.shader_device_address_bit;
+        if (device_address and !self.context.ray_query_enabled)
+            return error.BufferDeviceAddressDisabled;
+
         var dedicated = vk.MemoryDedicatedRequirements{
             .prefers_dedicated_allocation = undefined,
             .requires_dedicated_allocation = undefined,
@@ -196,6 +205,7 @@ pub const MemoryAllocator = struct {
                 .{ .buffer = buffer }
             else
                 .none,
+            .device_address = device_address,
         });
         errdefer self.freeLocked(allocation) catch |err| switch (err) {
             error.InvalidAllocation => @panic("allocator rejected its own buffer allocation"),
@@ -238,6 +248,7 @@ pub const MemoryAllocator = struct {
                 .{ .image = image }
             else
                 .none,
+            .device_address = false,
         });
         errdefer self.freeLocked(allocation) catch |err| switch (err) {
             error.InvalidAllocation => @panic("allocator rejected its own image allocation"),
@@ -318,6 +329,7 @@ pub const MemoryAllocator = struct {
                 const block = &(slot.block orelse continue);
                 const type_bit = @as(u32, 1) << @intCast(block.memory_type_index);
                 if (block.pool != request.pool or
+                    block.device_address != request.device_address or
                     request.requirements.memory_type_bits & type_bit == 0 or
                     block.release_when_empty)
                 {
@@ -369,8 +381,18 @@ pub const MemoryAllocator = struct {
             .buffer => |buffer| dedicated_info.buffer = buffer,
             .image => |image| dedicated_info.image = image,
         }
-        const memory = try self.context.device.allocateMemory(&.{
+        var flags_info = vk.MemoryAllocateFlagsInfo{
             .p_next = if (dedicated) @ptrCast(&dedicated_info) else null,
+            .flags = .{ .device_address_bit = true },
+            .device_mask = 0,
+        };
+        const memory = try self.context.device.allocateMemory(&.{
+            .p_next = if (request.device_address)
+                @ptrCast(&flags_info)
+            else if (dedicated)
+                @ptrCast(&dedicated_info)
+            else
+                null,
             .allocation_size = block_size,
             .memory_type_index = choice.index,
         }, null);
@@ -410,6 +432,7 @@ pub const MemoryAllocator = struct {
             .size = block_size,
             .memory_type_index = choice.index,
             .pool = request.pool,
+            .device_address = request.device_address,
             .mapped = mapped,
             .suballocator = suballocator,
             .release_when_empty = release_when_empty,

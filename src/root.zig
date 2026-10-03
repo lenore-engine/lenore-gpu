@@ -1,3 +1,4 @@
+const acceleration = @import("object/acceleration.zig");
 const attachment = @import("pass/attachment.zig");
 const buffer = @import("object/buffer.zig");
 const commands = @import("device/commands.zig");
@@ -31,6 +32,7 @@ const transfer = @import("staging/transfer.zig");
 const uniforms = @import("binding/uniforms.zig");
 const upload = @import("staging/upload.zig");
 const storage = @import("store/owning.zig");
+const surface = @import("device/surface.zig");
 const swapchain = @import("device/swapchain.zig");
 
 pub const Context = context.Context;
@@ -47,6 +49,7 @@ pub const validateFrameContents = frame_set.validate;
 pub const Instance = frame_set.Instance;
 pub const Joint = frame_set.Joint;
 pub const FrameCapacity = frame_set.Capacity;
+pub const Surface = surface.Surface;
 pub const Swapchain = swapchain.Swapchain;
 pub const PresentModePreference = swapchain.PresentModePreference;
 
@@ -54,6 +57,16 @@ pub const MemoryAllocator = memory.MemoryAllocator;
 pub const MemoryConfig = memory.Config;
 pub const BufferMemoryClass = memory.BufferClass;
 pub const MemoryAllocation = memory.Allocation;
+
+pub const AccelerationStructure = acceleration.AccelerationStructure;
+pub const PendingAccelerationBuild = acceleration.PendingBuild;
+pub const AccelerationInstance = acceleration.Instance;
+pub const AccelerationTriangleGeometry = acceleration.TriangleGeometry;
+pub const AccelerationBoxGeometry = acceleration.BoxGeometry;
+pub const AccelerationIndexData = acceleration.IndexData;
+pub const recordBottomLevelAcceleration = acceleration.recordBottomLevel;
+pub const recordBottomLevelAccelerationBoxes = acceleration.recordBottomLevelBoxes;
+pub const recordTopLevelAcceleration = acceleration.recordTopLevel;
 
 pub const Buffer = buffer.Buffer;
 pub const CopyRegion = buffer.CopyRegion;
@@ -150,6 +163,15 @@ pub const uiSampledLayout = ui.sampled_layout;
 pub const uiScissorFor = ui.scissorFor;
 pub const uiInverseExtent = ui.inverseExtent;
 
+const meter = @import("pass/meter.zig");
+pub const MeterPass = meter.MeterPass;
+pub const MeterShader = meter.Shader;
+pub const MeterCells = meter.Cells;
+pub const meter_bindings = meter.bindings;
+pub const meter_cell_side = meter.cell_side;
+pub const meter_tap_side = meter.tap_side;
+pub const meter_cell_count = meter.cell_count;
+
 const bloom = @import("pass/bloom.zig");
 pub const Bloom = bloom;
 pub const BloomPass = bloom.BloomPass;
@@ -191,8 +213,11 @@ pub const SceneVariant = renderer.SceneVariant;
 pub const sceneVariantFor = renderer.sceneVariantFor;
 pub const sceneVariantIndex = renderer.sceneVariantIndex;
 pub const scenePipelineIndex = renderer.scenePipelineIndex;
+pub const scenePipelineMode = renderer.scenePipelineMode;
+pub const depthPipelineIndex = renderer.depthPipelineIndex;
 pub const scene_variants = renderer.scene_variants;
 pub const scene_pipeline_count = renderer.scene_pipeline_count;
+pub const depth_pipeline_count = renderer.depth_pipeline_count;
 pub const scene_modes = renderer.scene_modes;
 pub const RecordBatch = renderer.RecordBatch;
 pub const MaterialRecord = renderer.MaterialRecord;
@@ -203,6 +228,7 @@ pub const batchVertexSource = renderer.batchVertexSource;
 // any, and these are the shapes that composition fills.
 pub const Shaders = renderer.Shaders;
 pub const SceneShader = renderer.SceneShader;
+pub const SceneShading = renderer.SceneShading;
 pub const SkyShader = sky.Shader;
 pub const PostShader = post.Shader;
 pub const BloomShader = bloom.Shader;
@@ -210,11 +236,25 @@ pub const ShadowShader = shadow.Shader;
 pub const MorphShader = morph.Shader;
 
 pub const RendererMaterialBindings = renderer.material_bindings;
+const lightmap_object = @import("object/lightmap.zig");
+pub const Lightmap = lightmap_object.Lightmap;
+pub const lightmapSampler = lightmap_object.sampler_config;
+pub const lightmap_bindings = lightmap_object.bindings;
+
+// Texels with no container around them. Named here because an application that
+// computes an image rather than decoding one has to spell the source type.
+pub const Raw = @import("object/texture_cache.zig").Raw;
+
 pub const SceneSetBindings = renderer.scene_bindings;
 pub const frame_set_index = renderer.frame_set_index;
 pub const scene_set_index = renderer.scene_set_index;
 pub const material_set_index = renderer.material_set_index;
 pub const shadow_set_index = renderer.shadow_set_index;
+// The set this module describes nothing about, for an application whose scene
+// shader needs resources the engine has no vocabulary for. Named here because
+// the application's shader has to declare the same index and its layout has to
+// be handed back in `Shaders`.
+pub const scene_extra_set_index = renderer.scene_extra_set_index;
 
 pub const ResourceStorage = resource_storage.ResourceStorage;
 pub const TextureSet = resource_storage.TextureSet;
@@ -246,6 +286,7 @@ pub const DescriptorBinding = descriptors.Binding;
 pub const DescriptorSets = descriptors.Sets;
 pub const DescriptorBufferSource = descriptors.BufferSource;
 pub const DescriptorImageSource = descriptors.ImageSource;
+pub const DescriptorAccelerationSource = descriptors.AccelerationSource;
 
 // The bindings this module was generated against.
 //
@@ -293,6 +334,7 @@ pub const GpuTimings = timing.Frame;
 pub const GpuPass = timing.Pass;
 pub const GpuTimestampEdge = timing.Edge;
 pub const gpuTimestampSlot = timing.slot;
+pub const gpu_timestamp_slots_per_frame = timing.slots_per_frame;
 pub const gpuDurationNs = timing.durationNs;
 
 pub const PerFrame = per_frame.PerFrame;
@@ -305,6 +347,9 @@ pub const PostSets = post.Sets;
 pub const PostSource = post.Source;
 pub const PostBindings = post.bindings;
 pub const PostSettings = post.Settings;
+pub const PostApplication = post.Application;
+pub const postApplicationOffset = post.application_offset;
+pub const postApplicationSize = post.application_size;
 pub const PostSettingsError = post.SettingsError;
 pub const PostPushConstants = post.PushConstants;
 pub const postPushConstantRange = post.push_constant_range;

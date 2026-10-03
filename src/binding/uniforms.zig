@@ -21,9 +21,19 @@ pub const Camera = extern struct {
     // as four rows and the shader reads it the same way; nothing transposes.
     view_projection: zm.Mat align(16),
 
-    // xyz is the eye in world space. The fourth lane is padding that the
-    // sixteen-byte alignment would insert anyway, so it is named rather than
-    // left to the compiler.
+    // xyz is the eye in world space, and w is the frame's clock in seconds.
+    //
+    // The clock rides in a lane the sixteen-byte alignment reserves anyway, so
+    // it costs nothing and moves nothing. It belongs in this block rather than
+    // beside it for the reason Godot gives for keeping its own `time` in the
+    // scene data block: this is where a frame's view-independent globals live,
+    // and a shader that animates anything needs one exactly as much as it needs
+    // the eye (`servers/rendering/renderer_rd/shaders/scene_data_inc.glsl`,
+    // `struct SceneData`).
+    //
+    // It is folded into an hour, so anything animated on it must be periodic in
+    // that hour. `lenore`'s `FrameTime.shaderSeconds` is what folds it and says
+    // why.
     position: [4]f32 align(16),
 
     // The view ray a pass covering the target reconstructs, in the shape
@@ -68,9 +78,10 @@ pub const max_lights = 16;
 // out as. Nothing here restates them: `tests/shader_reflection.zig` holds every field
 // against the compiler's own account of the shader.
 pub const Light = extern struct {
-    pub const Kind = enum(u32) { directional, point, spot };
+    pub const Kind = enum(u32) { directional, point, spot, rect };
 
-    // World space, for `point` and `spot`. Unused by `directional`.
+    // World space. The centre for `rect`, the source for `point` and `spot`.
+    // Unused by `directional`.
     position: [3]f32 align(16),
     kind: Kind,
 
@@ -79,7 +90,9 @@ pub const Light = extern struct {
     intensity: f32,
 
     // Unit, and pointing the way the light travels, which is the convention
-    // `lenore-scene`'s `Light` carries and normalizes. Unused by `point`.
+    // `lenore-scene`'s `Light` carries and normalizes. For `rect` it is the face
+    // the rectangle emits from, so a surface behind it receives nothing. Unused
+    // by `point`.
     direction: [3]f32,
 
     // Distance past which the light contributes nothing. Unused by
@@ -87,7 +100,7 @@ pub const Light = extern struct {
     range: f32,
 
     // The spot cone, as cosines against the axis. `cos_inner` is the larger:
-    // cosine falls as the angle opens. Both zero for the other two kinds.
+    // cosine falls as the angle opens. Both zero for the other kinds.
     cos_inner: f32,
     cos_outer: f32,
 
@@ -95,6 +108,22 @@ pub const Light = extern struct {
     // rather than left to the compiler so the shader's own padding field has
     // something to match.
     padding: [2]f32 = .{ 0, 0 },
+
+    // The rectangle, for `rect`, and zero for every other kind.
+    //
+    // `half_edge` is half of one edge, as a vector from the centre at
+    // `position`. The other edge is perpendicular to it and to `direction`, with
+    // `half_extent` for its half length, so the four corners are the centre plus
+    // and minus `half_edge`, plus and minus `normalize(cross(direction,
+    // half_edge))` scaled by `half_extent`.
+    //
+    // One vector and one scalar rather than two vectors. The second edge is
+    // fixed by the first and the emitting face up to its length, so storing it
+    // as well would allow a rectangle whose own edges disagree with the
+    // direction it claims to emit in, and nothing downstream could tell which of
+    // the three was meant.
+    half_edge: [3]f32 = .{ 0, 0, 0 },
+    half_extent: f32 = 0,
 
     pub fn directional(colour: [3]f32, intensity: f32, direction: [3]f32) Light {
         return .{
@@ -130,6 +159,21 @@ pub const Light = extern struct {
         cos_outer: f32,
     };
 
+    pub const Rect = struct {
+        centre: [3]f32,
+
+        // Unit, and the face the rectangle emits from.
+        direction: [3]f32,
+
+        // Half of one edge, as a vector from the centre, and the half length of
+        // the edge perpendicular to it. See the fields for the geometry these
+        // describe.
+        half_edge: [3]f32,
+        half_extent: f32,
+
+        range: f32,
+    };
+
     pub fn spot(colour: [3]f32, intensity: f32, cone: Spot) Light {
         return .{
             .position = cone.position,
@@ -140,6 +184,21 @@ pub const Light = extern struct {
             .range = cone.range,
             .cos_inner = cone.cos_inner,
             .cos_outer = cone.cos_outer,
+        };
+    }
+
+    pub fn rect(colour: [3]f32, intensity: f32, panel: Rect) Light {
+        return .{
+            .position = panel.centre,
+            .kind = .rect,
+            .colour = colour,
+            .intensity = intensity,
+            .direction = panel.direction,
+            .range = panel.range,
+            .cos_inner = 0,
+            .cos_outer = 0,
+            .half_edge = panel.half_edge,
+            .half_extent = panel.half_extent,
         };
     }
 };

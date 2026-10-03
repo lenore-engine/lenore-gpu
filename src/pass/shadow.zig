@@ -174,13 +174,13 @@ pub const ShadowPass = struct {
         if (map_size == 0 or map_size > context.properties.limits.max_image_dimension_2d)
             return error.MapSizeUnsupported;
 
-        const format = try attachment.shadowFormat(context);
+        const format = try attachment.depthFormat(context);
 
         var map = try image.Image.init(context, memory_allocator, .{
             .width = map_size,
             .height = map_size,
             .format = format,
-            .usage = attachment.shadow_usage,
+            .usage = attachment.depth_usage,
             .kind = .depth,
         });
         errdefer map.deinit();

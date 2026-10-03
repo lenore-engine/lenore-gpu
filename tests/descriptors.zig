@@ -99,6 +99,11 @@ const sampled_set = [_]gpu.DescriptorBinding{
     .{ .slot = 1, .name = "second", .kind = .combined_image_sampler, .stages = fragment },
 };
 
+const mixed_acceleration_set = [_]gpu.DescriptorBinding{
+    .{ .slot = 0, .name = "data", .kind = .storage_buffer, .stages = .{ .compute_bit = true } },
+    .{ .slot = 1, .name = "scene", .kind = .acceleration_structure_khr, .stages = .{ .compute_bit = true } },
+};
+
 test "a buffer write is keyed by binding name, not by position" {
     const Group = gpu.DescriptorSets(&frame_set);
     var first = handled(0x11);
@@ -169,6 +174,49 @@ test "one buffer can fill two slots" {
     try testing.expectEqual(infos[0].buffer, infos[1].buffer);
     try testing.expectEqual(@as(u32, 0), writes[0].dst_binding);
     try testing.expectEqual(@as(u32, 1), writes[1].dst_binding);
+}
+
+test "mixed buffer and acceleration writes select their own bindings" {
+    const Group = gpu.DescriptorSets(&mixed_acceleration_set);
+    var data = handled(0x55);
+    var buffer_infos: [1]vk.DescriptorBufferInfo = undefined;
+    const buffer_writes = Group.bufferWrites(.null_handle, &buffer_infos, .{ .data = &data });
+
+    try testing.expectEqual(@as(usize, 1), buffer_writes.len);
+    try testing.expectEqual(@as(u32, 0), buffer_writes[0].dst_binding);
+    try testing.expectEqual(@as(vk.Buffer, @enumFromInt(0x55)), buffer_infos[0].buffer);
+
+    var structure: gpu.AccelerationStructure = undefined;
+    structure.handle = @enumFromInt(0x66);
+    const source = gpu.DescriptorAccelerationSource.one(&structure);
+    var acceleration_infos: [1]vk.WriteDescriptorSetAccelerationStructureKHR = undefined;
+    const acceleration_writes = try Group.accelerationWrites(
+        .null_handle,
+        &acceleration_infos,
+        .{ .scene = source },
+    );
+
+    try testing.expectEqual(@as(usize, 1), acceleration_writes.len);
+    try testing.expectEqual(@as(u32, 1), acceleration_writes[0].dst_binding);
+    try testing.expectEqual(@as(u32, 1), acceleration_writes[0].descriptor_count);
+    try testing.expectEqual(@as(u32, 1), acceleration_infos[0].acceleration_structure_count);
+    try testing.expectEqual(
+        @as(?*const anyopaque, @ptrCast(&acceleration_infos[0])),
+        acceleration_writes[0].p_next,
+    );
+    try testing.expectEqual(structure.handle, acceleration_infos[0].p_acceleration_structures[0]);
+}
+
+test "an acceleration write rejects a source count that differs from its binding" {
+    const Group = gpu.DescriptorSets(&mixed_acceleration_set);
+    const no_handles = [_]vk.AccelerationStructureKHR{};
+    var infos: [1]vk.WriteDescriptorSetAccelerationStructureKHR = undefined;
+
+    try testing.expectError(error.DescriptorCountMismatch, Group.accelerationWrites(
+        .null_handle,
+        &infos,
+        .{ .scene = gpu.DescriptorAccelerationSource{ .handles = &no_handles } },
+    ));
 }
 
 test "an image write carries the layout the caller states" {

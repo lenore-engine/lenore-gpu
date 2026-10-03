@@ -1,6 +1,7 @@
 const std = @import("std");
 const vk = @import("vulkan");
 const Context = @import("../device/context.zig").Context;
+const AccelerationStructure = @import("../object/acceleration.zig").AccelerationStructure;
 const Buffer = @import("../object/buffer.zig").Buffer;
 
 const Allocator = std.mem.Allocator;
@@ -11,6 +12,8 @@ pub const InitError = error{
     vk.DeviceWrapper.CreateDescriptorSetLayoutError ||
     vk.DeviceWrapper.CreateDescriptorPoolError ||
     vk.DeviceWrapper.AllocateDescriptorSetsError;
+
+pub const WriteError = error{DescriptorCountMismatch};
 
 // One entry of a set layout, as the shader declares it.
 pub const Binding = struct {
@@ -67,6 +70,18 @@ pub const ImageSource = struct {
     layout: vk.ImageLayout,
 };
 
+// The handle slice is read only while the descriptor write is submitted. `one`
+// points it at the owned handle inside an acceleration structure, so the common
+// scalar binding exposes no Vulkan handle at its call site.
+pub const AccelerationSource = struct {
+    handles: []const vk.AccelerationStructureKHR,
+
+    pub fn one(structure: *const AccelerationStructure) AccelerationSource {
+        const handles: [*]const vk.AccelerationStructureKHR = @ptrCast(&structure.handle);
+        return .{ .handles = handles[0..1] };
+    }
+};
+
 // Vulkan specification, VkWriteDescriptorSet: the members not selected by
 // descriptorType are ignored, but the pointers are not optional in the
 // structure, so they are given something valid to point at.
@@ -74,17 +89,17 @@ const no_buffers = [_]vk.DescriptorBufferInfo{};
 const no_images = [_]vk.DescriptorImageInfo{};
 const no_texel_buffers = [_]vk.BufferView{};
 
-// Which of `VkWriteDescriptorSet`'s three arrays a descriptor type is written
-// through. Only the types this module's layouts declare are classified: a texel
-// buffer is written through a third array and an inline uniform block through a
-// chained structure, and answering for either without a consumer to check it
-// against would be a guess. Both are compile errors below until one exists.
-const Family = enum { buffer, image };
+// Vulkan specification, VkWriteDescriptorSet: acceleration structures are the
+// fourth payload path beside its three arrays. Their handle array is carried by
+// VkWriteDescriptorSetAccelerationStructureKHR through pNext. Texel buffers and
+// inline uniform blocks remain unclassified until a consumer needs them.
+const Family = enum { buffer, image, acceleration };
 
 fn familyOf(kind: vk.DescriptorType) ?Family {
     return switch (kind) {
         .uniform_buffer, .storage_buffer, .uniform_buffer_dynamic, .storage_buffer_dynamic => .buffer,
         .combined_image_sampler, .sampled_image, .storage_image => .image,
+        .acceleration_structure_khr => .acceleration,
         else => null,
     };
 }
@@ -214,31 +229,22 @@ pub fn Sets(comptime bindings: []const Binding) type {
             return self.sets[index];
         }
 
-        // The family every binding of this layout belongs to.
-        //
-        // Homogeneous is not an accident to be tolerated but the shape the
-        // writers below rest on: one source array, positional against
-        // `bindings`. A layout mixing the two would need a per-binding source
-        // type, and no layout in this module or its consumers mixes them.
-        //
-        // Referenced only from the writers, so a layout that is never written
-        // through them is free to declare a type or an array binding they
-        // cannot express.
-        const family = blk: {
-            var found: ?Family = null;
+        // Writers select their own family from a layout. The compact source and
+        // info arrays therefore contain only that family's bindings, while each
+        // write retains the slot and descriptor type from the complete layout.
+        // This keeps keyed writes when one set mixes buffers with an acceleration
+        // structure without introducing a tagged source per binding.
+        fn bindingCount(comptime wanted: Family) usize {
+            var count: usize = 0;
             for (bindings) |binding| {
-                if (binding.count != 1)
-                    @compileError("an array binding needs one info per element, which these writers do not build");
-
-                const current = familyOf(binding.kind) orelse
-                    @compileError("descriptor type these writers do not handle: " ++ @tagName(binding.kind));
-                if (found) |previous| {
-                    if (previous != current)
-                        @compileError("this layout mixes buffer and image bindings, which one source array cannot fill");
-                } else found = current;
+                if (familyOf(binding.kind) == wanted) count += 1;
             }
-            break :blk found.?;
-        };
+            return count;
+        }
+
+        const buffer_binding_count = bindingCount(.buffer);
+        const image_binding_count = bindingCount(.image);
+        const acceleration_binding_count = bindingCount(.acceleration);
 
         // What would be submitted, without submitting it. Split from the call
         // for the reason `Buffer.validateCopy` is: everything that can be wrong
@@ -250,21 +256,28 @@ pub fn Sets(comptime bindings: []const Binding) type {
         // owns that scope.
         pub fn bufferWrites(
             handle: vk.DescriptorSet,
-            infos: *[bindings.len]vk.DescriptorBufferInfo,
+            infos: *[buffer_binding_count]vk.DescriptorBufferInfo,
             given: anytype,
-        ) [bindings.len]vk.WriteDescriptorSet {
-            comptime if (family != .buffer)
-                @compileError("this layout's bindings are images; call imageWrites");
+        ) [buffer_binding_count]vk.WriteDescriptorSet {
+            comptime if (buffer_binding_count == 0)
+                @compileError("this layout has no buffer bindings");
 
-            const sources = named(BufferSource, given);
-            var entries: [bindings.len]vk.WriteDescriptorSet = undefined;
-            for (bindings, sources, infos, &entries) |binding, source, *info, *entry| {
+            const sources = named(BufferSource, .buffer, given);
+            var entries: [buffer_binding_count]vk.WriteDescriptorSet = undefined;
+            var index: usize = 0;
+            inline for (bindings) |binding| {
+                if (comptime familyOf(binding.kind) != .buffer) continue;
+                comptime if (binding.count != 1)
+                    @compileError("a buffer array binding needs one info per element");
+
+                const source = sources[index];
+                const info = &infos[index];
                 info.* = .{
                     .buffer = source.buffer.handle,
                     .offset = source.offset,
                     .range = source.range orelse vk.WHOLE_SIZE,
                 };
-                entry.* = .{
+                entries[index] = .{
                     .dst_set = handle,
                     .dst_binding = binding.slot,
                     .dst_array_element = 0,
@@ -274,6 +287,7 @@ pub fn Sets(comptime bindings: []const Binding) type {
                     .p_buffer_info = @ptrCast(info),
                     .p_texel_buffer_view = &no_texel_buffers,
                 };
+                index += 1;
             }
             return entries;
         }
@@ -281,21 +295,28 @@ pub fn Sets(comptime bindings: []const Binding) type {
         // The image half of the same shape.
         pub fn imageWrites(
             handle: vk.DescriptorSet,
-            infos: *[bindings.len]vk.DescriptorImageInfo,
+            infos: *[image_binding_count]vk.DescriptorImageInfo,
             given: anytype,
-        ) [bindings.len]vk.WriteDescriptorSet {
-            comptime if (family != .image)
-                @compileError("this layout's bindings are buffers; call bufferWrites");
+        ) [image_binding_count]vk.WriteDescriptorSet {
+            comptime if (image_binding_count == 0)
+                @compileError("this layout has no image bindings");
 
-            const sources = named(ImageSource, given);
-            var entries: [bindings.len]vk.WriteDescriptorSet = undefined;
-            for (bindings, sources, infos, &entries) |binding, source, *info, *entry| {
+            const sources = named(ImageSource, .image, given);
+            var entries: [image_binding_count]vk.WriteDescriptorSet = undefined;
+            var index: usize = 0;
+            inline for (bindings) |binding| {
+                if (comptime familyOf(binding.kind) != .image) continue;
+                comptime if (binding.count != 1)
+                    @compileError("an image array binding needs one info per element");
+
+                const source = sources[index];
+                const info = &infos[index];
                 info.* = .{
                     .sampler = source.sampler,
                     .image_view = source.view,
                     .image_layout = source.layout,
                 };
-                entry.* = .{
+                entries[index] = .{
                     .dst_set = handle,
                     .dst_binding = binding.slot,
                     .dst_array_element = 0,
@@ -305,31 +326,77 @@ pub fn Sets(comptime bindings: []const Binding) type {
                     .p_buffer_info = &no_buffers,
                     .p_texel_buffer_view = &no_texel_buffers,
                 };
+                index += 1;
+            }
+            return entries;
+        }
+
+        // `infos` owns the pNext structures through the update call. A temporary
+        // created inside the loop would leave each write pointing at an object
+        // whose lifetime ended before vkUpdateDescriptorSets read it.
+        pub fn accelerationWrites(
+            handle: vk.DescriptorSet,
+            infos: *[acceleration_binding_count]vk.WriteDescriptorSetAccelerationStructureKHR,
+            given: anytype,
+        ) WriteError![acceleration_binding_count]vk.WriteDescriptorSet {
+            comptime if (acceleration_binding_count == 0)
+                @compileError("this layout has no acceleration structure bindings");
+
+            const sources = named(AccelerationSource, .acceleration, given);
+            var entries: [acceleration_binding_count]vk.WriteDescriptorSet = undefined;
+            var index: usize = 0;
+            inline for (bindings) |binding| {
+                if (comptime familyOf(binding.kind) != .acceleration) continue;
+
+                const source = sources[index];
+                if (source.handles.len != binding.count)
+                    return error.DescriptorCountMismatch;
+                const info = &infos[index];
+                info.* = .{
+                    .acceleration_structure_count = binding.count,
+                    .p_acceleration_structures = source.handles.ptr,
+                };
+                entries[index] = .{
+                    .p_next = @ptrCast(info),
+                    .dst_set = handle,
+                    .dst_binding = binding.slot,
+                    .dst_array_element = 0,
+                    .descriptor_count = binding.count,
+                    .descriptor_type = binding.kind,
+                    .p_image_info = &no_images,
+                    .p_buffer_info = &no_buffers,
+                    .p_texel_buffer_view = &no_texel_buffers,
+                };
+                index += 1;
             }
             return entries;
         }
 
         // Vulkan specification, vkUpdateDescriptorSets: the set must not be in
-        // use by any submitted work that has not completed. Both of these are
-        // therefore cold paths, and pointing a set at something else while a
-        // frame is in flight is the caller's problem rather than theirs.
+        // use by any submitted work that has not completed. These are therefore
+        // cold paths, and pointing a set at something else while a frame is in
+        // flight is the caller's problem rather than theirs.
         pub fn writeBuffers(
             self: *const Self,
             context: *const Context,
             index: usize,
             sources: anytype,
         ) void {
-            var infos: [bindings.len]vk.DescriptorBufferInfo = undefined;
+            var infos: [buffer_binding_count]vk.DescriptorBufferInfo = undefined;
             const entries = bufferWrites(self.set(index), &infos, sources);
             context.device.updateDescriptorSets(&entries, null);
         }
 
-        // Where a binding of this name sits in the list.
-        fn slotOf(comptime name: []const u8) usize {
-            for (bindings, 0..) |binding, index| {
-                if (std.mem.eql(u8, binding.name, name)) return index;
+        // Where a binding of this name sits among one family's compact sources.
+        fn slotOf(comptime wanted: Family, comptime name: []const u8) usize {
+            var family_index: usize = 0;
+            for (bindings) |binding| {
+                if (familyOf(binding.kind) != wanted) continue;
+                if (std.mem.eql(u8, binding.name, name)) return family_index;
+                family_index += 1;
             }
-            @compileError("this layout has no binding named " ++ name);
+            @compileError("this layout has no " ++ @tagName(wanted) ++
+                " binding named " ++ name);
         }
 
         // A written source list, keyed by binding name, in the order the write
@@ -343,21 +410,26 @@ pub fn Sets(comptime bindings: []const Binding) type {
         // neighbouring slot held.
         //
         // Bijective by construction: field names in a struct literal are
-        // unique, each resolves to a distinct slot, and the count matches, so
-        // every binding is written exactly once and no runtime check is needed
-        // to say so.
-        fn named(comptime Source: type, given: anytype) [bindings.len]Source {
+        // unique, each resolves to a distinct slot within the selected family,
+        // and the count matches, so every binding of that family is written
+        // exactly once and no runtime check is needed to say so.
+        fn named(
+            comptime Source: type,
+            comptime wanted: Family,
+            given: anytype,
+        ) [bindingCount(wanted)]Source {
             const fields = @typeInfo(@TypeOf(given)).@"struct".fields;
-            comptime if (fields.len != bindings.len) @compileError(std.fmt.comptimePrint(
-                "this layout has {d} bindings and the source list has {d}",
-                .{ bindings.len, fields.len },
+            const expected = comptime bindingCount(wanted);
+            comptime if (fields.len != expected) @compileError(std.fmt.comptimePrint(
+                "this layout has {d} {s} bindings and the source list has {d}",
+                .{ expected, @tagName(wanted), fields.len },
             ));
 
-            var resolved: [bindings.len]Source = undefined;
+            var resolved: [expected]Source = undefined;
             inline for (fields) |field| {
                 const source = @field(given, field.name);
                 const Given = @TypeOf(source);
-                const slot = &resolved[comptime slotOf(field.name)];
+                const slot = &resolved[comptime slotOf(wanted, field.name)];
 
                 if (comptime Given == Source) {
                     slot.* = source;
@@ -365,7 +437,7 @@ pub fn Sets(comptime bindings: []const Binding) type {
                     // The shorthand: a buffer alone is the whole of it.
                     .pointer => {
                         comptime if (Source != BufferSource)
-                            @compileError("an image source is a " ++ @typeName(Source));
+                            @compileError("a source is a " ++ @typeName(Source));
                         slot.* = .{ .buffer = source };
                     },
                     // Named rather than left to coercion: a field of the list
@@ -387,8 +459,19 @@ pub fn Sets(comptime bindings: []const Binding) type {
             index: usize,
             sources: anytype,
         ) void {
-            var infos: [bindings.len]vk.DescriptorImageInfo = undefined;
+            var infos: [image_binding_count]vk.DescriptorImageInfo = undefined;
             const entries = imageWrites(self.set(index), &infos, sources);
+            context.device.updateDescriptorSets(&entries, null);
+        }
+
+        pub fn writeAccelerationStructures(
+            self: *const Self,
+            context: *const Context,
+            index: usize,
+            sources: anytype,
+        ) WriteError!void {
+            var infos: [acceleration_binding_count]vk.WriteDescriptorSetAccelerationStructureKHR = undefined;
+            const entries = try accelerationWrites(self.set(index), &infos, sources);
             context.device.updateDescriptorSets(&entries, null);
         }
     };
