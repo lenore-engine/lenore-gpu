@@ -7,6 +7,7 @@ const image = @import("../object/image.zig");
 const memory = @import("../memory/allocator.zig");
 const pass = @import("scene.zig");
 const pipeline = @import("../binding/pipeline.zig");
+const uniforms = @import("../binding/uniforms.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -34,7 +35,7 @@ const usage: vk.ImageUsageFlags = .{ .color_attachment_bit = true, .sampled_bit 
 // Who fills `resolved`. `external` is an upscaler outside this module writing it
 // from compute through a storage view, in place of `record`: the image is
 // created with storage usage, and the passes after read it as they always do.
-// The resolve's own pipeline and histories are still built and stay unused.
+// None of the resolve's own objects are built in that mode.
 pub const Writer = enum { draw, external };
 
 // Mirrors `TemporalPushConstants` in temporal.slang.
@@ -50,6 +51,10 @@ pub const PushConstants = extern struct {
     blend: f32,
     // Nonzero takes the frame alone: there is no history to gather with.
     reset: u32,
+    // Where a background pixel was last frame, as `Sky` describes.
+    sky_across: [4]f32,
+    sky_down: [4]f32,
+    sky_ahead: [4]f32,
 };
 
 pub const push_constant_range: vk.PushConstantRange = .{
@@ -58,10 +63,49 @@ pub const push_constant_range: vk.PushConstantRange = .{
     .size = @sizeOf(PushConstants),
 };
 
+// Where the background was last frame. The depth prepass leaves no motion
+// where nothing was drawn, but the background is infinitely far, so the
+// camera's turning moves it and the camera's travel does not. A pixel at
+// device (x, y) looks along `front + x * right + y * up`; that direction with
+// w = 0 through last frame's view-projection is last frame's clip position,
+// translation dropping out with the zero. The three rows are the basis vectors
+// already taken through the matrix, so the shader's clip position is
+// `x * across + y * down + ahead`.
+pub const Sky = struct {
+    across: [4]f32,
+    down: [4]f32,
+    ahead: [4]f32,
+};
+
+// From the frame's camera block, so the basis and last frame's matrix are both
+// in the framebuffer's coordinates, and neither carries the jitter.
+pub fn skyFor(camera: uniforms.FramebufferCamera) Sky {
+    const block = camera.block;
+    return .{
+        .across = throughPrevious(block.ray_right, block.previous_view_projection),
+        .down = throughPrevious(block.ray_up, block.previous_view_projection),
+        .ahead = throughPrevious(block.ray_front, block.previous_view_projection),
+    };
+}
+
+// A direction as a row vector with w = 0, so the matrix's fourth row, which
+// holds the translation, takes no part. The direction's fourth lane is the
+// block's padding and is not read.
+fn throughPrevious(direction: [4]f32, matrix: uniforms.Mat4) [4]f32 {
+    var result: [4]f32 = undefined;
+    for (0..4) |column| {
+        result[column] = direction[0] * matrix[0][column] +
+            direction[1] * matrix[1][column] +
+            direction[2] * matrix[2][column];
+    }
+    return result;
+}
+
 // What the frame decides.
 pub const Frame = struct {
     // `Camera.jitter`'s offset, in the framebuffer's device coordinates.
     jitter: [2]f32,
+    sky: Sky,
 };
 
 // The new frame's weight at a pixel one of its samples lands on. A tenth
@@ -85,6 +129,9 @@ pub fn pushFor(frame: Frame, render: vk.Extent2D, output: vk.Extent2D, reset: bo
         .jitter = jitterPixels(frame.jitter, render),
         .blend = blend,
         .reset = @intFromBool(reset),
+        .sky_across = frame.sky.across,
+        .sky_down = frame.sky.down,
+        .sky_ahead = frame.sky.ahead,
     };
 }
 
@@ -126,13 +173,8 @@ pub const Sources = struct {
     depth: vk.ImageView,
 };
 
-pub const TemporalPass = struct {
-    context: *const Context,
-    memory_allocator: *memory.MemoryAllocator,
-    allocator: Allocator,
-    format: vk.Format,
-    writer: Writer,
-
+// What the resolve's own draw needs, absent with an external writer.
+const Resolve = struct {
     // Persistent across a resize.
     nearest_sampler: vk.Sampler,
     linear_sampler: vk.Sampler,
@@ -142,7 +184,6 @@ pub const TemporalPass = struct {
     sets: Sets,
 
     // Replaced by a resize, at the output's extent.
-    resolved: image.Image,
     histories: [2]image.Image,
 
     // Frames resolved since the history was last reset. Zero means the history
@@ -154,16 +195,7 @@ pub const TemporalPass = struct {
     // on the frame its value is not read.
     histories_ready: bool,
 
-    pub fn init(
-        context: *const Context,
-        memory_allocator: *memory.MemoryAllocator,
-        allocator: Allocator,
-        format: vk.Format,
-        output: vk.Extent2D,
-        sources: Sources,
-        shader: Shader,
-        writer: Writer,
-    ) InitError!TemporalPass {
+    fn init(context: *const Context, allocator: Allocator, format: vk.Format, shader: Shader) InitError!Resolve {
         const nearest_sampler = try createSampler(context, .nearest);
         errdefer context.device.destroySampler(nearest_sampler, null);
         const linear_sampler = try createSampler(context, .linear);
@@ -192,25 +224,67 @@ pub const TemporalPass = struct {
                 .fragment = .{ .module = module, .entry_point = shader.fragment_entry },
             },
         });
-        errdefer context.device.destroyPipeline(built, null);
 
-        var self: TemporalPass = .{
-            .context = context,
-            .memory_allocator = memory_allocator,
-            .allocator = allocator,
-            .format = format,
-            .writer = writer,
+        return .{
             .nearest_sampler = nearest_sampler,
             .linear_sampler = linear_sampler,
             .module = module,
             .layout = layout,
             .pipeline = built,
             .sets = sets,
-            .resolved = undefined,
             .histories = undefined,
             .resolved_frames = 0,
             .histories_ready = false,
         };
+    }
+
+    // Everything but the histories, which go with the pass's other images.
+    fn deinit(self: *Resolve, context: *const Context, allocator: Allocator) void {
+        const device = context.device;
+        device.destroyPipeline(self.pipeline, null);
+        device.destroyPipelineLayout(self.layout, null);
+        self.sets.deinit(context, allocator);
+        device.destroyShaderModule(self.module, null);
+        device.destroySampler(self.linear_sampler, null);
+        device.destroySampler(self.nearest_sampler, null);
+    }
+};
+
+pub const TemporalPass = struct {
+    context: *const Context,
+    memory_allocator: *memory.MemoryAllocator,
+    allocator: Allocator,
+    format: vk.Format,
+    writer: Writer,
+
+    // Replaced by a resize, at the output's extent.
+    resolved: image.Image,
+    // Null with an external writer.
+    resolve: ?Resolve,
+
+    pub fn init(
+        context: *const Context,
+        memory_allocator: *memory.MemoryAllocator,
+        allocator: Allocator,
+        format: vk.Format,
+        output: vk.Extent2D,
+        sources: Sources,
+        shader: Shader,
+        writer: Writer,
+    ) InitError!TemporalPass {
+        var self: TemporalPass = .{
+            .context = context,
+            .memory_allocator = memory_allocator,
+            .allocator = allocator,
+            .format = format,
+            .writer = writer,
+            .resolved = undefined,
+            .resolve = switch (writer) {
+                .draw => try Resolve.init(context, allocator, format, shader),
+                .external => null,
+            },
+        };
+        errdefer if (self.resolve) |*resolve| resolve.deinit(context, allocator);
         try self.createImages(output, sources);
         return self;
     }
@@ -218,14 +292,8 @@ pub const TemporalPass = struct {
     // Vulkan specification, vkDestroyPipeline and the rest: every submission
     // naming any of these must have completed. The caller drains the device.
     pub fn deinit(self: *TemporalPass) void {
-        const device = self.context.device;
         self.destroyImages();
-        device.destroyPipeline(self.pipeline, null);
-        device.destroyPipelineLayout(self.layout, null);
-        self.sets.deinit(self.context, self.allocator);
-        device.destroyShaderModule(self.module, null);
-        device.destroySampler(self.linear_sampler, null);
-        device.destroySampler(self.nearest_sampler, null);
+        if (self.resolve) |*resolve| resolve.deinit(self.context, self.allocator);
         self.* = undefined;
     }
 
@@ -244,23 +312,27 @@ pub const TemporalPass = struct {
 
     // The next frame takes its own picture alone, as after a camera cut.
     pub fn resetHistory(self: *TemporalPass) void {
-        self.resolved_frames = 0;
+        if (self.resolve) |*resolve| resolve.resolved_frames = 0;
     }
 
     fn createImages(self: *TemporalPass, output: vk.Extent2D, sources: Sources) InitError!void {
+        // Storage usage only where something writes it from compute. With it,
+        // and written from compute, the post pass's read of this image took
+        // 0.28 ms against 0.20 at 2560x1600 on a Radeon 780M under RADV.
         var written_usage = usage;
         written_usage.storage_bit = self.writer == .external;
         var resolved = try self.createImage(output, written_usage);
         errdefer resolved.deinit();
-        var first = try self.createImage(output, usage);
-        errdefer first.deinit();
-        const second = try self.createImage(output, usage);
-
+        if (self.resolve) |*resolve| {
+            var first = try self.createImage(output, usage);
+            errdefer first.deinit();
+            const second = try self.createImage(output, usage);
+            resolve.histories = .{ first, second };
+            resolve.resolved_frames = 0;
+            resolve.histories_ready = false;
+        }
         self.resolved = resolved;
-        self.histories = .{ first, second };
-        self.resolved_frames = 0;
-        self.histories_ready = false;
-        self.writeSets(sources);
+        if (self.resolve) |*resolve| writeSets(self.context, resolve, sources);
     }
 
     fn createImage(self: *const TemporalPass, extent: vk.Extent2D, image_usage: vk.ImageUsageFlags) image.InitError!image.Image {
@@ -274,27 +346,29 @@ pub const TemporalPass = struct {
     }
 
     fn destroyImages(self: *TemporalPass) void {
-        self.histories[1].deinit();
-        self.histories[0].deinit();
+        if (self.resolve) |*resolve| {
+            resolve.histories[1].deinit();
+            resolve.histories[0].deinit();
+        }
         self.resolved.deinit();
     }
 
     // Safe only when no frame is in flight, which is where images are built.
-    fn writeSets(self: *const TemporalPass, sources: Sources) void {
+    fn writeSets(context: *const Context, resolve: *const Resolve, sources: Sources) void {
         var infos: [set_count * bindings.len]vk.DescriptorImageInfo = undefined;
         var writes: [set_count * bindings.len]vk.WriteDescriptorSet = undefined;
         for (0..set_count) |set| {
             const views = [bindings.len]vk.DescriptorImageInfo{
-                .{ .sampler = self.nearest_sampler, .image_view = sources.colour, .image_layout = pass.sampled_layout },
-                .{ .sampler = self.nearest_sampler, .image_view = sources.motion, .image_layout = pass.sampled_layout },
-                .{ .sampler = self.nearest_sampler, .image_view = sources.depth, .image_layout = pass.sampled_layout },
-                .{ .sampler = self.linear_sampler, .image_view = self.histories[set].view, .image_layout = pass.sampled_layout },
+                .{ .sampler = resolve.nearest_sampler, .image_view = sources.colour, .image_layout = pass.sampled_layout },
+                .{ .sampler = resolve.nearest_sampler, .image_view = sources.motion, .image_layout = pass.sampled_layout },
+                .{ .sampler = resolve.nearest_sampler, .image_view = sources.depth, .image_layout = pass.sampled_layout },
+                .{ .sampler = resolve.linear_sampler, .image_view = resolve.histories[set].view, .image_layout = pass.sampled_layout },
             };
             for (bindings, views, 0..) |binding, info, index| {
                 const at = set * bindings.len + index;
                 infos[at] = info;
                 writes[at] = .{
-                    .dst_set = self.sets.set(@intCast(set)),
+                    .dst_set = resolve.sets.set(@intCast(set)),
                     .dst_binding = binding.slot,
                     .dst_array_element = 0,
                     .descriptor_count = 1,
@@ -305,7 +379,7 @@ pub const TemporalPass = struct {
                 };
             }
         }
-        self.context.device.updateDescriptorSets(&writes, null);
+        context.device.updateDescriptorSets(&writes, null);
     }
 
     // What bloom, the meter and the post pass read in place of the main pass's
@@ -327,23 +401,24 @@ pub const TemporalPass = struct {
     // After the main pass, whose end barrier leaves its colour and depth
     // sampled, and after the prepass's, which leaves the motion sampled. On
     // exit `resolved` and the history just written are sampled, for the passes
-    // after this one and for the next frame.
+    // after this one and for the next frame. Nothing with an external writer.
     pub fn record(self: *TemporalPass, command_buffer: vk.CommandBuffer, render: vk.Extent2D, frame: Frame) void {
+        const resolve = if (self.resolve) |*resolve| resolve else return;
         const device = self.context.device;
         const output = self.outputExtent();
-        const read = readIndex(self.resolved_frames);
+        const read = readIndex(resolve.resolved_frames);
         const written = 1 - read;
 
         var opening: [4]vk.ImageMemoryBarrier2 = undefined;
         var count: u32 = 0;
         opening[count] = colourBarrier(self.resolved.handle, .discard_to_attachment);
         count += 1;
-        opening[count] = colourBarrier(self.histories[written].handle, .discard_to_attachment);
+        opening[count] = colourBarrier(resolve.histories[written].handle, .discard_to_attachment);
         count += 1;
-        if (!self.histories_ready) {
-            opening[count] = colourBarrier(self.histories[read].handle, .undefined_to_sampled);
+        if (!resolve.histories_ready) {
+            opening[count] = colourBarrier(resolve.histories[read].handle, .undefined_to_sampled);
             count += 1;
-            self.histories_ready = true;
+            resolve.histories_ready = true;
         }
         device.cmdPipelineBarrier2(command_buffer, &.{
             .image_memory_barrier_count = count,
@@ -352,7 +427,7 @@ pub const TemporalPass = struct {
 
         const colours = [2]vk.RenderingAttachmentInfo{
             attachmentFor(self.resolved.view),
-            attachmentFor(self.histories[written].view),
+            attachmentFor(resolve.histories[written].view),
         };
         device.cmdBeginRendering(command_buffer, &.{
             .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = output },
@@ -363,12 +438,12 @@ pub const TemporalPass = struct {
         });
         device.cmdSetViewport(command_buffer, 0, &.{pass.viewport(output)});
         device.cmdSetScissor(command_buffer, 0, &.{pass.scissor(output)});
-        device.cmdBindPipeline(command_buffer, .graphics, self.pipeline);
-        device.cmdBindDescriptorSets(command_buffer, .graphics, self.layout, 0, &.{self.sets.set(read)}, &.{});
-        var block = pushFor(frame, render, output, self.resolved_frames == 0);
+        device.cmdBindPipeline(command_buffer, .graphics, resolve.pipeline);
+        device.cmdBindDescriptorSets(command_buffer, .graphics, resolve.layout, 0, &.{resolve.sets.set(read)}, &.{});
+        var block = pushFor(frame, render, output, resolve.resolved_frames == 0);
         device.cmdPushConstants(
             command_buffer,
-            self.layout,
+            resolve.layout,
             push_constant_range.stage_flags,
             push_constant_range.offset,
             push_constant_range.size,
@@ -379,13 +454,13 @@ pub const TemporalPass = struct {
 
         const closing = [2]vk.ImageMemoryBarrier2{
             colourBarrier(self.resolved.handle, .attachment_to_sampled),
-            colourBarrier(self.histories[written].handle, .attachment_to_sampled),
+            colourBarrier(resolve.histories[written].handle, .attachment_to_sampled),
         };
         device.cmdPipelineBarrier2(command_buffer, &.{
             .image_memory_barrier_count = closing.len,
             .p_image_memory_barriers = &closing,
         });
-        self.resolved_frames += 1;
+        resolve.resolved_frames += 1;
     }
 };
 
