@@ -289,7 +289,9 @@ pub const LocalShadow = extern struct {
 // default, so a scene that sets nothing renders as before.
 pub const Ambient = extern struct {
     sky: [3]f32 align(16) = .{ 0, 0, 0 },
-    padding_0: f32 = 0,
+    // How much ambient the background and reflections add. Zero when the
+    // environment cube already carries the sky; diffuse ambient is independent.
+    reflected: f32 = 1,
     ground: [3]f32 = .{ 0, 0, 0 },
     padding_1: f32 = 0,
 };
@@ -332,6 +334,21 @@ pub const Debug = extern struct {
     padding: [3]u32 = .{ 0, 0, 0 },
 };
 
+// A glow the background draws around each directional light's disc: the
+// atmosphere's forward scattering nearer the sun than an environment cube
+// resolves, and the glare an eye sees around a bright source. Two lobes, each
+// falling off exponentially with the angle from the light's centre. A strength
+// is in white surfaces facing the light, E / pi, so the glow follows the
+// light's colour and brightness through the day; a width is the angle in
+// degrees over which its lobe falls to 1/e. Zero strengths draw none, the
+// default. Only the background reads it: surfaces are lit by the light block.
+pub const Halo = extern struct {
+    narrow: f32 align(16) = 0,
+    narrow_degrees: f32 = 1,
+    wide: f32 = 0,
+    wide_degrees: f32 = 8,
+};
+
 // The light block, read by every shaded fragment.
 //
 // A fixed array rather than a storage buffer sized to the scene. The block is
@@ -355,6 +372,7 @@ pub const Lights = extern struct {
     ambient: Ambient,
     probe_grid: ProbeGrid,
     debug: Debug,
+    halo: Halo,
 
     // Write a frame's lights into the block.
     //

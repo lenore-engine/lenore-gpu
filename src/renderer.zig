@@ -1,11 +1,13 @@
 const std = @import("std");
 const vk = @import("vulkan");
+const atmosphere = @import("pass/atmosphere.zig");
 const attachment = @import("pass/attachment.zig");
 const bloom = @import("pass/bloom.zig");
 const meter = @import("pass/meter.zig");
 const Context = @import("device/context.zig").Context;
 const descriptors = @import("binding/descriptors.zig");
 const environment = @import("object/environment.zig");
+const texture_cache = @import("object/texture_cache.zig");
 const lightmap_module = @import("object/lightmap.zig");
 const frame_set = @import("binding/frame_set.zig");
 const image = @import("object/image.zig");
@@ -555,6 +557,7 @@ pub const Shaders = struct {
     // pipeline, a descriptor set and a small buffer per frame in flight, and
     // none of that is worth carrying for a caller that will not read it.
     meter: ?meter.Shader = null,
+    atmosphere: ?atmosphere.Shader = null,
     // Null is a renderer with no temporal resolve: the passes after the main
     // one read its target directly, at the render resolution. Supplied, they
     // read the resolve's picture at the output resolution instead.
@@ -708,6 +711,12 @@ pub const Renderer = struct {
     // Present only when the shader was supplied. It follows the target for the
     // reason the chain does: the set it binds names the target's view.
     meter: ?meter.MeterPass,
+    // The physical sky, once `setAtmosphere` made it, the shader it is made
+    // with (null in a renderer built without it), and the environment it
+    // installs, which replaces any other while it exists.
+    atmosphere: ?atmosphere.AtmospherePass,
+    atmosphere_shader: ?atmosphere.Shader,
+    atmosphere_environment: ?environment.Environment,
     // Present only when its shader was supplied. Follows both the target, which
     // it reads, and the output, at whose size it writes.
     temporal: ?temporal.TemporalPass,
@@ -1147,6 +1156,9 @@ pub const Renderer = struct {
             .occlusion_cleared = false,
             .probe_fallback = probe_fallback,
             .meter = meter_pass,
+            .atmosphere = null,
+            .atmosphere_shader = shaders.atmosphere,
+            .atmosphere_environment = null,
             .post_sets = post_sets,
             .post_sampler = post_sampler,
         };
@@ -1165,6 +1177,7 @@ pub const Renderer = struct {
         device.destroyPipelineLayout(self.scene_layout, null);
         self.post_sets.deinit(self.context, self.allocator);
         if (self.meter) |*measured| measured.deinit();
+        if (self.atmosphere) |*drawn| drawn.deinit();
         if (self.temporal) |*resolve| resolve.deinit();
         self.probe_fallback.deinit();
         self.ambient_occlusion.deinit();
@@ -1203,8 +1216,54 @@ pub const Renderer = struct {
     // an absent environment; composition does, through `Environment.neutral`,
     // and passes them here. Recording refuses to proceed until it has.
     pub fn setEnvironment(self: *Renderer, source: environment.Environment) void {
-        environment.write(self.context, self.scene.set(0), source);
+        environment.write(self.context, self.scene.set(0), self.atmosphere_environment orelse source);
         self.environment_ready = true;
+    }
+
+    // Makes the sky and installs it as the environment, `base` providing the
+    // diffuse map and the split-sum table and the cube replacing its GGX map.
+    // Cold: the caller drains the device first, since the scene set is
+    // rewritten. While installed it takes precedence over `setEnvironment`.
+    pub fn setAtmosphere(
+        self: *Renderer,
+        parameters: atmosphere.Parameters,
+        transmittance: texture_cache.Bound,
+        multiple: texture_cache.Bound,
+        base: environment.Environment,
+    ) !void {
+        const shader = self.atmosphere_shader orelse return error.AtmosphereDisabled;
+        const made = try atmosphere.AtmospherePass.init(
+            self.context,
+            self.memory_allocator,
+            self.allocator,
+            shader,
+            parameters,
+            transmittance,
+            multiple,
+            base.ggx.sampler,
+        );
+        if (self.atmosphere) |*old| old.deinit();
+        self.atmosphere = made;
+        var installed = base;
+        installed.ggx = self.atmosphere.?.bound();
+        self.atmosphere_environment = installed;
+        self.setEnvironment(installed);
+    }
+
+    pub fn relightSky(self: *Renderer, sun: atmosphere.Sun) !void {
+        const drawn = if (self.atmosphere) |*value| value else return error.AtmosphereNotConfigured;
+        try drawn.relight(sun);
+    }
+
+    // Before the main pass, in the frame's command buffer; nothing when there
+    // is no sky or the sun has not moved.
+    pub fn recordSky(self: *Renderer, cmd: vk.CommandBuffer) void {
+        if (self.atmosphere) |*drawn| drawn.record(cmd);
+    }
+
+    pub fn recordSkyReadback(self: *Renderer, cmd: vk.CommandBuffer, destination: *Buffer) !void {
+        const drawn = if (self.atmosphere) |*value| value else return error.AtmosphereNotConfigured;
+        try drawn.recordReadback(cmd, destination);
     }
 
     // Point the scene set at a lighting cache. Cold, like the environment: it is

@@ -370,6 +370,7 @@ pub const FrameSet = struct {
         // No field by default: the main pass lights from the ambient alone.
         probe_grid: uniforms.ProbeGrid = .none,
         debug: uniforms.Debug = .{},
+        halo: uniforms.Halo = .{},
     };
 
     // Fill one frame's slot. The caller has waited on that slot's fence; see
@@ -385,6 +386,7 @@ pub const FrameSet = struct {
         self.lights.slice(frame)[0].ambient = contents.ambient;
         self.lights.slice(frame)[0].probe_grid = contents.probe_grid;
         self.lights.slice(frame)[0].debug = contents.debug;
+        self.lights.slice(frame)[0].halo = contents.halo;
         self.sun_shadow.slice(frame)[0] = contents.sun_shadow;
     }
 

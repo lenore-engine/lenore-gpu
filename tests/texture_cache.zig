@@ -144,3 +144,10 @@ test "one resident image binds under two samplers without a second reference" {
     try testing.expectEqual(@as(u32, 3), linear.mip_levels);
     try testing.expectEqual(resident.view, linear.view);
 }
+
+test "atmosphere LUT and split sum raw uploads use their actual texel widths" {
+    const pixels: [32]u8 = @splat(0);
+    try gpu.TextureCache.validateRaw(.{ .width = 2, .height = 1, .bytes = &pixels }, .r32g32b32a32_sfloat);
+    try gpu.TextureCache.validateRaw(.{ .width = 2, .height = 1, .bytes = pixels[0..8] }, .r16g16_sfloat);
+    try testing.expectError(error.PixelLengthMismatch, gpu.TextureCache.validateRaw(.{ .width = 2, .height = 1, .bytes = pixels[0..16] }, .r32g32b32a32_sfloat));
+}

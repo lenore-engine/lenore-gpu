@@ -25,6 +25,7 @@ const Context = @import("context.zig").Context;
 // the application decides.
 pub const Pass = enum {
     compute,
+    atmosphere,
     shadow,
     depth,
     // The ambient occlusion estimate, and then its two blurs, between the

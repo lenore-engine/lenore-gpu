@@ -14,8 +14,8 @@ const TextureCache = texture_cache.TextureCache;
 // The image-based half of the scene's lighting: what a fragment reads when it
 // asks what the world around it looks like, rather than where the lights are.
 //
-// Three resources, all prefiltered before the engine sees them. This module owns
-// none of them: the texture cache owns the images and this holds the views and
+// Three sampled resources, supplied as views and samplers. This module owns
+// none of them: their producer owns the images and this holds the views and
 // samplers a descriptor write needs, in the shape the set expects. That split is
 // why an environment can be replaced without the renderer knowing how it was
 // produced.

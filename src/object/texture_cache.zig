@@ -35,6 +35,8 @@ fn texelBytes(format: vk.Format) ?vk.DeviceSize {
     return switch (format) {
         .a2b10g10r10_unorm_pack32, .r8g8b8a8_srgb, .r8g8b8a8_unorm => 4,
         .r16g16b16a16_sfloat => 8,
+        .r16g16_sfloat => 4,
+        .r32g32b32a32_sfloat => 16,
         else => null,
     };
 }

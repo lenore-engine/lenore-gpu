@@ -103,7 +103,8 @@ test "the lights block begins its array where the shader's does" {
     try testing.expectEqual(ambient, @offsetOf(gpu.LightsUniform, "ambient"));
     try testing.expectEqual(ambient + 32, @offsetOf(gpu.LightsUniform, "probe_grid"));
     try testing.expectEqual(ambient + 64, @offsetOf(gpu.LightsUniform, "debug"));
-    try testing.expectEqual(@as(usize, ambient + 80), @sizeOf(gpu.LightsUniform));
+    try testing.expectEqual(ambient + 80, @offsetOf(gpu.LightsUniform, "halo"));
+    try testing.expectEqual(@as(usize, ambient + 96), @sizeOf(gpu.LightsUniform));
     // Vulkan specification, Limits: maxUniformBufferRange is at least 16384.
     try testing.expect(@sizeOf(gpu.LightsUniform) <= 16384);
 }

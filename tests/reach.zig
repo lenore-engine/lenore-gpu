@@ -14,6 +14,16 @@ const gpu = @import("lenore-gpu");
 // Anything here that gains a test which actually calls it should lose its line.
 
 test "the device-facing surface is compiled" {
+    _ = &gpu.AtmospherePass.init;
+    _ = &gpu.AtmospherePass.deinit;
+    _ = &gpu.AtmospherePass.bound;
+    _ = &gpu.AtmospherePass.relight;
+    _ = &gpu.AtmospherePass.record;
+    _ = &gpu.AtmospherePass.recordReadback;
+    _ = &gpu.Renderer.setAtmosphere;
+    _ = &gpu.Renderer.relightSky;
+    _ = &gpu.Renderer.recordSky;
+    _ = &gpu.Renderer.recordSkyReadback;
     _ = &gpu.Motion.create;
     _ = &gpu.Motion.writeResult;
     _ = &gpu.GpuTimer.init;
