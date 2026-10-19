@@ -16,6 +16,7 @@ const any_camera: gpu.FramebufferCamera = gpu.vulkanClipCamera(.{
     .ray_right = .{ 1, 0, 0, 0 },
     .ray_up = .{ 0, 1, 0, 0 },
     .ray_front = .{ 0, 0, -1, 0 },
+    .previous_view_projection = gpu.mat4(zm.identity()),
 });
 
 test "the frame set's own methods are reached by the compiler" {
@@ -30,10 +31,11 @@ test "the frame set's own methods are reached by the compiler" {
 
 test "an instance carries model, joint and material indices at the shader's stride" {
     // The element the shader steps through. A `float4x4` aligns the struct to
-    // sixteen bytes, so seventy-two bytes of payload stride by eighty. Getting
-    // this wrong reads the wrong instance from the second one on, and the first
-    // still looks right, which is why it is pinned here rather than noticed.
-    try testing.expectEqual(@as(usize, 80), @sizeOf(gpu.Instance));
+    // sixteen bytes: two matrices and four words stride by a hundred and
+    // forty-four. Getting this wrong reads the wrong instance from the second
+    // one on, and the first still looks right, which is why it is pinned here
+    // rather than noticed.
+    try testing.expectEqual(@as(usize, 144), @sizeOf(gpu.Instance));
     try testing.expectEqual(@as(usize, 16), @alignOf(gpu.Instance));
 
     // The indices sit after the matrix in the order the shader names them. A
@@ -41,8 +43,11 @@ test "an instance carries model, joint and material indices at the shader's stri
     try testing.expectEqual(@as(usize, 0), @offsetOf(gpu.Instance, "model"));
     try testing.expectEqual(@as(usize, 64), @offsetOf(gpu.Instance, "joint_base"));
     try testing.expectEqual(@as(usize, 68), @offsetOf(gpu.Instance, "material_index"));
+    // After the first eighty bytes, which keep the place they had for a shader
+    // that reads only those.
+    try testing.expectEqual(@as(usize, 80), @offsetOf(gpu.Instance, "previous_model"));
 
-    const default_material: gpu.Instance = .{ .model = gpu.mat4(zm.identity()), .joint_base = 0 };
+    const default_material: gpu.Instance = .{ .model = gpu.mat4(zm.identity()), .joint_base = 0, .previous_model = gpu.mat4(zm.identity()) };
     try testing.expectEqual(@as(u32, 0), default_material.material_index);
 }
 
@@ -89,7 +94,7 @@ test "the rings that a scene sizes are storage buffers, not uniform ones" {
 }
 
 test "a frame that fits is accepted at every bound and one past any of them is not" {
-    const models: [4]gpu.Instance = @splat(.{ .model = gpu.mat4(zm.identity()), .joint_base = 0 });
+    const models: [4]gpu.Instance = @splat(.{ .model = gpu.mat4(zm.identity()), .joint_base = 0, .previous_model = gpu.mat4(zm.identity()) });
     const joints: [6]gpu.Joint = @splat(gpu.mat4(zm.identity()));
     var lights: [gpu.max_lights + 1]gpu.LightUniform = @splat(gpu.LightUniform.directional(.{ 1, 1, 1 }, 1, .{ 0, -1, 0 }));
 
@@ -99,6 +104,7 @@ test "a frame that fits is accepted at every bound and one past any of them is n
         .camera = any_camera,
         .models = &models,
         .joints = &joints,
+        .previous_joints = &joints,
         .lights = lights[0..gpu.max_lights],
     });
 
@@ -106,6 +112,7 @@ test "a frame that fits is accepted at every bound and one past any of them is n
         .camera = any_camera,
         .models = &models,
         .joints = &joints,
+        .previous_joints = &joints,
         .lights = &.{},
     }));
     // The joint bound is its own: a frame can fit every instance and still
@@ -115,12 +122,14 @@ test "a frame that fits is accepted at every bound and one past any of them is n
         .camera = any_camera,
         .models = &models,
         .joints = &joints,
+        .previous_joints = &joints,
         .lights = &.{},
     }));
     try testing.expectError(error.LightCapacityExceeded, gpu.validateFrameContents(.{ .instances = 4, .joints = 6 }, .{
         .camera = any_camera,
         .models = &models,
         .joints = &joints,
+        .previous_joints = &joints,
         .lights = &lights,
     }));
 }
@@ -130,7 +139,7 @@ test "a frame with no skinned instance carries no joints" {
     // capacity of zero accepts an empty joint slice.
     try gpu.validateFrameContents(.{ .instances = 1, .joints = 0 }, .{
         .camera = any_camera,
-        .models = &.{.{ .model = gpu.mat4(zm.identity()), .joint_base = 0 }},
+        .models = &.{.{ .model = gpu.mat4(zm.identity()), .joint_base = 0, .previous_model = gpu.mat4(zm.identity()) }},
         .joints = &.{},
         .lights = &.{},
     });
@@ -141,4 +150,107 @@ fn bindingFor(slot: u32) gpu.DescriptorBinding {
         if (binding.slot == slot) return binding;
     }
     unreachable;
+}
+
+// The shader indexes the shadow matrices by a light's layer with no check of its
+// own, so the frame is where a layer that runs past them is stopped.
+test "a light's shadow layers must lie inside the frame's matrices" {
+    const capacity: gpu.FrameCapacity = .{ .instances = 1, .joints = 0 };
+    const identity = gpu.mat4(zm.identity());
+    const seven: [7]gpu.Mat4 = @splat(identity);
+
+    var spot = gpu.LightUniform.spot(.{ 1, 1, 1 }, 5, .{
+        .position = .{ 0, 3, 0 },
+        .direction = .{ 0, -1, 0 },
+        .range = 8,
+        .cos_inner = 0.9,
+        .cos_outer = 0.8,
+    });
+    var lamp = gpu.LightUniform.point(.{ 1, 1, 1 }, 5, .{ 0, 2, 0 }, 8);
+    lamp.shadow_layer = 0;
+    spot.shadow_layer = 6;
+    try gpu.validateFrameContents(capacity, .{
+        .camera = any_camera,
+        .models = &.{},
+        .joints = &.{},
+        .lights = &.{ lamp, spot },
+        .shadow_view_projections = &seven,
+    });
+
+    // A point light's six layers end one past the seven matrices.
+    lamp.shadow_layer = 2;
+    try testing.expectError(error.ShadowLayerOutOfRange, gpu.validateFrameContents(capacity, .{
+        .camera = any_camera,
+        .models = &.{},
+        .joints = &.{},
+        .lights = &.{lamp},
+        .shadow_view_projections = &seven,
+    }));
+
+    // Near the top of u32, where a sum would wrap below the count.
+    spot.shadow_layer = std.math.maxInt(u32) - 1;
+    try testing.expectError(error.ShadowLayerOutOfRange, gpu.validateFrameContents(capacity, .{
+        .camera = any_camera,
+        .models = &.{},
+        .joints = &.{},
+        .lights = &.{spot},
+        .shadow_view_projections = &seven,
+    }));
+
+    // A kind with no local map.
+    var sun = gpu.LightUniform.directional(.{ 1, 1, 1 }, 3, .{ 0, -1, 0 });
+    sun.shadow_layer = 0;
+    try testing.expectError(error.ShadowLayerOutOfRange, gpu.validateFrameContents(capacity, .{
+        .camera = any_camera,
+        .models = &.{},
+        .joints = &.{},
+        .lights = &.{sun},
+        .shadow_view_projections = &seven,
+    }));
+
+    const too_many: [gpu.max_shadow_layers + 1]gpu.Mat4 = @splat(identity);
+    try testing.expectError(error.ShadowLayerCapacityExceeded, gpu.validateFrameContents(capacity, .{
+        .camera = any_camera,
+        .models = &.{},
+        .joints = &.{},
+        .lights = &.{},
+        .shadow_view_projections = &too_many,
+    }));
+}
+
+test "previous joints must match the current pose length" {
+    const joints: [2]gpu.Joint = @splat(gpu.mat4(zm.identity()));
+    var frame: gpu.FrameContents = .{
+        .camera = any_camera,
+        .models = &.{},
+        .joints = &joints,
+        .previous_joints = &joints,
+        .lights = &.{},
+    };
+    const capacity: gpu.FrameCapacity = .{ .instances = 0, .joints = 2 };
+    try gpu.validateFrameContents(capacity, frame);
+    frame.previous_joints = joints[0..1];
+    try testing.expectError(error.PreviousJointCountMismatch, gpu.validateFrameContents(capacity, frame));
+    frame.joints = &.{};
+    try testing.expectError(error.PreviousJointCountMismatch, gpu.validateFrameContents(capacity, frame));
+    frame.previous_joints = &.{};
+    try gpu.validateFrameContents(capacity, frame);
+}
+
+test "joint poses occupy consecutive live runs within a doubled ring" {
+    const sentinel = gpu.mat4(zm.translation(-1, -1, -1));
+    var storage: [8]gpu.Joint = @splat(sentinel);
+    const current = [_]gpu.Joint{ gpu.mat4(zm.translation(1, 0, 0)), gpu.mat4(zm.translation(2, 0, 0)) };
+    const previous = [_]gpu.Joint{ gpu.mat4(zm.translation(3, 0, 0)), gpu.mat4(zm.translation(4, 0, 0)) };
+    gpu.writeJointPoses(&storage, &current, &previous);
+    try testing.expectEqualSlices(gpu.Joint, &current, storage[0..2]);
+    try testing.expectEqualSlices(gpu.Joint, &previous, storage[2..4]);
+    for (storage[4..]) |joint| try testing.expectEqual(sentinel, joint);
+    gpu.writeJointPoses(&storage, &.{}, &.{});
+    try testing.expectEqualSlices(gpu.Joint, &previous, storage[2..4]);
+
+    var frame_set: gpu.FrameSet = undefined;
+    frame_set.instances.count = 3;
+    frame_set.joints.count = storage.len;
+    try testing.expectEqual(gpu.FrameCapacity{ .instances = 3, .joints = 4 }, frame_set.capacity());
 }

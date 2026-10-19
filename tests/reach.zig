@@ -14,6 +14,8 @@ const gpu = @import("lenore-gpu");
 // Anything here that gains a test which actually calls it should lose its line.
 
 test "the device-facing surface is compiled" {
+    _ = &gpu.Motion.create;
+    _ = &gpu.Motion.writeResult;
     _ = &gpu.GpuTimer.init;
     _ = &gpu.GpuTimer.deinit;
     _ = &gpu.GpuTimer.reset;
@@ -89,6 +91,7 @@ test "the device-facing surface is compiled" {
     _ = &gpu.Image.deinit;
     _ = &gpu.Image.recordLayoutTransition;
     _ = &gpu.Image.recordCopyFrom;
+    _ = &gpu.Image.createLayerView;
 
     _ = &gpu.StagingPool.init;
     _ = &gpu.StagingPool.deinit;
@@ -167,6 +170,25 @@ test "the device-facing surface is compiled" {
     _ = &gpu.MorphPass.record;
     _ = &gpu.MorphPass.descriptorSetLayout;
 
+    _ = &gpu.ProbeField.init;
+    _ = &gpu.ProbeField.deinit;
+    _ = &gpu.ProbeField.settle;
+    _ = &gpu.ProbeField.shBuffer;
+    _ = &gpu.ProbeField.momentBuffer;
+
+    _ = &gpu.AoPass.init;
+    _ = &gpu.AoPass.deinit;
+    _ = &gpu.AoPass.recreate;
+    _ = &gpu.AoPass.recordEstimate;
+    _ = &gpu.AoPass.recordBlur;
+    _ = &gpu.AoPass.recordClear;
+    _ = &gpu.TemporalPass.init;
+    _ = &gpu.TemporalPass.deinit;
+    _ = &gpu.TemporalPass.recreate;
+    _ = &gpu.TemporalPass.record;
+    _ = &gpu.AoPass.resultView;
+    _ = &gpu.AoPass.resultSampler;
+
     _ = &gpu.ShadowPass.init;
     _ = &gpu.ShadowPass.deinit;
     _ = &gpu.ShadowPass.descriptorSetLayout;
@@ -175,6 +197,12 @@ test "the device-facing surface is compiled" {
     _ = &gpu.ShadowPass.pipelineFor;
     _ = &gpu.ShadowPass.begin;
     _ = &gpu.ShadowPass.end;
+    _ = &gpu.ShadowPass.localMapSize;
+    _ = &gpu.ShadowPass.localLayers;
+    _ = &gpu.ShadowPass.beginLocal;
+    _ = &gpu.ShadowPass.beginLayer;
+    _ = &gpu.ShadowPass.endLayer;
+    _ = &gpu.ShadowPass.endLocal;
 
     _ = &gpu.Sky.record;
 
@@ -223,9 +251,15 @@ test "the device-facing surface is compiled" {
     // not through a whole-frame entry point, because there is no longer one:
     // composition sequences them.
     _ = &gpu.Renderer.recordShadowBake;
+    _ = &gpu.Renderer.recordLocalShadowBake;
     _ = &gpu.Renderer.beginDepthPrepass;
     _ = &gpu.Renderer.recordDepthPrepass;
     _ = &gpu.Renderer.endDepthPrepass;
+    _ = &gpu.Renderer.recordOcclusionEstimate;
+    _ = &gpu.Renderer.recordOcclusionBlur;
+    _ = &gpu.Renderer.recordTemporal;
+    _ = &gpu.Renderer.resetTemporalHistory;
+    _ = &gpu.Renderer.temporalImages;
     _ = &gpu.Renderer.beginMain;
     _ = &gpu.Renderer.recordScene;
     _ = &gpu.Renderer.endMain;
@@ -236,11 +270,15 @@ test "the device-facing surface is compiled" {
     _ = &gpu.Renderer.setMaterialBuffer;
     _ = &gpu.Renderer.setEnvironment;
     _ = &gpu.Renderer.setLightmap;
+    _ = &gpu.Renderer.setProbeField;
     _ = &gpu.Renderer.setMaterialTextures;
     _ = &gpu.Renderer.clearMaterials;
     _ = &gpu.Renderer.shadowBakes;
     _ = &gpu.Renderer.backgroundDraws;
     _ = &gpu.Renderer.shadowMapSize;
+    _ = &gpu.Renderer.localShadowBakes;
+    _ = &gpu.Renderer.localShadowMapSize;
+    _ = &gpu.Renderer.localShadowLayers;
     _ = &gpu.Renderer.targetExtent;
     _ = &gpu.Renderer.mainPassTarget;
     _ = &gpu.Renderer.mainPassFormats;

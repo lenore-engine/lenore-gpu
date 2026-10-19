@@ -27,8 +27,16 @@ pub const Pass = enum {
     compute,
     shadow,
     depth,
+    // The ambient occlusion estimate, and then its two blurs, between the
+    // prepass and the shaded pass. Two rows because they scale differently:
+    // the estimate's taps spread with the radius on screen, the blur's are a
+    // fixed nine per axis.
+    occlusion,
+    occlusion_blur,
     main,
     after_main,
+    // The temporal resolve, when the renderer has one.
+    temporal,
     meter,
     bloom,
     post,

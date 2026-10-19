@@ -1,5 +1,6 @@
 const std = @import("std");
 const vk = @import("vulkan");
+const motion = @import("motion.zig");
 const Context = @import("../device/context.zig").Context;
 
 // The main pass renders linear radiance into an HDR target that the post pass
@@ -11,6 +12,8 @@ pub const Target = struct {
     hdr_view: vk.ImageView,
     depth_image: vk.Image,
     depth_view: vk.ImageView,
+    motion_image: vk.Image,
+    motion_view: vk.ImageView,
     extent: vk.Extent2D,
 };
 
@@ -216,7 +219,7 @@ pub fn beginDepthPrepass(
     command_buffer: vk.CommandBuffer,
     target: Target,
 ) void {
-    const barriers = beginBarriers(target);
+    const barriers = beginBarriers(target) ++ .{motion.beginBarrier(target.motion_image)};
     context.device.cmdPipelineBarrier2(command_buffer, &.{
         .image_memory_barrier_count = barriers.len,
         .p_image_memory_barriers = &barriers,
@@ -228,12 +231,13 @@ pub fn beginDepthPrepass(
     context.device.cmdSetScissor(command_buffer, 0, &.{scissor(target.extent)});
 
     const depth = prepassDepthAttachment(target);
+    const colour = motion.attachment(target.motion_view);
     context.device.cmdBeginRendering(command_buffer, &.{
         .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = target.extent },
         .layer_count = 1,
         .view_mask = 0,
-        .color_attachment_count = 0,
-        .p_color_attachments = &no_colour_attachments,
+        .color_attachment_count = 1,
+        .p_color_attachments = @ptrCast(&colour),
         .p_depth_attachment = &depth,
     });
 }
@@ -245,7 +249,7 @@ pub fn endDepthPrepass(
 ) void {
     context.device.cmdEndRendering(command_buffer);
 
-    const barriers = prepassBarrier(target);
+    const barriers = prepassBarrier(target) ++ .{motion.endBarrier(target.motion_image)};
     context.device.cmdPipelineBarrier2(command_buffer, &.{
         .image_memory_barrier_count = barriers.len,
         .p_image_memory_barriers = &barriers,
@@ -284,5 +288,3 @@ pub fn endMain(context: *const Context, command_buffer: vk.CommandBuffer, target
         .p_image_memory_barriers = &barriers,
     });
 }
-
-const no_colour_attachments = [_]vk.RenderingAttachmentInfo{};

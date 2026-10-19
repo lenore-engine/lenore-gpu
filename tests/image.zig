@@ -49,8 +49,8 @@ test "a cube map is six layers, cube-compatible, and viewed as a cube" {
     // refuses a cube view of an image created without the flag, and a view
     // asking for six layers of a one-layer image. Pinning them together is what
     // makes a half-applied shape a failing test rather than a device error.
-    const flat = gpu.ImageShape.texture_2d;
-    const cube = gpu.ImageShape.cube;
+    const flat: gpu.ImageShape = .texture_2d;
+    const cube: gpu.ImageShape = .cube;
 
     try testing.expectEqual(@as(u32, 1), flat.layerCount());
     try testing.expectEqual(@as(u32, 6), cube.layerCount());
@@ -60,6 +60,13 @@ test "a cube map is six layers, cube-compatible, and viewed as a cube" {
 
     try testing.expectEqual(vk.ImageViewType.@"2d", flat.viewType());
     try testing.expectEqual(vk.ImageViewType.cube, cube.viewType());
+}
+
+test "a 2D array carries its own layer count and is viewed as an array" {
+    const array: gpu.ImageShape = .{ .array_2d = 24 };
+    try testing.expectEqual(@as(u32, 24), array.layerCount());
+    try testing.expectEqual(vk.ImageCreateFlags{}, array.createFlags());
+    try testing.expectEqual(vk.ImageViewType.@"2d_array", array.viewType());
 }
 
 test "each usage is refused by the feature that would carry it" {
@@ -123,9 +130,21 @@ test "an attachment usage is one this module will create" {
     try testing.expect(gpu.imageUsageSupported(.{ .depth_stencil_attachment_bit = true }));
     try testing.expect(gpu.imageUsageSupported(.{ .color_attachment_bit = true, .sampled_bit = true }));
     try testing.expect(gpu.imageUsageSupported(.{ .transfer_dst_bit = true, .sampled_bit = true }));
+    try testing.expect(gpu.imageUsageSupported(.{ .storage_bit = true, .sampled_bit = true }));
 
     // Nothing here allocates lazily or renders to a tile-local attachment, so
     // the bit that would ask for it is not accepted.
     try testing.expect(!gpu.imageUsageSupported(.{ .transient_attachment_bit = true }));
-    try testing.expect(!gpu.imageUsageSupported(.{ .storage_bit = true }));
+    try testing.expect(!gpu.imageUsageSupported(.{ .input_attachment_bit = true }));
+}
+
+test "a storage usage needs the format's storage feature" {
+    // Sampling a format says nothing about writing it from a shader: the two
+    // are separate features, and a format offering only the first is refused.
+    const sampled_only: vk.FormatFeatureFlags = .{ .sampled_image_bit = true };
+    const both: vk.FormatFeatureFlags = .{ .sampled_image_bit = true, .storage_image_bit = true };
+    const usage: vk.ImageUsageFlags = .{ .storage_bit = true, .sampled_bit = true };
+
+    try testing.expect(!gpu.imageFormatSupports(usage, sampled_only));
+    try testing.expect(gpu.imageFormatSupports(usage, both));
 }

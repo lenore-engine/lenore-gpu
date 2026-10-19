@@ -7,7 +7,8 @@ const InstanceWrapper = vk.InstanceWrapper;
 
 // One error set per window system the platform's union declares, because the
 // switch below is exhaustive over it.
-const CreateError = InstanceWrapper.CreateWaylandSurfaceKHRError;
+const CreateError = InstanceWrapper.CreateWaylandSurfaceKHRError ||
+    InstanceWrapper.CreateWin32SurfaceKHRError;
 
 pub const InitError = error{
     // The device was chosen against the display and this surface still cannot
@@ -58,6 +59,10 @@ fn create(context: *const Context, handles: platform.NativeHandles) CreateError!
         .wayland => |wayland| context.instance.createWaylandSurfaceKHR(&.{
             .display = @ptrCast(wayland.display),
             .surface = @ptrCast(wayland.surface),
+        }, null),
+        .win32 => |win32| context.instance.createWin32SurfaceKHR(&.{
+            .hinstance = @ptrCast(win32.hinstance),
+            .hwnd = @ptrCast(win32.hwnd),
         }, null),
     };
 }

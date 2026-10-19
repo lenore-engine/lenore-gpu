@@ -18,6 +18,11 @@ const post = @import("pass/post.zig");
 const res = @import("lenore-resources");
 const resource_storage = @import("store/resources.zig");
 const shadow = @import("pass/shadow.zig");
+const motion_pass = @import("pass/motion.zig");
+const temporal = @import("pass/temporal.zig");
+const ao = @import("pass/ao.zig");
+const probes = @import("pass/probes.zig");
+const Buffer = @import("object/buffer.zig").Buffer;
 const sky = @import("pass/sky.zig");
 const uniforms = @import("binding/uniforms.zig");
 
@@ -70,7 +75,7 @@ pub const scene_extra_set_index = 4;
 // makes a slot claimed twice a compile error rather than a descriptor quietly
 // overwritten at run time.
 pub const scene_bindings = materials_module.bindings ++ environment.bindings ++
-    lightmap_module.bindings;
+    lightmap_module.bindings ++ ao.scene_bindings ++ probes.scene_bindings ++ motion_pass.scene_bindings;
 
 const SceneSets = descriptors.Sets(&scene_bindings);
 
@@ -120,7 +125,7 @@ pub const MaterialRecord = struct {
     alpha: res.MaterialInfo.Rendering.AlphaMode,
     // The cutoff test the bake pushes for a masked caster, in the units the
     // shader compares in.
-    mask: shadow.PushConstants,
+    mask: shadow.Mask,
 
     pub fn mode(self: MaterialRecord) pipeline.Mode {
         return pipeline.modeFor(self.alpha);
@@ -142,12 +147,12 @@ pub const MaterialRecord = struct {
     }
 };
 
-// Whether this frame re-records the sun shadow map.
+// Whether this frame re-records a shadow map: the sun's, or the local array.
 //
-// The decision is the caller's because the renderer cannot make it: what the map
-// has to hold changes when the sun moves or when a caster does, and neither is
-// something a renderer is told about. A scene that neither animates nor moves
-// its sun bakes once and reuses that map for every frame after.
+// The decision is the caller's because the renderer cannot make it: what a map
+// has to hold changes when its light moves or when a caster does, and neither
+// is something a renderer is told about. A scene that neither animates nor
+// moves its lights bakes once and reuses the maps for every frame after.
 pub const ShadowBake = enum { reuse, rebake };
 
 pub const MaterialError = error{MaterialIndexOutOfRange};
@@ -467,9 +472,9 @@ pub fn scenePipelineMode(mode: pipeline.Mode) pipeline.Mode {
     return if (mode == .solid) .pretested else mode;
 }
 
-// Two camera-depth pipelines per vertex variant. Opaque geometry has no
-// fragment stage; MASK runs the cutoff-only entry point whose input matches that
-// variant. The creation loop fills this order and rollback walks its prefix.
+// Two camera-depth pipelines per vertex variant. Both write motion
+// through a fragment stage; MASK also applies the alpha cutoff. The creation
+// loop fills this order and rollback walks its prefix.
 pub const depth_pipeline_count = scene_variants * 2;
 
 pub fn depthPipelineIndex(variant: SceneVariant, masked: bool) usize {
@@ -506,8 +511,9 @@ pub const SceneShader = struct {
     fragment_entry: [*:0]const u8,
     // For the variants whose vertex stage carries COLOR_0.
     colour_fragment_entry: [*:0]const u8,
-    // The same input axis for the cutoff-only camera depth prepass. Opaque
-    // geometry has no fragment stage and names neither.
+    // The prepass writes motion for both opaque and masked surfaces.
+    motion_fragment_entry: [*:0]const u8,
+    colour_motion_fragment_entry: [*:0]const u8,
     mask_fragment_entry: [*:0]const u8,
     colour_mask_fragment_entry: [*:0]const u8,
 
@@ -543,11 +549,38 @@ pub const Shaders = struct {
     post: post.Shader,
     bloom: bloom.Shader,
     shadow: shadow.Shader,
+    ao: ao.Shader,
     // Null is a renderer that never measures its own frames, which is what an
     // application setting its exposure from a constant wants: the pass costs a
     // pipeline, a descriptor set and a small buffer per frame in flight, and
     // none of that is worth carrying for a caller that will not read it.
     meter: ?meter.Shader = null,
+    // Null is a renderer with no temporal resolve: the passes after the main
+    // one read its target directly, at the render resolution. Supplied, they
+    // read the resolve's picture at the output resolution instead.
+    temporal: ?temporal.Shader = null,
+    // Who fills the resolved picture. `external` leaves `recordTemporal` to the
+    // caller's own upscaler, which writes the image `temporalImages` names.
+    temporal_writer: temporal.Writer = .draw,
+};
+
+// One image an upscaler reads or writes, as the renderer holds it.
+pub const TemporalImage = struct {
+    image: vk.Image,
+    view: vk.ImageView,
+    format: vk.Format,
+    extent: vk.Extent2D,
+};
+
+// What an external upscaler works from and writes to, and the layouts they are
+// in: the main pass's colour, depth and motion are sampled (`pass.endMain` and
+// the prepass leave them so), and `resolved` is what bloom, the meter and the
+// post pass read, sampled from the fragment and compute stages.
+pub const TemporalImages = struct {
+    colour: TemporalImage,
+    depth: TemporalImage,
+    motion: TemporalImage,
+    resolved: TemporalImage,
 };
 
 // The Vulkan-facing form the umbrella translates a scene batch into. Keeping
@@ -589,6 +622,7 @@ pub const Renderer = struct {
     // after the previous frame's.
     hdr: image.Image,
     depth: image.Image,
+    motion: image.Image,
 
     scene_module: vk.ShaderModule,
     // Present only when the application supplied shaded fragment entries from
@@ -653,6 +687,11 @@ pub const Renderer = struct {
     // them a caller can read back: a scene that has stopped moving under a still
     // sun should stop adding to it.
     shadow_bakes: u64,
+    // The same pair for the local array. Valid also records how many layers the
+    // last bake wrote, because a light given a layer the last bake did not
+    // write would read whatever that layer held.
+    local_shadow_layers_baked: ?usize,
+    local_shadow_bakes: u64,
     // How many recordings have drawn a background. The counterpart of
     // `shadow_bakes` and read for the same reason: what a caller asked for and
     // what was recorded are two different things, and this is the one a caller
@@ -669,11 +708,24 @@ pub const Renderer = struct {
     // Present only when the shader was supplied. It follows the target for the
     // reason the chain does: the set it binds names the target's view.
     meter: ?meter.MeterPass,
+    // Present only when its shader was supplied. Follows both the target, which
+    // it reads, and the output, at whose size it writes.
+    temporal: ?temporal.TemporalPass,
     // How many recordings have run the chain. The counterpart of `shadow_bakes`
     // and `background_draws`, and read for the same reason: what a caller asked
     // for and what was recorded are two different things, and this is the one a
     // caller can check from outside a frame it cannot see into.
     bloom_chains: u64,
+
+    // Follows the target like the chain. Its result is in the scene set, so
+    // the main pass reads it whether or not the pass ran; `occlusion_cleared`
+    // records that the result already holds the unoccluded one from a frame
+    // that did not run it, so a scene with the pass off clears it once.
+    ambient_occlusion: ao.AoPass,
+    occlusion_cleared: bool,
+
+    // What the scene set's probe slots name when no field is installed.
+    probe_fallback: Buffer,
 
     post_sets: post.Sets,
     post_sampler: vk.Sampler,
@@ -719,6 +771,9 @@ pub const Renderer = struct {
         memory_allocator: *memory.MemoryAllocator,
         allocator: Allocator,
         extent: vk.Extent2D,
+        // The extent the temporal resolve writes at, which is the presented
+        // image's. Unread without a temporal shader.
+        output_extent: vk.Extent2D,
         frames: usize,
         capacity: frame_set.Capacity,
         material_capacity: u32,
@@ -728,12 +783,37 @@ pub const Renderer = struct {
         // against. Asked for here rather than fixed, because what a map costs
         // and what it resolves are the caller's trade to make.
         shadow_map_size: u32,
+        // The local lights' layers, for the same trade: `LocalShadowFit` is
+        // computed against `map_size`, and `layers` is what
+        // `assignShadowLayers` in lenore-scene gives out.
+        local_shadow_maps: shadow.LocalMaps,
         shaders: Shaders,
     ) InitError!Renderer {
         var hdr = try attachment.createHdr(context, memory_allocator, extent);
         errdefer hdr.deinit();
         var depth = try attachment.createDepth(context, memory_allocator, extent);
         errdefer depth.deinit();
+        var motion = try motion_pass.create(context, memory_allocator, extent);
+        errdefer motion.deinit();
+
+        // Before the chain, the meter and the post set, which read what it
+        // writes in place of the target when it exists.
+        var temporal_pass: ?temporal.TemporalPass = if (shaders.temporal) |supplied|
+            try temporal.TemporalPass.init(
+                context,
+                memory_allocator,
+                allocator,
+                hdr.format,
+                output_extent,
+                .{ .colour = hdr.view, .motion = motion.view, .depth = depth.view },
+                supplied,
+                shaders.temporal_writer,
+            )
+        else
+            null;
+        errdefer if (temporal_pass) |*pass_| pass_.deinit();
+        const presented_view = if (temporal_pass) |*pass_| pass_.resolvedView() else hdr.view;
+        const presented_extent = if (temporal_pass) |*pass_| pass_.outputExtent() else extent;
 
         // Both are the first candidate the device's features carried, so which
         // one it is belongs in the log beside the present mode. A resize takes
@@ -795,12 +875,25 @@ pub const Renderer = struct {
             context,
             memory_allocator,
             allocator,
-            extent,
+            presented_extent,
             hdr.format,
-            hdr.view,
+            presented_view,
             shaders.bloom,
         );
         errdefer bloom_pass.deinit();
+
+        // Reads the camera depth, so it follows the target as the chain does,
+        // and its result goes into the scene set the moment both exist.
+        var ao_pass = try ao.AoPass.init(context, memory_allocator, allocator, extent, depth.view, shaders.ao);
+        errdefer ao_pass.deinit();
+        ao.writeResult(context, scene.set(0), ao_pass.resultView(), ao_pass.resultSampler());
+        motion_pass.writeResult(context, scene.set(0), motion.view, ao_pass.resultSampler());
+
+        // What the probe slots name while no field is installed. Never read:
+        // the light block's grid is disabled until `setProbeField`.
+        var probe_fallback = try Buffer.init(context, memory_allocator, 64, .{ .storage_buffer_bit = true }, .device);
+        errdefer probe_fallback.deinit();
+        probes.writeScene(context, scene.set(0), &probe_fallback, &probe_fallback);
 
         // Beside the chain rather than after the pipelines, because it reads the
         // same target and is undone on the same failure path.
@@ -810,7 +903,7 @@ pub const Renderer = struct {
                 memory_allocator,
                 allocator,
                 frames,
-                hdr.view,
+                presented_view,
                 supplied,
             )
         else
@@ -818,7 +911,7 @@ pub const Renderer = struct {
         errdefer if (meter_pass) |*pass_| pass_.deinit();
 
         post.write(context, &post_sets, .{
-            .view = hdr.view,
+            .view = presented_view,
             .sampler = post_sampler,
             .bloom_view = bloom_pass.compositeView(),
             .bloom_sampler = bloom_pass.compositeSampler(),
@@ -834,6 +927,7 @@ pub const Renderer = struct {
             memory_allocator,
             allocator,
             shadow_map_size,
+            local_shadow_maps,
             .{
                 .frame = frame.descriptorSetLayout(),
                 .scene = scene.layout,
@@ -939,7 +1033,7 @@ pub const Renderer = struct {
                             .mode = .solid,
                             .vertex_input = pipeline.vertexInput(variant.streams()),
                             .culling = .dynamic,
-                            .formats = .{ .depth = depth.format },
+                            .formats = .{ .colour = motion_pass.format, .depth = depth.format },
                             .layout = scene_layout,
                             .stages = .{
                                 // The exact entry point the shaded pipeline
@@ -949,13 +1043,13 @@ pub const Renderer = struct {
                                     .module = scene_module,
                                     .entry_point = shaders.scene.vertex_entry[sceneVariantIndex(variant)],
                                 },
-                                .fragment = if (masked) .{
+                                .fragment = .{
                                     .module = scene_module,
-                                    .entry_point = if (colour)
-                                        shaders.scene.colour_mask_fragment_entry
+                                    .entry_point = if (masked)
+                                        (if (colour) shaders.scene.colour_mask_fragment_entry else shaders.scene.mask_fragment_entry)
                                     else
-                                        shaders.scene.mask_fragment_entry,
-                                } else null,
+                                        (if (colour) shaders.scene.colour_motion_fragment_entry else shaders.scene.motion_fragment_entry),
+                                },
                             },
                         });
                         depth_created += 1;
@@ -1019,6 +1113,8 @@ pub const Renderer = struct {
             .allocator = allocator,
             .hdr = hdr,
             .depth = depth,
+            .motion = motion,
+            .temporal = temporal_pass,
             .scene_module = scene_module,
             .scene_shading_module = scene_shading_module,
             .sky_module = sky_module,
@@ -1042,9 +1138,14 @@ pub const Renderer = struct {
             .shadows = shadows,
             .shadow_valid = false,
             .shadow_bakes = 0,
+            .local_shadow_layers_baked = null,
+            .local_shadow_bakes = 0,
             .background_draws = 0,
             .bloom = bloom_pass,
             .bloom_chains = 0,
+            .ambient_occlusion = ao_pass,
+            .occlusion_cleared = false,
+            .probe_fallback = probe_fallback,
             .meter = meter_pass,
             .post_sets = post_sets,
             .post_sampler = post_sampler,
@@ -1064,6 +1165,9 @@ pub const Renderer = struct {
         device.destroyPipelineLayout(self.scene_layout, null);
         self.post_sets.deinit(self.context, self.allocator);
         if (self.meter) |*measured| measured.deinit();
+        if (self.temporal) |*resolve| resolve.deinit();
+        self.probe_fallback.deinit();
+        self.ambient_occlusion.deinit();
         self.bloom.deinit();
         self.shadows.deinit();
         self.allocator.free(self.frame_instance_counts);
@@ -1075,6 +1179,7 @@ pub const Renderer = struct {
         device.destroyShaderModule(self.sky_module, null);
         if (self.scene_shading_module) |module| device.destroyShaderModule(module, null);
         device.destroyShaderModule(self.scene_module, null);
+        self.motion.deinit();
         self.depth.deinit();
         self.hdr.deinit();
         self.* = undefined;
@@ -1110,6 +1215,17 @@ pub const Renderer = struct {
     // none: the renderer owns no texture cache and so cannot produce the black
     // image that stands in for an absent one. Composition does, through
     // `Lightmap.none`, and recording refuses to proceed until it has.
+    // Points the main pass at a settled probe field, or back at nothing. The
+    // field outlives its installation; the light block's grid is what says
+    // whether it is read. When no frame is in flight.
+    pub fn setProbeField(self: *Renderer, field: ?*const probes.ProbeField) void {
+        if (field) |installed| {
+            probes.writeScene(self.context, self.scene.set(0), installed.shBuffer(), installed.momentBuffer());
+        } else {
+            probes.writeScene(self.context, self.scene.set(0), &self.probe_fallback, &self.probe_fallback);
+        }
+    }
+
     pub fn setLightmap(self: *Renderer, source: lightmap_module.Lightmap) void {
         lightmap_module.write(self.context, self.scene.set(0), source);
         self.lightmap_ready = true;
@@ -1198,13 +1314,22 @@ pub const Renderer = struct {
     // The attachments follow the swapchain, so a resize replaces them and the
     // post pass's descriptor with them.
     //
-    // Candidate first: the old pair survives if either allocation fails, so a
+    // Candidate first: the old attachments survive if an allocation fails, so a
     // resize that cannot be honoured leaves a renderer that still draws.
-    pub fn resize(self: *Renderer, extent: vk.Extent2D) InitError!void {
+    pub fn resize(self: *Renderer, extent: vk.Extent2D, output_extent: vk.Extent2D) InitError!void {
         var hdr = try attachment.createHdr(self.context, self.memory_allocator, extent);
         errdefer hdr.deinit();
         var depth = try attachment.createDepth(self.context, self.memory_allocator, extent);
         errdefer depth.deinit();
+        var motion = try motion_pass.create(self.context, self.memory_allocator, extent);
+        errdefer motion.deinit();
+
+        // Against the candidates, and before the chain, which reads what it
+        // writes. `TemporalPass.recreate` keeps its own images on failure.
+        if (self.temporal) |*resolve|
+            try resolve.recreate(output_extent, .{ .colour = hdr.view, .motion = motion.view, .depth = depth.view });
+        const presented_view = if (self.temporal) |*resolve| resolve.resolvedView() else hdr.view;
+        const presented_extent: vk.Extent2D = if (self.temporal) |*resolve| resolve.outputExtent() else .{ .width = hdr.width, .height = hdr.height };
 
         // The chain follows the target, so a resize rebuilds it, and its depth
         // can change with it: a smaller window supports fewer levels. Whatever
@@ -1212,21 +1337,29 @@ pub const Renderer = struct {
         // which is why the composite's weight is derived per recording rather
         // than held beside the settings.
         //
-        // Before the two above are installed, and against the candidate's view
+        // Before the attachments are installed, and against the candidate's view
         // rather than the field's. The errdefers here name the candidates, so
         // anything failing after they were installed would destroy the images
         // the renderer had just started using; `BloomPass.recreate` keeps its
         // own chain on failure, so a resize that stops here leaves everything
         // as it was.
-        try self.bloom.recreate(.{ .width = hdr.width, .height = hdr.height }, hdr.view);
+        try self.bloom.recreate(presented_extent, presented_view);
+        // The same candidate rule, against the candidate depth. If it fails
+        // after the chain was rebuilt, the chain is a size ahead of a target
+        // that was not replaced; it follows the next resize either way, and a
+        // chain of the wrong size draws a softer glow rather than a wrong frame.
+        try self.ambient_occlusion.recreate(.{ .width = depth.width, .height = depth.height }, depth.view);
+        self.occlusion_cleared = false;
 
         self.hdr.deinit();
+        self.motion.deinit();
         self.depth.deinit();
         self.hdr = hdr;
         self.depth = depth;
+        self.motion = motion;
 
         post.write(self.context, &self.post_sets, .{
-            .view = self.hdr.view,
+            .view = presented_view,
             .sampler = self.post_sampler,
             .bloom_view = self.bloom.compositeView(),
             .bloom_sampler = self.bloom.compositeSampler(),
@@ -1236,7 +1369,14 @@ pub const Renderer = struct {
         // After the install and not before it, unlike the chain: this cannot
         // fail, so there is nothing to keep a candidate for, and pointing it at
         // the view the renderer is now drawing into is one fewer thing to undo.
-        if (self.meter) |*measured| measured.recreate(self.hdr.view);
+        if (self.meter) |*measured| measured.recreate(presented_view);
+        motion_pass.writeResult(self.context, self.scene.set(0), self.motion.view, self.ambient_occlusion.resultSampler());
+        ao.writeResult(
+            self.context,
+            self.scene.set(0),
+            self.ambient_occlusion.resultView(),
+            self.ambient_occlusion.resultSampler(),
+        );
     }
 
     // How many frames have re-recorded the map since init. Diagnostic, and the
@@ -1248,6 +1388,19 @@ pub const Renderer = struct {
 
     pub fn shadowMapSize(self: *const Renderer) u32 {
         return self.shadows.mapSize();
+    }
+
+    // The local array's counterparts of the three above.
+    pub fn localShadowBakes(self: *const Renderer) u64 {
+        return self.local_shadow_bakes;
+    }
+
+    pub fn localShadowMapSize(self: *const Renderer) u32 {
+        return self.shadows.localMapSize();
+    }
+
+    pub fn localShadowLayers(self: *const Renderer) u32 {
+        return self.shadows.localLayers();
     }
 
     // How many recordings have drawn a background since init. Every recording
@@ -1295,6 +1448,8 @@ pub const Renderer = struct {
         return .{
             .hdr_image = self.hdr.handle,
             .hdr_view = self.hdr.view,
+            .motion_image = self.motion.handle,
+            .motion_view = self.motion.view,
             .depth_image = self.depth.handle,
             .depth_view = self.depth.view,
             .extent = self.targetExtent(),
@@ -1358,11 +1513,16 @@ pub const Renderer = struct {
     // taken as present. Both hold because the list came out of a `RecordPlan`,
     // which is the only thing `record` accepts and which cannot be made without
     // validating it.
+    //
+    // `view_projection` is the map's or the layer's, pushed once here: every
+    // pipeline below shares the layout, so it survives each pipeline change,
+    // and the masks pushed after it lie past its bytes.
     fn recordCasters(
         self: *const Renderer,
         command_buffer: vk.CommandBuffer,
         frame_index: usize,
         batches: []const RecordBatch,
+        view_projection: uniforms.Mat4,
     ) void {
         if (batches.len == 0) return;
         const device = self.context.device;
@@ -1371,6 +1531,14 @@ pub const Renderer = struct {
         // set layouts but differ in push constants, so they are not compatible
         // and each pass binds for itself.
         self.frame.bind(self.context, command_buffer, self.shadows.layout, frame_index);
+        device.cmdPushConstants(
+            command_buffer,
+            self.shadows.layout,
+            shadow.push_constant_range.stage_flags,
+            shadow.view_offset,
+            @sizeOf(uniforms.Mat4),
+            @ptrCast(&view_projection),
+        );
 
         var last_pipeline: ?vk.Pipeline = null;
         var last_material: ?u32 = null;
@@ -1409,8 +1577,8 @@ pub const Renderer = struct {
                     command_buffer,
                     self.shadows.layout,
                     shadow.push_constant_range.stage_flags,
-                    shadow.push_constant_range.offset,
-                    shadow.push_constant_range.size,
+                    shadow.mask_offset,
+                    @sizeOf(shadow.Mask),
                     @ptrCast(&material.mask),
                 );
                 last_material = batch.material_index;
@@ -1482,10 +1650,14 @@ pub const Renderer = struct {
     // a scene without shadows rather than a scene whose shadows are pending.
     // It is the right content for a list with nothing in it to cast, which
     // is what `recordCasters` leaves when it is handed one.
+    //
+    // `sun_view_projection` is the fit the frame's sun block carries, the
+    // matrix the lookup reads back through.
     pub fn recordShadowBake(
         self: *Renderer,
         command_buffer: vk.CommandBuffer,
         shadow_bake: ShadowBake,
+        sun_view_projection: uniforms.Mat4,
         frame_plan: RecordPlan,
     ) void {
         if (shadow_bake != .rebake and self.shadow_valid) return;
@@ -1494,10 +1666,57 @@ pub const Renderer = struct {
         // Every batch, not the visible ones: what a camera cannot see still
         // casts into what it can, and the fit this map was built for covers
         // the whole scene rather than the view.
-        self.recordCasters(command_buffer, frame_plan.frame_index, frame_plan.casters);
+        self.recordCasters(command_buffer, frame_plan.frame_index, frame_plan.casters, sun_view_projection);
         self.shadows.end(command_buffer);
         self.shadow_valid = true;
         self.shadow_bakes += 1;
+    }
+
+    // The local lights' layers, before `beginMain` for the sun's reasons.
+    // `layers` holds the frame's layer matrices in layer order, the same slice
+    // the light block carries, and each layer is baked through its own.
+    //
+    // Re-recorded when asked, and also when the layers that would be read are
+    // not the ones last written: a first frame, or one that gives out more
+    // layers than the last bake wrote. Every listed layer is baked each time;
+    // one barrier opens the whole array, so a partial bake would discard the
+    // layers it skipped.
+    //
+    // The first call opens and closes the array even with no layers, so it is
+    // called every frame. The descriptor names the array in the sampled
+    // layout, and an image never transitioned out of `undefined` is not in
+    // it. Vulkan requires the match only where a draw reads the image
+    // (VUID-vkCmdDraw-None-09600), which no draw does while no light has a
+    // layer, and the validation layer was measured to stay silent without
+    // this; it is kept for the sun map's rule, that a lookup never meets an
+    // image nothing has written, so a later light given a layer cannot find
+    // the array in a layout no bake left it in.
+    //
+    // Every batch is drawn into every layer, as into the sun's map. A light's
+    // range bounds what can reach its layers, and culling the list against it
+    // is the obvious next cost to cut, once a scene shows the bake in a frame.
+    pub fn recordLocalShadowBake(
+        self: *Renderer,
+        command_buffer: vk.CommandBuffer,
+        shadow_bake: ShadowBake,
+        layers: []const uniforms.Mat4,
+        frame_plan: RecordPlan,
+    ) void {
+        std.debug.assert(layers.len <= self.shadows.localLayers());
+        if (self.local_shadow_layers_baked) |written| {
+            if (layers.len == 0) return;
+            if (shadow_bake != .rebake and layers.len <= written) return;
+        }
+
+        self.shadows.beginLocal(command_buffer);
+        for (layers, 0..) |view_projection, layer| {
+            self.shadows.beginLayer(command_buffer, @intCast(layer));
+            self.recordCasters(command_buffer, frame_plan.frame_index, frame_plan.casters, view_projection);
+            self.shadows.endLayer(command_buffer);
+        }
+        self.shadows.endLocal(command_buffer);
+        self.local_shadow_layers_baked = layers.len;
+        if (layers.len > 0) self.local_shadow_bakes += 1;
     }
 
     // Opens the camera depth prepass. Its barriers order the shared attachments
@@ -1508,9 +1727,9 @@ pub const Renderer = struct {
 
     // Visible opaque geometry into the open depth prepass. The vertex stage is
     // the exact entry point the shaded pipeline uses, so clip-space arithmetic
-    // is invariant and the later equality test is bit-exact. Opaque materials
-    // have no fragment stage; MASK selects a cutoff-only one and binds the two
-    // descriptor sets it reads. BLEND has no single depth and ends the run.
+    // is invariant and the later equality test is bit-exact. Both opaque and
+    // MASK fragments write motion; MASK also binds the material textures for
+    // its cutoff. BLEND has no single depth and ends the run.
     pub fn recordDepthPrepass(
         self: *const Renderer,
         command_buffer: vk.CommandBuffer,
@@ -1601,9 +1820,32 @@ pub const Renderer = struct {
         }
     }
 
-    // Stores the nearest depth and makes it visible to the main rendering.
+    // Makes the stored depth and motion visible to the main rendering.
     pub fn endDepthPrepass(self: *Renderer, command_buffer: vk.CommandBuffer) void {
         pass.endDepthPrepass(self.context, command_buffer, self.mainPassTarget());
+    }
+
+    // Between the prepass and the shaded pass, which is the one place the
+    // stored depth is complete and not yet loaded again. Null is a frame with
+    // the effect off: the result is set to unoccluded once and left there.
+    //
+    // `recordOcclusionBlur` follows it with the same frame. The depth is an
+    // attachment again by the end of this one.
+    pub fn recordOcclusionEstimate(self: *Renderer, command_buffer: vk.CommandBuffer, frame: ?ao.Frame) void {
+        if (frame) |values| {
+            self.ambient_occlusion.recordEstimate(command_buffer, self.depth.handle, values);
+            self.occlusion_cleared = false;
+        } else if (!self.occlusion_cleared) {
+            self.ambient_occlusion.recordClear(command_buffer);
+            self.occlusion_cleared = true;
+        }
+    }
+
+    // The estimate's blur. Null records nothing, as the estimate did no more
+    // than clear.
+    pub fn recordOcclusionBlur(self: *Renderer, command_buffer: vk.CommandBuffer, frame: ?ao.Frame) void {
+        const values = frame orelse return;
+        self.ambient_occlusion.recordBlur(command_buffer, values);
     }
 
     // Opens the shaded main rendering. Colour is cleared and depth loads what
@@ -1756,6 +1998,38 @@ pub const Renderer = struct {
     // post pass sample it in.
     pub fn endMain(self: *Renderer, command_buffer: vk.CommandBuffer) void {
         pass.endMain(self.context, command_buffer, self.mainPassTarget());
+    }
+
+    // The temporal resolve, after `endMain` and before the meter and the
+    // chain, which read what it writes. Nothing without a temporal shader.
+    pub fn recordTemporal(self: *Renderer, command_buffer: vk.CommandBuffer, frame: temporal.Frame) void {
+        const resolve = if (self.temporal) |*pass_| pass_ else return;
+        resolve.record(command_buffer, self.targetExtent(), frame);
+    }
+
+    // Null without a temporal pass.
+    pub fn temporalImages(self: *const Renderer) ?TemporalImages {
+        const resolve = if (self.temporal) |*pass_| pass_ else return null;
+        const resolved = resolve.resolvedImage();
+        const target = self.targetExtent();
+        return .{
+            .colour = .{ .image = self.hdr.handle, .view = self.hdr.view, .format = self.hdr.format, .extent = target },
+            .depth = .{ .image = self.depth.handle, .view = self.depth.view, .format = self.depth.format, .extent = target },
+            .motion = .{ .image = self.motion.handle, .view = self.motion.view, .format = self.motion.format, .extent = target },
+            .resolved = .{
+                .image = resolved.handle,
+                .view = resolved.view,
+                .format = resolved.format,
+                .extent = .{ .width = resolved.width, .height = resolved.height },
+            },
+        };
+    }
+
+    // The next resolve takes its frame alone, for a camera cut: history
+    // gathered of another view would otherwise be clipped in over several
+    // frames rather than dropped.
+    pub fn resetTemporalHistory(self: *Renderer) void {
+        if (self.temporal) |*resolve| resolve.resetHistory();
     }
 
     // The bloom chain, recorded between `endMain` and `recordPost`: it reads

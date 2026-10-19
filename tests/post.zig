@@ -71,6 +71,8 @@ test "the pass samples what the main pass left behind" {
         .hdr_view = @fromBackingInt(@intCast(2)),
         .depth_image = @fromBackingInt(@intCast(3)),
         .depth_view = @fromBackingInt(@intCast(4)),
+        .motion_image = @fromBackingInt(@intCast(5)),
+        .motion_view = @fromBackingInt(@intCast(6)),
         .extent = target.extent,
     });
     try testing.expectEqual(vk.ImageLayout.shader_read_only_optimal, main_end[0].new_layout);

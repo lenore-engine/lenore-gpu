@@ -46,6 +46,7 @@ pub const FrameSet = frame_set.FrameSet;
 pub const FrameSetBindings = frame_set.bindings;
 pub const FrameContents = frame_set.FrameSet.Frame;
 pub const validateFrameContents = frame_set.validate;
+pub const writeJointPoses = frame_set.writeJointPoses;
 pub const Instance = frame_set.Instance;
 pub const Joint = frame_set.Joint;
 pub const FrameCapacity = frame_set.Capacity;
@@ -77,6 +78,8 @@ pub const validateBufferCopy = buffer.validateCopy;
 
 pub const Image = image.Image;
 pub const ImageConfig = image.Config;
+pub const ImageInitError = image.InitError;
+pub const ImageMipViewError = image.MipViewError;
 pub const MipCopy = image.MipCopy;
 pub const ImageKind = image.Kind;
 pub const ImageShape = image.Shape;
@@ -135,9 +138,16 @@ pub const LightUniform = uniforms.Light;
 pub const LightsUniform = uniforms.Lights;
 pub const SunShadowUniform = uniforms.SunShadow;
 pub const max_lights = uniforms.max_lights;
+pub const max_shadow_layers = uniforms.max_shadow_layers;
+pub const no_shadow_layer = uniforms.no_shadow_layer;
+pub const LocalShadowUniform = uniforms.LocalShadow;
+pub const AmbientUniform = uniforms.Ambient;
+pub const ProbeGridUniform = uniforms.ProbeGrid;
+pub const DebugView = uniforms.DebugView;
 pub const Mat4 = uniforms.Mat4;
 pub const mat4 = uniforms.mat4;
 pub const vulkanClip = uniforms.vulkanClip;
+pub const jitterClip = uniforms.jitterClip;
 pub const vulkanClipCamera = uniforms.vulkanClipCamera;
 pub const FramebufferCamera = uniforms.FramebufferCamera;
 pub const Uniforms = uniforms;
@@ -173,6 +183,21 @@ pub const meter_bindings = meter.bindings;
 pub const meter_cell_side = meter.cell_side;
 pub const meter_tap_side = meter.tap_side;
 pub const meter_cell_count = meter.cell_count;
+
+const probes = @import("pass/probes.zig");
+pub const Probes = probes;
+pub const ProbeField = probes.ProbeField;
+pub const ProbesShader = probes.Shader;
+
+pub const Motion = @import("pass/motion.zig");
+
+const ao = @import("pass/ao.zig");
+pub const Ao = ao;
+pub const AoPass = ao.AoPass;
+pub const Temporal = @import("pass/temporal.zig");
+pub const TemporalPass = Temporal.TemporalPass;
+pub const TemporalShader = Temporal.Shader;
+pub const AoShader = ao.Shader;
 
 const bloom = @import("pass/bloom.zig");
 pub const Bloom = bloom;
@@ -210,6 +235,8 @@ pub const backgroundSlot = renderer.backgroundSlot;
 pub const RecordRequest = renderer.RecordRequest;
 pub const RecordState = renderer.RecordState;
 pub const RecordPlan = renderer.RecordPlan;
+pub const TemporalImages = renderer.TemporalImages;
+pub const TemporalImage = renderer.TemporalImage;
 pub const planRecording = renderer.planRecording;
 pub const SceneVariant = renderer.SceneVariant;
 pub const sceneVariantFor = renderer.sceneVariantFor;
@@ -341,6 +368,8 @@ pub const gpu_timestamp_slots_per_frame = timing.slots_per_frame;
 pub const gpuDurationNs = timing.durationNs;
 
 pub const PerFrame = per_frame.PerFrame;
+pub const PerFrameInitError = per_frame.InitError;
+pub const PerFrameLayoutError = per_frame.LayoutError;
 pub const perFrameLayout = per_frame.layout;
 pub const perFrameOffsetAlignment = per_frame.offsetAlignment;
 

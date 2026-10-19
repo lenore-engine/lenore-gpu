@@ -11,7 +11,9 @@ test "the environment continues the scene set after the material array" {
     // The joined layout is what the pipeline is built with, so a gap or a
     // collision between the two lists shows up here rather than as a descriptor
     // the shader reads and nobody wrote.
-    try testing.expectEqual(@as(usize, 6), gpu.SceneSetBindings.len);
+    // Ten: the material array, the environment's three, the lighting
+    // cache's two, ambient occlusion, the probe field's two and motion.
+    try testing.expectEqual(@as(usize, 10), gpu.SceneSetBindings.len);
     for (gpu.SceneSetBindings, 0..) |binding, index|
         try testing.expectEqual(@as(u32, @intCast(index)), binding.slot);
 

@@ -61,11 +61,11 @@ const entries = [_]Entry{
         .ring = .joints,
     },
     .{
-        // Both stages, and for once not the same reason on each side: the bake's
-        // vertex stage transforms casters by this matrix, and the main pass's
-        // fragment stage transforms the shaded point by the same one to find the
-        // texel to compare against. The lookup is a fragment-stage operation
-        // because the point it needs is the shaded one, not a vertex.
+        // The main pass's fragment stage transforms the shaded point by this
+        // matrix to find the texel to compare against; the bake rasterizes
+        // through the same matrix, pushed to it. The vertex stage stays in the
+        // flags because the bake's pipeline layout names this set, and a stage
+        // that reads nothing from a binding costs nothing.
         .binding = .{
             .slot = 4,
             .name = "sun_shadow",
@@ -127,6 +127,16 @@ pub const UpdateError = error{
     // reports this first, against the same bound; this is the check that stands
     // between the arithmetic and the write.
     JointCapacityExceeded,
+    PreviousJointCountMismatch,
+
+    // More local shadow matrices than the block holds (`uniforms.max_shadow_layers`).
+    ShadowLayerCapacityExceeded,
+
+    // A light names a shadow layer it cannot have: a kind with no local map,
+    // or a run of layers (one for a spot, six for a point light) that ends
+    // past the frame's matrices. The shader indexes the matrices by this
+    // number without a check, so it is refused here instead.
+    ShadowLayerOutOfRange,
 };
 
 // What one instance carries, as the shader's `StructuredBuffer<Instance>` steps
@@ -142,12 +152,16 @@ pub const Instance = extern struct {
 
     // The material and two padding words are separate scalars because the
     // shader's mirror is held against this one by field name. A three-component
-    // vector there aligns to sixteen bytes, which puts the tail at offset
-    // eighty and strides the element by ninety-six; that was measured against
-    // the compiler's own reflection, not derived.
+    // vector would move those fields and the previous matrix away from the
+    // offsets the host writes. Reflection checks both the fields and stride.
     material_index: u32 = 0,
     padding_0: u32 = 0,
     padding_1: u32 = 0,
+
+    // Last frame's `model`, for the motion the depth prepass writes. After the
+    // fields above rather than beside `model`, so that a shader reading the
+    // record's first eighty bytes reads them where it always did.
+    previous_model: uniforms.Mat4 align(16),
 };
 
 // One joint matrix, as `StructuredBuffer<float4x4>` reads it.
@@ -178,7 +192,32 @@ pub const Capacity = struct {
 pub fn validate(capacity: Capacity, contents: FrameSet.Frame) UpdateError!void {
     if (contents.models.len > capacity.instances) return error.InstanceCapacityExceeded;
     if (contents.joints.len > capacity.joints) return error.JointCapacityExceeded;
+    if (contents.previous_joints.len != contents.joints.len) return error.PreviousJointCountMismatch;
     if (contents.lights.len > uniforms.max_lights) return error.LightCapacityExceeded;
+    if (contents.shadow_view_projections.len > uniforms.max_shadow_layers)
+        return error.ShadowLayerCapacityExceeded;
+    for (contents.lights) |light| {
+        if (light.shadow_layer == uniforms.no_shadow_layer) continue;
+        const layers: u32 = switch (light.kind) {
+            .spot => 1,
+            .point => 6,
+            .directional, .rect => return error.ShadowLayerOutOfRange,
+        };
+        // As a subtraction, so a layer near the top of u32 cannot wrap into
+        // looking in range.
+        const available = contents.shadow_view_projections.len;
+        if (light.shadow_layer >= available or layers > available - light.shadow_layer)
+            return error.ShadowLayerOutOfRange;
+    }
+}
+
+// Current and previous poses share one descriptor range. The previous pose
+// starts at the live count, not at capacity, matching the camera's offset.
+pub fn writeJointPoses(storage: []Joint, current: []const Joint, previous: []const Joint) void {
+    std.debug.assert(current.len == previous.len);
+    std.debug.assert(current.len <= storage.len / 2);
+    @memcpy(storage[0..current.len], current);
+    @memcpy(storage[current.len..][0..previous.len], previous);
 }
 
 pub const FrameSet = struct {
@@ -231,7 +270,7 @@ pub const FrameSet = struct {
             context,
             memory_allocator,
             frames,
-            sizes.joints,
+            std.math.mul(usize, sizes.joints, 2) catch return error.SizeOverflow,
             usageFor(entryFor(.joints).binding.kind),
         );
         errdefer joints.deinit();
@@ -298,7 +337,7 @@ pub const FrameSet = struct {
     // this, so the bound the planner packs into and the bound `validate` tests
     // are the same number rather than two copies of it.
     pub fn capacity(self: *const FrameSet) Capacity {
-        return .{ .instances = self.instances.count, .joints = self.joints.count };
+        return .{ .instances = self.instances.count, .joints = self.joints.count / 2 };
     }
 
     // What one frame reads. Grouped rather than passed as three parameters
@@ -312,12 +351,25 @@ pub const FrameSet = struct {
         // Every drawn skeleton's matrices, already packed into one run per
         // instance. The bases in `models` index this.
         joints: []const Joint,
+        previous_joints: []const Joint = &.{},
         lights: []const uniforms.Light,
 
         // Defaulted to the off state, which is what a frame that casts no sun
         // shadow carries: it is a supported configuration and not an omission,
         // so it does not have to be written out at every call site that means it.
         sun_shadow: uniforms.SunShadow = .off,
+
+        // The local shadows, off by the same reasoning: the settings default
+        // to a strength of zero, and with no matrices no light may name a
+        // layer.
+        local_shadow: uniforms.LocalShadow = .{},
+        shadow_view_projections: []const uniforms.Mat4 = &.{},
+
+        // None by default, for the same reason.
+        ambient: uniforms.Ambient = .{},
+        // No field by default: the main pass lights from the ambient alone.
+        probe_grid: uniforms.ProbeGrid = .none,
+        debug: uniforms.Debug = .{},
     };
 
     // Fill one frame's slot. The caller has waited on that slot's fence; see
@@ -327,8 +379,12 @@ pub const FrameSet = struct {
 
         self.camera.slice(frame)[0] = contents.camera.block;
         @memcpy(self.instances.slice(frame)[0..contents.models.len], contents.models);
-        @memcpy(self.joints.slice(frame)[0..contents.joints.len], contents.joints);
+        writeJointPoses(self.joints.slice(frame), contents.joints, contents.previous_joints);
         self.lights.slice(frame)[0].fill(contents.lights);
+        self.lights.slice(frame)[0].fillShadows(contents.local_shadow, contents.shadow_view_projections);
+        self.lights.slice(frame)[0].ambient = contents.ambient;
+        self.lights.slice(frame)[0].probe_grid = contents.probe_grid;
+        self.lights.slice(frame)[0].debug = contents.debug;
         self.sun_shadow.slice(frame)[0] = contents.sun_shadow;
     }
 

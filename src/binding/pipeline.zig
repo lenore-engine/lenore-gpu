@@ -82,11 +82,18 @@ pub fn modeFor(alpha: AlphaMode) Mode {
 
 // Dynamic rendering takes the attachment formats at creation instead of a
 // render pass object.
+// The most colour attachments a pipeline here declares. Vulkan specification,
+// table "Required Limits": maxColorAttachments is at least 4 in core Vulkan.
+const max_colour_attachments = 4;
+
 pub const Formats = struct {
     // Null for a pass that writes no colour. The shadow bake is one: the depth
     // the rasterizer writes is its whole output, and declaring an attachment
     // nothing writes would demand a fragment shader to write it.
     colour: ?vk.Format = null,
+    // How many colour attachments of that format, all written alike: the
+    // temporal resolve writes its picture and its history in one draw.
+    colour_count: u32 = 1,
     // Null for a pass that declares no depth attachment. The post pass is one:
     // it covers the screen with a triangle and has nothing to occlude.
     depth: ?vk.Format = null,
@@ -475,7 +482,10 @@ pub fn create(context: *const Context, config: Config) CreateError!vk.Pipeline {
     };
 
     const depth_stencil = depthStencilState(config.mode);
-    const blend_attachment = blendAttachment(config.mode);
+    std.debug.assert(config.formats.colour_count >= 1 and config.formats.colour_count <= max_colour_attachments);
+    const colour_count: u32 = if (config.formats.colour == null) 0 else config.formats.colour_count;
+    const blend_attachments: [max_colour_attachments]vk.PipelineColorBlendAttachmentState =
+        @splat(blendAttachment(config.mode));
 
     // A pipeline with no colour attachment has nothing to blend, and the state
     // is still handed over with a count of zero rather than left out: a valid
@@ -485,8 +495,8 @@ pub fn create(context: *const Context, config: Config) CreateError!vk.Pipeline {
     const blend_state = vk.PipelineColorBlendStateCreateInfo{
         .logic_op_enable = .false,
         .logic_op = .copy,
-        .attachment_count = if (config.formats.colour == null) 0 else 1,
-        .p_attachments = @ptrCast(&blend_attachment),
+        .attachment_count = colour_count,
+        .p_attachments = &blend_attachments,
         .blend_constants = .{ 0, 0, 0, 0 },
     };
 
@@ -498,11 +508,11 @@ pub fn create(context: *const Context, config: Config) CreateError!vk.Pipeline {
 
     // Named rather than passed inline: the structure holds a pointer to it and
     // it has to outlive the call below.
-    const colour_format = config.formats.colour orelse .undefined;
+    const colour_formats: [max_colour_attachments]vk.Format = @splat(config.formats.colour orelse .undefined);
     const rendering = vk.PipelineRenderingCreateInfo{
         .view_mask = 0,
-        .color_attachment_count = if (config.formats.colour == null) 0 else 1,
-        .p_color_attachment_formats = @ptrCast(&colour_format),
+        .color_attachment_count = colour_count,
+        .p_color_attachment_formats = &colour_formats,
         .depth_attachment_format = config.formats.depth orelse .undefined,
         .stencil_attachment_format = .undefined,
     };

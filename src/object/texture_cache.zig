@@ -461,7 +461,7 @@ pub const TextureCache = struct {
     ) AcquireError!?Bound {
         const existing = self.images.acquire(key) orelse return null;
         if (existing.format != expected.format or
-            existing.shape != expected.shape or
+            !std.meta.eql(existing.shape, expected.shape) or
             existing.width != expected.width or
             existing.height != expected.height or
             existing.mip_levels != expected.mip_levels)

@@ -110,6 +110,8 @@ const DeviceExtensions = struct {
 const FeatureSupport = struct {
     pipeline_statistics: bool,
     ray_query: bool,
+    storage_image_without_format: bool,
+    float16_int16: bool,
 };
 
 const DeviceCandidate = struct {
@@ -120,6 +122,8 @@ const DeviceCandidate = struct {
     // Of the graphics family, which is the only one anything is recorded on.
     timestamp_valid_bits: u32,
     pipeline_statistics: bool,
+    storage_image_without_format: bool,
+    float16_int16: bool,
     max_buffer_size: vk.DeviceSize,
 };
 
@@ -155,6 +159,16 @@ pub const Context = struct {
     // which is what `pipeline.Config.capture_statistics` asks for, so this
     // says the query exists and not that any pipeline carries an answer.
     shader_statistics_enabled: bool,
+    // Whether a shader may read and write a storage image declared without a
+    // format. Optional because nothing in this module declares one; a consumer
+    // compiling shaders that do (HLSL's `RWTexture2D<float4>` reaches SPIR-V as
+    // `Unknown`) checks it before creating a pipeline.
+    storage_image_without_format_enabled: bool,
+    // Whether shaders may compute in 16-bit floats and integers, subgroup
+    // operations included (`shaderFloat16`, `shaderInt16`,
+    // `shaderSubgroupExtendedTypes`). Optional and unused here; a consumer
+    // with 16-bit shader variants picks them by this.
+    float16_int16_enabled: bool,
     // What a timestamp written on the graphics queue is worth, as the device
     // reports it. Zero is a queue that cannot carry one.
     timestamp_valid_bits: u32,
@@ -276,6 +290,8 @@ pub const Context = struct {
             .memory_budget_enabled = candidate.extensions.memory_budget,
             .ray_query_enabled = candidate.extensions.ray_query,
             .shader_statistics_enabled = candidate.extensions.shader_statistics,
+            .storage_image_without_format_enabled = candidate.storage_image_without_format,
+            .float16_int16_enabled = candidate.float16_int16,
             .timestamp_valid_bits = candidate.timestamp_valid_bits,
         };
     }
@@ -336,6 +352,7 @@ fn appendSurfaceExtensions(
     try names.append(allocator, vk.extensions.khr_surface.name);
     switch (display) {
         .wayland => try names.append(allocator, vk.extensions.khr_wayland_surface.name),
+        .win32 => try names.append(allocator, vk.extensions.khr_win_32_surface.name),
     }
 }
 
@@ -396,6 +413,8 @@ fn inspectDevice(
         .timestamp_valid_bits = queues.timestamp_valid_bits,
         .extensions = extensions,
         .pipeline_statistics = feature_support.pipeline_statistics,
+        .storage_image_without_format = feature_support.storage_image_without_format,
+        .float16_int16 = feature_support.float16_int16,
         .max_buffer_size = queryMaxBufferSize(instance, physical_device),
     };
 }
@@ -460,6 +479,13 @@ fn supportsPresentation(
             physical_device,
             family,
             @ptrCast(wayland.display),
+        ) == .true,
+        // The same question asked of the Windows desktop, which has no
+        // connection object to pass: the command is the device and the family
+        // and nothing else (vk.xml, registry 1.4.350).
+        .win32 => instance.getPhysicalDeviceWin32PresentationSupportKHR(
+            physical_device,
+            family,
         ) == .true,
     };
 }
@@ -567,6 +593,16 @@ fn supportsRequiredFeatures(
     }
     return .{
         .pipeline_statistics = core.pipeline_statistics_query == .true,
+        // Both or neither: a shader that writes such an image reads it too.
+        .storage_image_without_format = core.shader_storage_image_read_without_format == .true and
+            core.shader_storage_image_write_without_format == .true,
+        // All three or none: the 16-bit shaders that want any (FidelityFX's,
+        // in `lenore-fsr`) declare Int16 beside Float16, and their pyramid
+        // passes run quad operations on 16-bit vectors, which is what
+        // `shaderSubgroupExtendedTypes` admits (Vulkan specification,
+        // VUID-RuntimeSpirv-None-06275, reported by the validation layer).
+        .float16_int16 = vulkan_12.shader_float_16 == .true and core.shader_int_16 == .true and
+            vulkan_12.shader_subgroup_extended_types == .true,
         .ray_query = ray_query_extensions and
             vulkan_12.buffer_device_address == .true and
             acceleration_structure.acceleration_structure == .true and
@@ -628,6 +664,8 @@ fn createDevice(instance: Instance, candidate: DeviceCandidate) InstanceWrapper.
     var vulkan_12 = vk.PhysicalDeviceVulkan12Features{
         .p_next = @ptrCast(&vulkan_13),
         .buffer_device_address = if (candidate.extensions.ray_query) .true else .false,
+        .shader_float_16 = if (candidate.float16_int16) .true else .false,
+        .shader_subgroup_extended_types = if (candidate.float16_int16) .true else .false,
     };
     var vulkan_11 = vk.PhysicalDeviceVulkan11Features{
         .p_next = @ptrCast(&vulkan_12),
@@ -643,6 +681,9 @@ fn createDevice(instance: Instance, candidate: DeviceCandidate) InstanceWrapper.
             .dual_src_blend = .true,
             .multi_draw_indirect = .true,
             .pipeline_statistics_query = if (candidate.pipeline_statistics) .true else .false,
+            .shader_storage_image_read_without_format = if (candidate.storage_image_without_format) .true else .false,
+            .shader_storage_image_write_without_format = if (candidate.storage_image_without_format) .true else .false,
+            .shader_int_16 = if (candidate.float16_int16) .true else .false,
         },
     };
     var extension_names = [_][*:0]const u8{

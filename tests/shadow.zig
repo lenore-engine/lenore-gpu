@@ -113,13 +113,13 @@ test "the main pass sees two modes where the bake sees three" {
 test "the bake is ordered after the previous frame's sampling and before the next" {
     const handle: vk.Image = .null_handle;
 
-    const opening = shadow.beginBarriers(handle)[0];
+    const opening = shadow.beginBarriers(handle, 1)[0];
     try testing.expect(opening.src_stage_mask.fragment_shader_bit);
     try testing.expect(opening.src_access_mask.shader_read_bit);
     try testing.expect(opening.dst_access_mask.depth_stencil_attachment_write_bit);
     try testing.expectEqual(vk.ImageLayout.depth_attachment_optimal, opening.new_layout);
 
-    const closing = shadow.endBarriers(handle)[0];
+    const closing = shadow.endBarriers(handle, 1)[0];
     try testing.expect(closing.src_access_mask.depth_stencil_attachment_write_bit);
     try testing.expect(closing.dst_stage_mask.fragment_shader_bit);
     try testing.expect(closing.dst_access_mask.shader_read_bit);
@@ -146,4 +146,34 @@ test "the map is cleared to the far plane and kept" {
     // the whole scene as shadowed, which is the same picture as a bake that
     // failed and is why this is worth pinning.
     try testing.expectEqual(@as(f32, 1), info.clear_value.depth_stencil.depth);
+}
+
+// The local bake opens and closes the whole array with one barrier each, so the
+// range has to reach every layer. One short and the last light's layer would be
+// sampled in the layout the bake left it in.
+test "the local array's barriers cover every layer" {
+    const handle: vk.Image = .null_handle;
+    for ([_]u32{ 1, 6, 24 }) |layers| {
+        for ([_]vk.ImageMemoryBarrier2{ shadow.beginBarriers(handle, layers)[0], shadow.endBarriers(handle, layers)[0] }) |barrier| {
+            try testing.expectEqual(@as(u32, 0), barrier.subresource_range.base_array_layer);
+            try testing.expectEqual(layers, barrier.subresource_range.layer_count);
+        }
+    }
+}
+
+// The matrix the vertex stage reads and the mask the fragment stage reads are
+// pushed separately, at these offsets, and both through one range that names
+// both stages; vkCmdPushConstants refuses stage flags that differ from those of
+// a range the update overlaps.
+test "the bake's push block is the matrix then the mask, under one range for both stages" {
+    try testing.expectEqual(@as(u32, 0), shadow.view_offset);
+    try testing.expectEqual(@as(u32, 64), shadow.mask_offset);
+    try testing.expectEqual(@as(usize, 80), @sizeOf(shadow.PushConstants));
+
+    const range = shadow.push_constant_range;
+    try testing.expectEqual(@as(u32, 0), range.offset);
+    try testing.expectEqual(@as(u32, @sizeOf(shadow.PushConstants)), range.size);
+    try testing.expect(range.stage_flags.vertex_bit and range.stage_flags.fragment_bit);
+    // Vulkan specification, Limits: maxPushConstantsSize is at least 128.
+    try testing.expect(range.size <= 128);
 }

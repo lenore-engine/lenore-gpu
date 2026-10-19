@@ -66,6 +66,26 @@ pub const Camera = extern struct {
     ray_right: [4]f32 align(16),
     ray_up: [4]f32 align(16),
     ray_front: [4]f32 align(16),
+
+    // Last frame's `view_projection`, which the depth prepass projects each
+    // vertex's last position through to write how far it moved on screen. The
+    // engine passes the current matrix again where there is no last frame to
+    // move from: the first one, and the first after a resize.
+    previous_view_projection: Mat4 align(16),
+
+    // x is where last frame's joint matrices begin in the joint array: the
+    // engine packs the previous pose after the current one, in the same
+    // layout, so a skinned vertex finds both by the same base. The other lanes
+    // are the alignment's padding.
+    motion: [4]u32 align(16) = .{ 0, 0, 0, 0 },
+
+    // xy is the sub-pixel offset `view_projection` was moved by this frame, in
+    // the framebuffer's device coordinates (`jitterClip`); zero when the frame
+    // is not jittered. A reader that wants where a point really is, rather than
+    // where this frame's samples put it, takes it back out: the prepass's
+    // motion, and the occlusion pass's reconstruction. `previous_view_projection`
+    // is never jittered. The other lanes are the alignment's padding.
+    jitter: [4]f32 align(16) = .{ 0, 0, 0, 0 },
 };
 
 // How many lights one frame's block holds.
@@ -79,6 +99,18 @@ pub const Camera = extern struct {
 // What moves it is a scene that overflows it, which the count check in
 // `FrameSet.update` reports rather than truncates.
 pub const max_lights = 16;
+
+// How many local shadow layers one frame's block holds matrices for: a spot
+// takes one, a point light six.
+//
+// DECIDE: provisional. Twenty-four is four shadowed point lights, or any mix
+// down to twenty-four spots, and keeps the matrices at 1536 bytes of a block
+// still far under the 16384 every implementation offers (vk.xml,
+// maxUniformBufferRange). Closed by what Reclaim's base needs lit at once.
+pub const max_shadow_layers = 24;
+
+// The value of `Light.shadow_layer` for a light that casts no shadow.
+pub const no_shadow_layer: u32 = std.math.maxInt(u32);
 
 // One element of the light block below.
 //
@@ -119,10 +151,18 @@ pub const Light = extern struct {
     cos_inner: f32,
     cos_outer: f32,
 
-    // Reaching the sixteen-byte multiple an array of these is strided by. Named
-    // rather than left to the compiler so the shader's own padding field has
-    // something to match.
-    padding: [2]f32 = .{ 0, 0 },
+    // The light's first layer in the local shadow array, or `no_shadow_layer`.
+    // A spot reads that layer; a point light reads it and the five after it,
+    // in the face order of `LocalShadowFit` in lenore-scene. Every other kind
+    // carries `no_shadow_layer`, and `frame_set.validate` refuses one that
+    // does not, or a run that ends past the frame's matrices.
+    shadow_layer: u32 = no_shadow_layer,
+
+    // `LocalShadowFit.texel_slope`: world units across one texel at unit
+    // distance from the light, which the lookup scales by the fragment's
+    // distance to turn the authored normal offset into a world one. Zero for a
+    // light with no layer.
+    shadow_texel_slope: f32 = 0,
 
     // The rectangle, for `rect`, and zero for every other kind.
     //
@@ -218,17 +258,103 @@ pub const Light = extern struct {
     }
 };
 
+// How the local shadows are read, for every light that has layers. One pair
+// for the scene rather than lanes on each light, like the sun's: they are look
+// controls, and nothing about one lamp makes its shadow want a different one.
+pub const LocalShadow = extern struct {
+    // What a shadowed surface loses of a local light's direct term, in [0, 1].
+    // Zero switches the lookup off for every light, as the sun's strength does.
+    strength: f32 = 0,
+
+    // How far the lookup point is pushed off the surface along its normal, in
+    // texels of the light's layer at the fragment's distance.
+    normal_offset_texels: f32 = 1,
+
+    // The radius of every local light's emitting surface, in world units. A
+    // shadow's edge softens with it, more the farther the surface it falls
+    // on is behind the caster. Zero is a point and the hardest edge the map
+    // can give. One value for every light: `Light` has no lane to spare.
+    source_radius: f32 = 0,
+
+    // The near plane of every layer, `LocalShadowFit`'s, which the lookup
+    // needs to turn a stored depth into a distance. The engine writes it; a
+    // caller's value is replaced.
+    near: f32 = 0,
+};
+
+// Light from everywhere at once: a sky radiance from above and a ground
+// radiance from below, blended by direction. What a scene with no prefiltered
+// environment has instead of one, and what an interior adds to the one it has.
+// Linear, and in the same units as the environment's maps; zero is none, the
+// default, so a scene that sets nothing renders as before.
+pub const Ambient = extern struct {
+    sky: [3]f32 align(16) = .{ 0, 0, 0 },
+    padding_0: f32 = 0,
+    ground: [3]f32 = .{ 0, 0, 0 },
+    padding_1: f32 = 0,
+};
+
+// Where the indirect-light probes stand: probe (0, 0, 0) at `origin`, the
+// rest `spacing` apart, `counts` per axis, X fastest. Mirrors
+// `ProbeGridParams` in include/probe_field.slang, which the main pass and the
+// probe update both read. `enabled` zero is no field.
+pub const ProbeGrid = extern struct {
+    origin: [3]f32 align(16),
+    spacing: f32,
+    counts: [3]u32,
+    enabled: u32,
+
+    pub const none: ProbeGrid = .{ .origin = .{ 0, 0, 0 }, .spacing = 1, .counts = .{ 0, 0, 0 }, .enabled = 0 };
+
+    pub fn probeCount(self: ProbeGrid) u32 {
+        return self.counts[0] * self.counts[1] * self.counts[2];
+    }
+};
+
+// What the main pass writes instead of the shaded surface, for looking at one
+// term of it alone. Linear radiance or irradiance over pi in every view, so the
+// post pass exposes and tone maps it as it does the frame.
+pub const DebugView = enum(u32) {
+    shaded = 0,
+    // The ambient's diffuse half before the albedo: the probe field where
+    // there is one, the hemisphere where there is not. Without occlusion.
+    indirect = 1,
+    // The light loop alone, every light with its shadow.
+    direct = 2,
+    // The occlusion multiplying the indirect term, authored and screen-space,
+    // as a grey.
+    occlusion = 3,
+    motion = 4,
+};
+
+pub const Debug = extern struct {
+    view: DebugView align(16) = .shaded,
+    padding: [3]u32 = .{ 0, 0, 0 },
+};
+
 // The light block, read by every shaded fragment.
 //
 // A fixed array rather than a storage buffer sized to the scene. The block is
 // read by every fragment, so it wants the constant path; the array's length is
 // what the shader's loop is bounded by, and `count` is how much of it holds a
 // light. The lanes past `count` are not written, so nothing may read them.
+//
+// The local shadow matrices are here rather than in a block of their own
+// because only the fragment stage reads them, beside the lights that index
+// them. The bake does not: it rasterizes through the matrix pushed for each
+// layer.
 pub const Lights = extern struct {
     // x is how many entries of `lights` are live. The other three lanes are the
     // alignment the array needs either way.
     count: [4]u32 align(16),
     lights: [max_lights]Light,
+    local_shadow: LocalShadow,
+    // World space to each layer's clip space, from `LocalShadowFit`. Written
+    // up to the highest layer a light names; the rest are not read.
+    shadow_view_projection: [max_shadow_layers]Mat4,
+    ambient: Ambient,
+    probe_grid: ProbeGrid,
+    debug: Debug,
 
     // Write a frame's lights into the block.
     //
@@ -242,6 +368,13 @@ pub const Lights = extern struct {
     pub fn fill(self: *Lights, lights: []const Light) void {
         self.count = .{ @intCast(lights.len), 0, 0, 0 };
         @memcpy(self.lights[0..lights.len], lights);
+    }
+
+    // Write the frame's local shadow settings and layer matrices. Total for the
+    // same reason as `fill`: `frame_set.validate` bounds the count first.
+    pub fn fillShadows(self: *Lights, settings: LocalShadow, matrices: []const Mat4) void {
+        self.local_shadow = settings;
+        @memcpy(self.shadow_view_projection[0..matrices.len], matrices);
     }
 };
 
@@ -313,6 +446,19 @@ pub fn vulkanClip(view_projection: anytype) @TypeOf(view_projection) {
     return flipped;
 }
 
+// Moves a framebuffer clip-space projection by `offset` in device coordinates:
+// every point's device x and y shift by exactly that, whatever its depth,
+// because the shift is added as a multiple of clip w before the divide. Row
+// vectors, so column k of the result is column k plus offset[k] times column 3.
+pub fn jitterClip(view_projection: anytype, offset: [2]f32) @TypeOf(view_projection) {
+    var moved = view_projection;
+    inline for (0..4) |row| {
+        moved[row][0] += offset[0] * view_projection[row][3];
+        moved[row][1] += offset[1] * view_projection[row][3];
+    }
+    return moved;
+}
+
 // A camera block in the coordinates the framebuffer counts in, which is the
 // only kind a frame may be filled with.
 //
@@ -339,6 +485,7 @@ pub const FramebufferCamera = struct {
 pub fn vulkanClipCamera(camera: Camera) FramebufferCamera {
     var flipped = camera;
     flipped.view_projection = vulkanClip(camera.view_projection);
+    flipped.previous_view_projection = vulkanClip(camera.previous_view_projection);
     inline for (0..3) |axis| flipped.ray_up[axis] = -camera.ray_up[axis];
     return .{ .block = flipped };
 }

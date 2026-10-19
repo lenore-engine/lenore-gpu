@@ -7,8 +7,9 @@ const memory = @import("../memory/allocator.zig");
 // Every image here is single-sampled, optimal-tiling and two-dimensional. That
 // is what the resource path uses and what the allocator's image pool is
 // granularity-separated for, and it is also the shape of a render target.
-// Multisampled attachments and array textures are not this type; a cube map is,
-// because its six layers are addressed as one image by one view.
+// Multisampled attachments are not this type. A cube map and a 2D array are,
+// because their layers are addressed as one image by one view; an array is
+// also rendered into one layer at a time, through `createLayerView`.
 const base_array_layer: u32 = 0;
 const base_mip_level: u32 = 0;
 const single_depth: u32 = 1;
@@ -23,14 +24,22 @@ const cube_layers: u32 = 6;
 // How many layers the image holds and how its view addresses them. It is a
 // separate axis from `Kind`, which decides the aspect: the two do not
 // constrain each other.
-pub const Shape = enum {
+//
+// A union so that the layer count of an array travels with the shape that
+// gives it a meaning. A separate count field would be a number every other
+// shape has to ignore.
+pub const Shape = union(enum) {
     texture_2d,
     cube,
+    // Independent layers of one extent and format, sampled as one array.
+    // `init` refuses zero and anything past the device's array layer limit.
+    array_2d: u32,
 
     pub fn layerCount(self: Shape) u32 {
         return switch (self) {
             .texture_2d => 1,
             .cube => cube_layers,
+            .array_2d => |count| count,
         };
     }
 
@@ -39,7 +48,7 @@ pub const Shape = enum {
     // afterwards.
     pub fn createFlags(self: Shape) vk.ImageCreateFlags {
         return switch (self) {
-            .texture_2d => .{},
+            .texture_2d, .array_2d => .{},
             .cube => .{ .cube_compatible_bit = true },
         };
     }
@@ -48,6 +57,7 @@ pub const Shape = enum {
         return switch (self) {
             .texture_2d => .@"2d",
             .cube => .cube,
+            .array_2d => .@"2d_array",
         };
     }
 };
@@ -83,6 +93,7 @@ const supported_usage = vk.ImageUsageFlags{
     .transfer_src_bit = true,
     .transfer_dst_bit = true,
     .sampled_bit = true,
+    .storage_bit = true,
     .color_attachment_bit = true,
     .depth_stencil_attachment_bit = true,
 };
@@ -92,6 +103,7 @@ pub const InitError = error{
     EmptyUsage,
     ExtentLimitExceeded,
     InvalidExtent,
+    InvalidLayerCount,
     InvalidMipLevels,
     UnsupportedFormatUsage,
     UnsupportedUsage,
@@ -110,6 +122,10 @@ pub const CopyError = error{
 
 pub const MipViewError = error{
     MipLevelOutOfRange,
+} || vk.DeviceWrapper.CreateImageViewError;
+
+pub const LayerViewError = error{
+    LayerOutOfRange,
 } || vk.DeviceWrapper.CreateImageViewError;
 
 pub const Config = struct {
@@ -263,13 +279,20 @@ pub const Image = struct {
         // rather than by maxImageDimension2D. The two limits are reported
         // separately and a device may set them differently.
         const limit = switch (config.shape) {
-            .texture_2d => context.properties.limits.max_image_dimension_2d,
+            .texture_2d, .array_2d => context.properties.limits.max_image_dimension_2d,
             .cube => context.properties.limits.max_image_dimension_cube,
         };
         if (config.width > limit or config.height > limit)
             return error.ExtentLimitExceeded;
         if (config.shape == .cube and config.width != config.height)
             return error.InvalidExtent;
+        // Vulkan specification, VkImageCreateInfo: arrayLayers must be greater
+        // than zero and not above maxImageArrayLayers.
+        if (config.shape == .array_2d) {
+            const layers = config.shape.layerCount();
+            if (layers == 0 or layers > context.properties.limits.max_image_array_layers)
+                return error.InvalidLayerCount;
+        }
 
         // Vulkan specification, VkImageCreateInfo: mipLevels must be at least
         // one and must not exceed the number of levels the extent can halve
@@ -371,6 +394,28 @@ pub const Image = struct {
                 .level_count = 1,
                 .base_array_layer = base_array_layer,
                 .layer_count = self.shape.layerCount(),
+            },
+        }, null);
+    }
+
+    // A view of one layer at the first level, for a pass that renders into the
+    // layers of an array one at a time: a depth attachment names one layer
+    // when the rendering's layer count is one, and `view` above spans them
+    // all. The caller owns the result, as with `createMipView`.
+    pub fn createLayerView(self: *const Image, layer: u32) LayerViewError!vk.ImageView {
+        if (layer >= self.shape.layerCount()) return error.LayerOutOfRange;
+
+        return self.context.device.createImageView(&.{
+            .image = self.handle,
+            .view_type = .@"2d",
+            .format = self.format,
+            .components = identity_components,
+            .subresource_range = .{
+                .aspect_mask = self.kind.aspect(),
+                .base_mip_level = base_mip_level,
+                .level_count = 1,
+                .base_array_layer = layer,
+                .layer_count = single_layer,
             },
         }, null);
     }
@@ -507,6 +552,7 @@ pub fn formatSupports(usage: vk.ImageUsageFlags, features: vk.FormatFeatureFlags
     if (usage.transfer_src_bit and !features.transfer_src_bit) return false;
     if (usage.transfer_dst_bit and !features.transfer_dst_bit) return false;
     if (usage.sampled_bit and !features.sampled_image_bit) return false;
+    if (usage.storage_bit and !features.storage_image_bit) return false;
     if (usage.color_attachment_bit and !features.color_attachment_bit) return false;
     if (usage.depth_stencil_attachment_bit and !features.depth_stencil_attachment_bit) return false;
     return true;

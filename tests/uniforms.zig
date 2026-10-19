@@ -86,6 +86,8 @@ test "the light record is laid out as the shader's array steps through it" {
     try testing.expectEqual(@as(usize, 28), @offsetOf(gpu.LightUniform, "intensity"));
     try testing.expectEqual(@as(usize, 44), @offsetOf(gpu.LightUniform, "range"));
     try testing.expectEqual(@as(usize, 64), @offsetOf(gpu.LightUniform, "half_edge"));
+    try testing.expectEqual(@as(usize, 56), @offsetOf(gpu.LightUniform, "shadow_layer"));
+    try testing.expectEqual(@as(usize, 60), @offsetOf(gpu.LightUniform, "shadow_texel_slope"));
     try testing.expectEqual(@as(usize, 76), @offsetOf(gpu.LightUniform, "half_extent"));
 }
 
@@ -94,10 +96,22 @@ test "the lights block begins its array where the shader's does" {
     // case a hand-written mirror gets wrong, and the array then reads one
     // light's worth of the previous one's tail.
     try testing.expectEqual(@as(usize, 16), @offsetOf(gpu.LightsUniform, "lights"));
-    try testing.expectEqual(
-        @as(usize, 16 + gpu.max_lights * 80),
-        @sizeOf(gpu.LightsUniform),
-    );
+    const shadow_settings = 16 + gpu.max_lights * 80;
+    try testing.expectEqual(shadow_settings, @offsetOf(gpu.LightsUniform, "local_shadow"));
+    try testing.expectEqual(shadow_settings + 16, @offsetOf(gpu.LightsUniform, "shadow_view_projection"));
+    const ambient = shadow_settings + 16 + gpu.max_shadow_layers * 64;
+    try testing.expectEqual(ambient, @offsetOf(gpu.LightsUniform, "ambient"));
+    try testing.expectEqual(ambient + 32, @offsetOf(gpu.LightsUniform, "probe_grid"));
+    try testing.expectEqual(ambient + 64, @offsetOf(gpu.LightsUniform, "debug"));
+    try testing.expectEqual(@as(usize, ambient + 80), @sizeOf(gpu.LightsUniform));
+    // Vulkan specification, Limits: maxUniformBufferRange is at least 16384.
+    try testing.expect(@sizeOf(gpu.LightsUniform) <= 16384);
+}
+
+test "a light casts no local shadow unless it is given a layer" {
+    const lamp = gpu.LightUniform.point(.{ 1, 1, 1 }, 5, .{ 1, 2, 3 }, 8);
+    try testing.expectEqual(gpu.no_shadow_layer, lamp.shadow_layer);
+    try testing.expectEqual(@as(f32, 0), lamp.shadow_texel_slope);
 }
 
 test "filling the block states how much of it is live and leaves the rest alone" {
@@ -194,6 +208,7 @@ test "the camera flip turns the ray basis over with the matrix" {
         .ray_right = .{ 0.5, 0, 0, 0 },
         .ray_up = .{ 0, 0.3, 0, 0 },
         .ray_front = .{ 0, 0, -1, 0 },
+        .previous_view_projection = gpu.mat4(zm.perspectiveFovRh(std.math.pi / 3.0, 1.7778, 0.1, 100)),
     };
     const flipped = gpu.vulkanClipCamera(camera);
 
@@ -208,6 +223,18 @@ test "the camera flip turns the ray basis over with the matrix" {
     }
 
     inline for (0..3) |axis| try testing.expectEqual(-camera.ray_up[axis], flipped.block.ray_up[axis]);
+
+    // Last frame's matrix lives in the same device coordinates as this
+    // frame's, or the motion between them carries the flip itself.
+    inline for (0..4) |row| {
+        inline for (0..4) |column| {
+            const expected = if (column == 1)
+                -camera.previous_view_projection[row][column]
+            else
+                camera.previous_view_projection[row][column];
+            try testing.expectEqual(expected, flipped.block.previous_view_projection[row][column]);
+        }
+    }
 
     // Nothing else is touched. Device x runs the same way on both sides, and
     // the centre ray is on neither axis the flip names.
@@ -229,6 +256,7 @@ test "the ray a device coordinate names survives the flip" {
         .ray_right = .{ half_height, 0, 0, 0 },
         .ray_up = .{ 0, half_height, 0, 0 },
         .ray_front = .{ 0, 0, -1, 0 },
+        .previous_view_projection = gpu.mat4(zm.identity()),
     };
     const flipped = gpu.vulkanClipCamera(camera);
 
@@ -244,4 +272,21 @@ test "the ray a device coordinate names survives the flip" {
     const clip = zm.mul(point, zm.Mat{ vp[0], vp[1], vp[2], vp[3] });
     try testing.expectApproxEqAbs(device[0], clip[0] / clip[3], 1e-5);
     try testing.expectApproxEqAbs(device[1], clip[1] / clip[3], 1e-5);
+}
+
+// The property the temporal pass relies on: every point, near or far, lands
+// exactly the offset away in device coordinates, so a sample pattern means the
+// same thing across the whole depth range.
+test "a jittered projection moves every point by the offset in device coordinates" {
+    const projection = gpu.mat4(zm.perspectiveFovRh(std.math.pi / 3.0, 1.6, 0.1, 100));
+    const offset: [2]f32 = .{ 0.0013, -0.0021 };
+    const moved = gpu.jitterClip(projection, offset);
+    for ([_]f32{ -0.2, -3, -40 }) |depth| {
+        const point = zm.f32x4(0.3, -0.1, depth, 1);
+        const before = zm.mul(point, zm.Mat{ projection[0], projection[1], projection[2], projection[3] });
+        const after = zm.mul(point, zm.Mat{ moved[0], moved[1], moved[2], moved[3] });
+        try testing.expectApproxEqAbs(before[0] / before[3] + offset[0], after[0] / after[3], 1e-6);
+        try testing.expectApproxEqAbs(before[1] / before[3] + offset[1], after[1] / after[3], 1e-6);
+        try testing.expectApproxEqAbs(before[2] / before[3], after[2] / after[3], 1e-6);
+    }
 }

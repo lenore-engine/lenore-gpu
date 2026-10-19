@@ -8,52 +8,86 @@ const memory = @import("../memory/allocator.zig");
 const pass = @import("scene.zig");
 const pipeline = @import("../binding/pipeline.zig");
 const res = @import("lenore-resources");
+const uniforms = @import("../binding/uniforms.zig");
 
 const Allocator = std.mem.Allocator;
 const AlphaMode = res.MaterialInfo.Rendering.AlphaMode;
 
-// The sun shadow map: one depth image the casters are rasterized into through
-// the fit's orthographic matrix, and the comparison sampler the main pass reads
-// it back through.
+// The shadow maps: the sun's, one depth image the casters are rasterized into
+// through the fit's orthographic matrix; the local lights', one 2D array of
+// depth layers rasterized a layer at a time through each layer's perspective
+// matrix; and the comparison sampler the main pass reads both back through.
 //
-// What is here and what is not. This owns the image, the sampler, the descriptor
-// set the main pass reads it from, and the four pipelines a caster is drawn
-// with. It does not own the loop that walks the casters: that reads the same
+// What is here and what is not. This owns the two images, the per-layer views
+// the local bake renders into, the sampler, the descriptor set the main pass
+// reads them from, and the four pipelines a caster is drawn with, which serve
+// both maps: the matrix is pushed per bake rather than built into a pipeline. It does not own the loop that walks the casters: that reads the same
 // batch list the main pass draws from, and splitting the two loops across two
 // files would put one list's ordering rules in two places. The relationship is
 // `scene.zig`'s to `renderer.zig` and not `morph.zig`'s, which has a registration
 // list of its own to walk.
 //
-// The map is a whole scene's, not a frame's. One image serves every frame in
-// flight, so a bake is ordered against the previous frame's sampling by the
-// barriers below, exactly as the main pass orders its shared attachments.
+// The maps are a whole scene's, not a frame's. One image of each serves every
+// frame in flight, so a bake is ordered against the previous frame's sampling
+// by the barriers below, exactly as the main pass orders its shared
+// attachments.
 
-// The map's own descriptor set, which is set 3 and not part of the scene set.
+// The maps' own descriptor set, which is set 3 and not part of the scene set.
 //
 // The reason is the bake. Its pipeline layout has to name sets 0 to 2 to reach
 // the frame rings and the caster's base colour, so any set in that range is
-// bound while the map is being written into. Keeping the map out of them means
-// the image is never both an attachment and a bound descriptor, rather than
+// bound while a map is being written into. Keeping the maps out of them means
+// an image is never both an attachment and a bound descriptor, rather than
 // relying on a shader not to declare what it must not read.
 pub const bindings = [_]descriptors.Binding{
     .{ .slot = 0, .name = "sun_map", .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
+    .{ .slot = 1, .name = "local_maps", .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
+    // The same array through a sampler that returns depths rather than test
+    // results, for the soft shadow's search for what stands between a point
+    // and the light: a comparison sampler can say whether something does, not
+    // how far away it is.
+    .{ .slot = 2, .name = "local_depths", .kind = .combined_image_sampler, .stages = .{ .fragment_bit = true } },
 };
 
 pub const Sets = descriptors.Sets(&bindings);
 
-// What a masked caster needs to run the cutoff test. The bake's shader is
-// created against this block and the record path fills it.
+// What a masked caster needs to run the cutoff test.
 //
 // Pushed rather than read out of the material array. Two floats against binding
 // that array into the bake and carrying a material index through as a varying,
 // and it leaves the bake independent of that array's layout.
-pub const PushConstants = extern struct {
+pub const Mask = extern struct {
     alpha_cutoff: f32,
     factor_alpha: f32,
 };
 
+// The bake's push block: the matrix the vertex stage rasterizes through, then
+// the mask the fragment stage tests. The bake's shader is created against this
+// block and the record path fills it in two parts, the matrix once per map or
+// layer and the mask once per masked material.
+//
+// The matrix is pushed rather than read from the sun's uniform block so that
+// one set of pipelines draws into the sun map and into every local layer, each
+// through its own projection.
+//
+// The matrix is aligned to 16 as the shader lays a matrix out, which rounds the
+// block to 80 bytes: Slang reports that size for it, and the range covers it.
+pub const PushConstants = extern struct {
+    view_projection: uniforms.Mat4 align(16),
+    mask: Mask,
+};
+
+pub const view_offset: u32 = @offsetOf(PushConstants, "view_projection");
+pub const mask_offset: u32 = @offsetOf(PushConstants, "mask");
+
+// One range over both stages rather than one per stage. Vulkan specification,
+// VkPipelineLayoutCreateInfo and the shader interface: each stage's whole
+// push block has to lie in a range for that stage, and Slang declares one
+// block for both entry points. A single range also lets each of the two
+// partial updates name the same stages, which vkCmdPushConstants requires of
+// every range its bytes overlap.
 pub const push_constant_range: vk.PushConstantRange = .{
-    .stage_flags = .{ .fragment_bit = true },
+    .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
     .offset = 0,
     .size = @sizeOf(PushConstants),
 };
@@ -144,10 +178,26 @@ pub const Shader = struct {
 };
 
 pub const InitError = error{
-    // The requested map does not fit the device's two-dimensional image limit,
+    // A requested map does not fit the device's two-dimensional image limit,
     // or has no extent at all.
     MapSizeUnsupported,
-} || attachment.FormatError || image.InitError || descriptors.InitError || pipeline.CreateError;
+
+    // More local layers than the light block carries matrices for
+    // (`uniforms.max_shadow_layers`): the ones past it could be baked and
+    // never read.
+    LocalLayersUnsupported,
+} || attachment.FormatError || image.InitError || image.LayerViewError ||
+    descriptors.InitError || pipeline.CreateError || Allocator.Error;
+
+// The local lights' array: the extent of each layer, and how many layers.
+//
+// Zero layers is a scene with no local shadows. The image is still created
+// with one, because the set's binding has to name a view for its descriptor to
+// be valid, and the lookup never reads it: no light is given a layer.
+pub const LocalMaps = struct {
+    map_size: u32,
+    layers: u32,
+};
 
 // The three set layouts the bake's pipeline layout names, in set order. Set 1 is
 // named and never bound: a bake shader declares nothing out of it, and it is
@@ -161,11 +211,20 @@ pub const Layouts = struct {
 
 pub const ShadowPass = struct {
     context: *const Context,
-    // The one the descriptor sets were allocated from, kept so that `deinit`
-    // returns them to it rather than to whichever allocator is in reach.
+    // The one the descriptor sets and the layer views were allocated from,
+    // kept so that `deinit` returns them to it rather than to whichever
+    // allocator is in reach.
     allocator: Allocator,
     map: image.Image,
+    local: image.Image,
+    // One per layer of `local`, for rendering into it a layer at a time.
+    // `local.view` spans them all and is what the descriptor names.
+    local_views: []vk.ImageView,
+    // What was asked for, which is zero when `local` holds its one unread
+    // layer.
+    local_layers: u32,
     sampler: vk.Sampler,
+    depth_sampler: vk.Sampler,
     module: vk.ShaderModule,
     layout: vk.PipelineLayout,
     pipelines: [variant_count]vk.Pipeline,
@@ -176,11 +235,14 @@ pub const ShadowPass = struct {
         memory_allocator: *memory.MemoryAllocator,
         allocator: Allocator,
         map_size: u32,
+        local_maps: LocalMaps,
         layouts: Layouts,
         shader: Shader,
     ) InitError!ShadowPass {
-        if (map_size == 0 or map_size > context.properties.limits.max_image_dimension_2d)
-            return error.MapSizeUnsupported;
+        const limit = context.properties.limits.max_image_dimension_2d;
+        if (map_size == 0 or map_size > limit) return error.MapSizeUnsupported;
+        if (local_maps.map_size == 0 or local_maps.map_size > limit) return error.MapSizeUnsupported;
+        if (local_maps.layers > uniforms.max_shadow_layers) return error.LocalLayersUnsupported;
 
         const format = try attachment.depthFormat(context);
 
@@ -193,8 +255,29 @@ pub const ShadowPass = struct {
         });
         errdefer map.deinit();
 
+        var local = try image.Image.init(context, memory_allocator, .{
+            .width = local_maps.map_size,
+            .height = local_maps.map_size,
+            .format = format,
+            .usage = attachment.depth_usage,
+            .kind = .depth,
+            .shape = .{ .array_2d = @max(local_maps.layers, 1) },
+        });
+        errdefer local.deinit();
+
+        const local_views = try allocator.alloc(vk.ImageView, local_maps.layers);
+        errdefer allocator.free(local_views);
+        var views_created: usize = 0;
+        errdefer for (local_views[0..views_created]) |view| context.device.destroyImageView(view, null);
+        for (local_views, 0..) |*view, layer| {
+            view.* = try local.createLayerView(@intCast(layer));
+            views_created += 1;
+        }
+
         const sampler = try createSampler(context, format);
         errdefer context.device.destroySampler(sampler, null);
+        const depth_sampler = try createDepthSampler(context);
+        errdefer context.device.destroySampler(depth_sampler, null);
 
         const module = try pipeline.createModule(context, shader.spirv);
         errdefer context.device.destroyShaderModule(module, null);
@@ -252,7 +335,11 @@ pub const ShadowPass = struct {
             .context = context,
             .allocator = allocator,
             .map = map,
+            .local = local,
+            .local_views = local_views,
+            .local_layers = local_maps.layers,
             .sampler = sampler,
+            .depth_sampler = depth_sampler,
             .module = module,
             .layout = layout,
             .pipelines = pipelines,
@@ -270,30 +357,38 @@ pub const ShadowPass = struct {
         device.destroyPipelineLayout(self.layout, null);
         self.sets.deinit(self.context, self.allocator);
         device.destroyShaderModule(self.module, null);
+        device.destroySampler(self.depth_sampler, null);
         device.destroySampler(self.sampler, null);
+        for (self.local_views) |view| device.destroyImageView(view, null);
+        self.allocator.free(self.local_views);
+        self.local.deinit();
         self.map.deinit();
         self.* = undefined;
     }
 
-    // Points the map's own set at the image. Once, at init: neither the image
-    // nor the sampler is replaced for the life of the pass, so this is not on
-    // any frame path.
+    // Points the maps' own set at the images. Once, at init: neither image nor
+    // the sampler is replaced for the life of the pass, so this is not on any
+    // frame path. One sampler serves both: a sampler does not depend on the
+    // type of the view it is used with.
     fn write(self: *const ShadowPass) void {
-        const info = vk.DescriptorImageInfo{
-            .sampler = self.sampler,
-            .image_view = self.map.view,
-            .image_layout = pass.sampled_layout,
+        const infos = [bindings.len]vk.DescriptorImageInfo{
+            .{ .sampler = self.sampler, .image_view = self.map.view, .image_layout = pass.sampled_layout },
+            .{ .sampler = self.sampler, .image_view = self.local.view, .image_layout = pass.sampled_layout },
+            .{ .sampler = self.depth_sampler, .image_view = self.local.view, .image_layout = pass.sampled_layout },
         };
-        const writes = [_]vk.WriteDescriptorSet{.{
-            .dst_set = self.sets.set(0),
-            .dst_binding = bindings[0].slot,
-            .dst_array_element = 0,
-            .descriptor_count = 1,
-            .descriptor_type = bindings[0].kind,
-            .p_image_info = @ptrCast(&info),
-            .p_buffer_info = &no_buffers,
-            .p_texel_buffer_view = &no_texel_buffers,
-        }};
+        var writes: [bindings.len]vk.WriteDescriptorSet = undefined;
+        for (&writes, bindings, &infos) |*write_, binding, *info| {
+            write_.* = .{
+                .dst_set = self.sets.set(0),
+                .dst_binding = binding.slot,
+                .dst_array_element = 0,
+                .descriptor_count = 1,
+                .descriptor_type = binding.kind,
+                .p_image_info = @ptrCast(info),
+                .p_buffer_info = &no_buffers,
+                .p_texel_buffer_view = &no_texel_buffers,
+            };
+        }
         self.context.device.updateDescriptorSets(&writes, null);
     }
 
@@ -313,6 +408,16 @@ pub const ShadowPass = struct {
         return self.map.width;
     }
 
+    // The local layers' extent, and how many there are to give out. Asked of
+    // the pass for the same reason as `mapSize`.
+    pub fn localMapSize(self: *const ShadowPass) u32 {
+        return self.local.width;
+    }
+
+    pub fn localLayers(self: *const ShadowPass) u32 {
+        return self.local_layers;
+    }
+
     pub fn pipelineFor(self: *const ShadowPass, variant: Variant) vk.Pipeline {
         return self.pipelines[pipelineIndex(variant)];
     }
@@ -325,7 +430,7 @@ pub const ShadowPass = struct {
     // caster recorded at all the map is left cleared, which reads as fully lit
     // everywhere and is the correct content for a scene that casts nothing.
     pub fn begin(self: *const ShadowPass, command_buffer: vk.CommandBuffer) void {
-        const barriers = beginBarriers(self.map.handle);
+        const barriers = beginBarriers(self.map.handle, 1);
         self.context.device.cmdPipelineBarrier2(command_buffer, &.{
             .image_memory_barrier_count = barriers.len,
             .p_image_memory_barriers = &barriers,
@@ -351,27 +456,78 @@ pub const ShadowPass = struct {
     pub fn end(self: *const ShadowPass, command_buffer: vk.CommandBuffer) void {
         self.context.device.cmdEndRendering(command_buffer);
 
-        const barriers = endBarriers(self.map.handle);
+        const barriers = endBarriers(self.map.handle, 1);
         self.context.device.cmdPipelineBarrier2(command_buffer, &.{
             .image_memory_barrier_count = barriers.len,
             .p_image_memory_barriers = &barriers,
         });
     }
+
+    // Opens the local bake: every layer at once, because one barrier over the
+    // array is cheaper than one per layer and the bake re-renders all of them.
+    // A layer no light was given is cleared by `beginLayer` or left
+    // discarded, and in both cases no lookup reads it. Between this and
+    // `endLocal` the caller brackets each layer with `beginLayer` and
+    // `endLayer`.
+    pub fn beginLocal(self: *const ShadowPass, command_buffer: vk.CommandBuffer) void {
+        const barriers = beginBarriers(self.local.handle, self.local.shape.layerCount());
+        self.context.device.cmdPipelineBarrier2(command_buffer, &.{
+            .image_memory_barrier_count = barriers.len,
+            .p_image_memory_barriers = &barriers,
+        });
+        const extent_ = self.localExtent();
+        self.context.device.cmdSetViewport(command_buffer, 0, &.{pass.viewport(extent_)});
+        self.context.device.cmdSetScissor(command_buffer, 0, &.{pass.scissor(extent_)});
+    }
+
+    // One layer's rendering. No barrier between layers: each is a separate
+    // subresource, so two layers' writes never touch the same memory.
+    pub fn beginLayer(self: *const ShadowPass, command_buffer: vk.CommandBuffer, layer: u32) void {
+        std.debug.assert(layer < self.local_layers);
+        const depth = depthAttachment(self.local_views[layer]);
+        self.context.device.cmdBeginRendering(command_buffer, &.{
+            .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = self.localExtent() },
+            .layer_count = 1,
+            .view_mask = 0,
+            .color_attachment_count = 0,
+            .p_color_attachments = &no_colour_attachments,
+            .p_depth_attachment = &depth,
+        });
+    }
+
+    pub fn endLayer(self: *const ShadowPass, command_buffer: vk.CommandBuffer) void {
+        self.context.device.cmdEndRendering(command_buffer);
+    }
+
+    pub fn endLocal(self: *const ShadowPass, command_buffer: vk.CommandBuffer) void {
+        const barriers = endBarriers(self.local.handle, self.local.shape.layerCount());
+        self.context.device.cmdPipelineBarrier2(command_buffer, &.{
+            .image_memory_barrier_count = barriers.len,
+            .p_image_memory_barriers = &barriers,
+        });
+    }
+
+    fn localExtent(self: *const ShadowPass) vk.Extent2D {
+        return .{ .width = self.local.width, .height = self.local.height };
+    }
 };
 
-const depth_range = vk.ImageSubresourceRange{
-    .aspect_mask = .{ .depth_bit = true },
-    .base_mip_level = 0,
-    .level_count = 1,
-    .base_array_layer = 0,
-    .layer_count = 1,
-};
+fn depthRange(layers: u32) vk.ImageSubresourceRange {
+    return .{
+        .aspect_mask = .{ .depth_bit = true },
+        .base_mip_level = 0,
+        .level_count = 1,
+        .base_array_layer = 0,
+        .layer_count = layers,
+    };
+}
 
 // One image for every frame in flight, so a bake has to be ordered after the
 // previous frame's sampling of it. That is a write-after-read, and it is the
 // whole reason this barrier exists; the layout change is incidental, because
 // `undefined` as the old layout discards contents the clear is about to replace.
-pub fn beginBarriers(handle: vk.Image) [1]vk.ImageMemoryBarrier2 {
+// `layers` is the image's whole count: the barrier covers every layer.
+pub fn beginBarriers(handle: vk.Image, layers: u32) [1]vk.ImageMemoryBarrier2 {
     return .{.{
         .src_stage_mask = .{ .fragment_shader_bit = true },
         .src_access_mask = .{ .shader_read_bit = true },
@@ -382,14 +538,14 @@ pub fn beginBarriers(handle: vk.Image) [1]vk.ImageMemoryBarrier2 {
         .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
         .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
         .image = handle,
-        .subresource_range = depth_range,
+        .subresource_range = depthRange(layers),
     }};
 }
 
 // Makes the bake's depth writes available to the main pass's sampler. Unlike the
 // camera's depth attachment, this one is stored: what it holds is the pass's
 // whole output rather than a by-product of drawing colour.
-pub fn endBarriers(handle: vk.Image) [1]vk.ImageMemoryBarrier2 {
+pub fn endBarriers(handle: vk.Image, layers: u32) [1]vk.ImageMemoryBarrier2 {
     return .{.{
         .src_stage_mask = .{ .early_fragment_tests_bit = true, .late_fragment_tests_bit = true },
         .src_access_mask = .{ .depth_stencil_attachment_write_bit = true },
@@ -400,7 +556,7 @@ pub fn endBarriers(handle: vk.Image) [1]vk.ImageMemoryBarrier2 {
         .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
         .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
         .image = handle,
-        .subresource_range = depth_range,
+        .subresource_range = depthRange(layers),
     }};
 }
 
@@ -408,6 +564,8 @@ pub fn endBarriers(handle: vk.Image) [1]vk.ImageMemoryBarrier2 {
 // a near of zero and a far of twice the slacked radius, and zmath's
 // `orthographicRh` maps that range onto depth 0 to 1, so an untouched texel
 // holds a caster infinitely far away and every comparison against it passes.
+// `LocalShadowFit`'s perspective maps its near and the light's range onto the
+// same 0 to 1, so the same holds for a local layer.
 pub fn depthAttachment(view: vk.ImageView) vk.RenderingAttachmentInfo {
     return .{
         .image_view = view,
@@ -455,6 +613,29 @@ fn createSampler(context: *const Context, format: vk.Format) vk.DeviceWrapper.Cr
         .max_anisotropy = 1,
         .compare_enable = .true,
         .compare_op = .less_or_equal,
+        .min_lod = 0,
+        .max_lod = 0,
+        .border_color = .float_opaque_white,
+        .unnormalized_coordinates = .false,
+    }, null);
+}
+
+// Nearest and clamped: a depth averaged between a caster and the far plane is
+// a caster that does not exist. Clamped rather than bordered so a search tap
+// past a layer's edge repeats the edge.
+fn createDepthSampler(context: *const Context) vk.DeviceWrapper.CreateSamplerError!vk.Sampler {
+    return context.device.createSampler(&.{
+        .mag_filter = .nearest,
+        .min_filter = .nearest,
+        .mipmap_mode = .nearest,
+        .address_mode_u = .clamp_to_edge,
+        .address_mode_v = .clamp_to_edge,
+        .address_mode_w = .clamp_to_edge,
+        .mip_lod_bias = 0,
+        .anisotropy_enable = .false,
+        .max_anisotropy = 1,
+        .compare_enable = .false,
+        .compare_op = .always,
         .min_lod = 0,
         .max_lod = 0,
         .border_color = .float_opaque_white,

@@ -12,6 +12,8 @@ const target: gpu.MainPassTarget = .{
     .hdr_view = @fromBackingInt(@intCast(2)),
     .depth_image = @fromBackingInt(@intCast(3)),
     .depth_view = @fromBackingInt(@intCast(4)),
+    .motion_image = @fromBackingInt(@intCast(5)),
+    .motion_view = @fromBackingInt(@intCast(6)),
     .extent = .{ .width = 1280, .height = 720 },
 };
 
